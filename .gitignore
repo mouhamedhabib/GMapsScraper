@@ -161,3 +161,8 @@ cython_debug/
 
 # Claude Code project guidance (local only)
 CLAUDE.md
+
+# Generated CSV files
+CSV_FILES/
+
+
