@@ -163,6 +163,5 @@ cython_debug/
 CLAUDE.md
 
 # CSV files
-CSV_FILES/
-
+/CSV_FILES/
 
