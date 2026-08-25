@@ -139,6 +139,34 @@ The builder normalizes unavailable values, rejects malformed or placeholder emai
 
 The lead builder currently expects CSV columns produced by this scraper (`title`, `webpage`, `phone_number`, and `site_email`). Export with `-of CSV` before running it.
 
+## Google Search company discovery
+
+Google Search discovery is a separate, optional source and does not change the
+Maps scraper. Run it with:
+
+```bash
+python3 utils/google_search_discovery.py \
+  -q google_queries.txt \
+  -l 20 \
+  --delay 3 \
+  --timeout 15 \
+  --verbose
+```
+
+Add `--windowed` to show Chrome. Discoveries are atomically written to
+`CSV_FILES/google_search_companies.csv` with the columns
+`company_name,website,source,source_query,source_url`. Repeated runs merge by
+normalized website domain and preserve distinct search queries.
+
+The normal `build_leads.py` command automatically reads this discovery file
+when present. It merges Maps and Search records by the existing company
+identity rules and records `source` and `source_queries` in `leads_master.csv`.
+The four-column `leads_ready.csv` format remains unchanged.
+
+Google Search discovery does not extract email addresses. Search-only records
+therefore remain in `leads_master.csv` and do not enter `leads_ready.csv` until
+a future, separate process obtains and validates an email address.
+
 ## Troubleshooting
 
 - Confirm Google Chrome Stable is installed and can be launched by the current user.

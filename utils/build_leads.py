@@ -31,7 +31,8 @@ EMAIL_LOCAL_PRIORITY = {
 UNAVAILABLE_VALUES = {"", "not available", "n/a", "none", "null"}
 MASTER_FIELDS = (
     "name", "email", "alternate_emails", "phone", "website",
-    "email_status", "review_status", "review_reasons",
+    "email_status", "review_status", "review_reasons", "source",
+    "source_queries",
 )
 READY_FIELDS = ("name", "email", "phone", "website")
 
@@ -110,6 +111,8 @@ def new_group(index):
         "phone_keys": set(),
         "emails": {},
         "review_reasons": set(),
+        "sources": [],
+        "source_queries": [],
         "rows": 0,
     }
 
@@ -130,6 +133,10 @@ def merge_groups(target, source):
     target["phone_keys"].update(source["phone_keys"])
     target["emails"].update(source["emails"])
     target["review_reasons"].update(source["review_reasons"])
+    for value in source["sources"]:
+        add_unique(target["sources"], value)
+    for value in source["source_queries"]:
+        add_unique(target["source_queries"], value)
     target["rows"] += source["rows"]
     target["first_index"] = min(target["first_index"], source["first_index"])
 
@@ -170,6 +177,11 @@ def build_groups(rows):
         web_domain = website_domain(website)
         phone = clean_value(row.get("phone_number"))
         phone_key = normalize_phone(phone)
+        source = clean_value(row.get("_source")) or "google_maps"
+        source_queries = [
+            clean_value(value) for value in (row.get("_source_queries") or "").split(";")
+            if clean_value(value)
+        ]
 
         valid_emails = {}
         for email in extract_emails(row.get("site_email")):
@@ -223,6 +235,9 @@ def build_groups(rows):
         if phone_key:
             group["phone_keys"].add(phone_key)
         group["emails"].update(valid_emails)
+        add_unique(group["sources"], source)
+        for source_query in source_queries:
+            add_unique(group["source_queries"], source_query)
 
         if ambiguous_name_matches:
             group["review_reasons"].add("ambiguous exact-name match")
@@ -275,6 +290,8 @@ def finalize_group(group):
         "email_status": status,
         "review_status": "REVIEW" if reasons else "READY",
         "review_reasons": "; ".join(sorted(reasons)),
+        "source": ";".join(group["sources"]),
+        "source_queries": ";".join(group["source_queries"]),
     }
 
 
@@ -286,9 +303,76 @@ def write_csv(path, fieldnames, rows):
         writer.writerows(rows)
 
 
-def build_lead_files(input_path, output_folder):
+def search_rows(search_input_path):
+    if not search_input_path or not search_input_path.exists():
+        return []
+    with search_input_path.open("r", newline="", encoding="utf-8-sig") as file_handler:
+        return [
+            {
+                "title": row.get("company_name", ""),
+                "webpage": row.get("website", ""),
+                "phone_number": "",
+                "site_email": "",
+                "_source": "google_search",
+                "_source_queries": row.get("source_query", ""),
+            }
+            for row in DictReader(file_handler)
+        ]
+
+
+def enriched_search_rows(email_enrichment_input_path):
+    if not email_enrichment_input_path or not email_enrichment_input_path.exists():
+        return []
+    rows = []
+    with email_enrichment_input_path.open(
+        "r", newline="", encoding="utf-8-sig"
+    ) as file_handler:
+        for row in DictReader(file_handler):
+            if clean_value(row.get("email_enrichment_status")).upper() != "FOUND":
+                continue
+            emails = [
+                email
+                for field in ("email", "alternate_emails")
+                for email in extract_emails(row.get(field))
+                if is_valid_email(email)
+            ]
+            if not emails:
+                continue
+            rows.append({
+                "title": row.get("name", ""),
+                "webpage": row.get("website", ""),
+                "phone_number": row.get("phone", ""),
+                "site_email": ";".join(emails),
+                "_source": "google_search",
+                "_source_queries": row.get("source_queries", ""),
+            })
+    return rows
+
+
+def build_lead_files(
+    input_path,
+    output_folder,
+    search_input_path=None,
+    email_enrichment_input_path=None,
+):
+    input_path = Path(input_path)
+    output_folder = Path(output_folder)
+    search_input_path = Path(search_input_path) if search_input_path else None
+    email_enrichment_input_path = (
+        Path(email_enrichment_input_path) if email_enrichment_input_path else None
+    )
     with input_path.open("r", newline="", encoding="utf-8-sig") as file_handler:
         raw_rows = list(DictReader(file_handler))
+    for row in raw_rows:
+        row["_source"] = "google_maps"
+
+    if search_input_path is None:
+        search_input_path = output_folder / "google_search_companies.csv"
+    discovered_rows = search_rows(search_input_path)
+    raw_rows.extend(discovered_rows)
+    if email_enrichment_input_path is None:
+        email_enrichment_input_path = output_folder / "search_email_enriched.csv"
+    raw_rows.extend(enriched_search_rows(email_enrichment_input_path))
 
     groups, rejected_emails = build_groups(raw_rows)
     master_rows = [finalize_group(group) for group in groups]
@@ -305,6 +389,10 @@ def build_lead_files(input_path, output_folder):
 
     domain_matches = sum(row["email_status"] == "MATCH" for row in master_rows)
     missing_email = sum(not row["email"] for row in master_rows)
+    search_only_missing_email = sum(
+        not row["email"] and row["source"] == "google_search"
+        for row in master_rows
+    )
     print(f"Raw rows: {len(raw_rows)}")
     print(f"Unique companies: {len(master_rows)}")
     print(f"Duplicates merged: {len(raw_rows) - len(master_rows)}")
@@ -313,14 +401,30 @@ def build_lead_files(input_path, output_folder):
     print(f"Needs review: {len(review_rows)}")
     print(f"Rejected emails: {rejected_emails}")
     print(f"Missing email: {missing_email}")
+    print(f"Google Search-only without email: {search_only_missing_email}")
 
 
 def main():
     parser = ArgumentParser(description="Build clean lead exports from GMapsScraper CSV output")
     parser.add_argument("--input", type=Path, default=Path("./CSV_FILES/google_maps_data.csv"))
     parser.add_argument("--output-folder", type=Path, default=Path("./CSV_FILES"))
+    parser.add_argument(
+        "--search-input",
+        type=Path,
+        help="Optional Google Search discovery CSV (defaults to the output folder)",
+    )
+    parser.add_argument(
+        "--email-enrichment-input",
+        type=Path,
+        help="Optional Search email enrichment CSV (defaults to the output folder)",
+    )
     args = parser.parse_args()
-    build_lead_files(args.input, args.output_folder)
+    build_lead_files(
+        args.input,
+        args.output_folder,
+        args.search_input,
+        args.email_enrichment_input,
+    )
 
 
 if __name__ == "__main__":
