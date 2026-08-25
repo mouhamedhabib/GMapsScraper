@@ -46,7 +46,7 @@ class PPrints:
             else:
                 launched_drivers = active_count() - 1
             print(f"{self.WARNING}Platform: {self.clean_terminal()}\n"
-                  f"{self.CYAN}Developer: AbdulMoez\n"
+                  f"{self.CYAN}Developer: Google Maps Scraper\n"
                   f"{self.GREEN}Script Version: {version}\n"
                   f"{self.WARNING}GitHub: github.com/Anonym0usWork1221/GMapsScraper\n"
                   f"{self.BLUE}Query: {query}\n{self.GREEN}Status: {status}\n"

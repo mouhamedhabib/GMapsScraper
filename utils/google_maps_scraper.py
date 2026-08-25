@@ -196,7 +196,7 @@ class GoogleMaps:
         """
 
         options = uc.ChromeOptions()
-        options.add_argument(argument='--title=Developer - Abdul Moez')
+        options.add_argument(argument='--title=Developer - Google Maps Scraper')
         options.add_argument(argument='--disable-popup-blocking')
         options.add_extension(extension=self._finger_print_defender_ext)
         chrome_version = self.detect_chrome_major_version()
