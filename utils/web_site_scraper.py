@@ -1,3 +1,23 @@
+"""
+Public Website Contact Extractor
+================================
+
+Purpose:
+    Visit a company's main/contact/about pages and extract public email and
+    social-profile links from their rendered HTML.
+
+Pipeline:
+    google_maps_scraper.py --------> web_site_scraper.py -> Maps record fields
+    enrich_search_emails.py -------> web_site_scraper.py -> enriched emails
+
+Input:
+    A Selenium driver, company website URL, and suggested page paths.
+
+Output:
+    A dictionary of validated email addresses and social links. Its caller
+    either stores these with Maps data or feeds them back through build_leads.py.
+"""
+
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -6,14 +26,27 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup
 from re import compile
 from time import monotonic
+from typing import Optional
 
 
 class PatternScrapper:
+    """Extract contact patterns from a bounded set of rendered website pages."""
 
-    def __init__(self, wait_time: int = 15, verbose: bool = True):
+    def __init__(
+        self,
+        wait_time: int = 15,
+        verbose: bool = True,
+        overall_timeout: Optional[float] = None,
+    ):
         self._last_opened_handler = None
         self._wait_time = wait_time
         self._verbose = verbose
+        self._overall_timeout = overall_timeout
+        self.last_attempted_urls = []
+        self.last_failure_kind = None
+        self.last_failure_message = ""
+        self.temporary_tabs_opened = 0
+        self.temporary_tabs_closed = 0
         self._email_pattern = compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
         self._fb_pattern = compile(r'(?:https?://)?(?:www\.)?facebook\.com/\S+')
         self._twitter_pattern = compile(r'(?:https?://)?(?:www\.)?twitter\.com/\S+')
@@ -40,6 +73,7 @@ class PatternScrapper:
 
     @staticmethod
     def create_urls(site_url: str, url_ext: list):
+        """Return unique homepage and suggested subpage URLs for one website."""
         site_url = site_url.strip()
         if not urlsplit(site_url).scheme:
             site_url = "http://" + site_url
@@ -76,17 +110,53 @@ class PatternScrapper:
                 created_urls.append(normalized_url)
         return created_urls
 
+    @staticmethod
+    def _navigation_failure(error, url=""):
+        """Return a concise failure category and message for navigation errors."""
+        message = " ".join(str(error).split())
+        normalized = message.upper()
+        hostname = urlsplit(url).hostname or url or "website"
+        if "ERR_NAME_NOT_RESOLVED" in normalized:
+            return "dns", f"{hostname} could not be resolved"
+        if "ERR_CONNECTION_REFUSED" in normalized:
+            return "connection", f"{hostname} refused the connection"
+        if "ERR_ADDRESS_UNREACHABLE" in normalized:
+            return "connection", f"{hostname} is unreachable"
+        if "ERR_INTERNET_DISCONNECTED" in normalized:
+            return "connection", "internet connection is unavailable"
+        if isinstance(error, TimeoutException) or "TIMED OUT" in normalized:
+            return "timeout", f"{hostname} exceeded the navigation timeout"
+        return "other", message
+
     def get_source_code(self, driver: WebDriver, urls: list):
+        """Load candidate URLs in temporary tabs and return successful HTML sources."""
         source_codes = []
         original_handle = driver.current_window_handle
+        try:
+            original_handles = set(driver.window_handles)
+        except Exception:
+            original_handles = {original_handle}
+        self.last_attempted_urls = []
+        self.last_failure_kind = None
+        self.last_failure_message = ""
+        company_deadline = (
+            monotonic() + self._overall_timeout
+            if self._overall_timeout is not None else None
+        )
 
         for url in urls:
-            temporary_handle = None
+            if company_deadline is not None and monotonic() >= company_deadline:
+                self.last_failure_kind = "timeout"
+                self.last_failure_message = "overall company deadline exceeded"
+                break
+            self.last_attempted_urls.append(url)
             try:
                 driver.switch_to.new_window("tab")
-                temporary_handle = driver.current_window_handle
+                self.temporary_tabs_opened += 1
                 candidate_timeout = max(1, self._wait_time)
                 deadline = monotonic() + candidate_timeout
+                if company_deadline is not None:
+                    deadline = min(deadline, company_deadline)
 
                 def remaining_timeout():
                     remaining = deadline - monotonic()
@@ -94,7 +164,7 @@ class PatternScrapper:
                         raise TimeoutException("candidate URL timeout exceeded")
                     return remaining
 
-                driver.set_page_load_timeout(candidate_timeout)
+                driver.set_page_load_timeout(remaining_timeout())
                 driver.get(url)
 
                 wait = WebDriverWait(driver, remaining_timeout())
@@ -127,6 +197,7 @@ class PatternScrapper:
 
                 source_codes.append(driver.page_source)
             except TimeoutException as e:
+                self.last_failure_kind, self.last_failure_message = self._navigation_failure(e, url)
                 if self._verbose:
                     print(f"[-] Website URL timed out: {url} ({type(e).__name__}: {e})")
                 try:
@@ -134,22 +205,47 @@ class PatternScrapper:
                 except Exception:
                     pass
             except Exception as e:
+                self.last_failure_kind, self.last_failure_message = self._navigation_failure(e, url)
                 if self._verbose:
                     print(f"[-] Website URL failed: {url} ({type(e).__name__}: {e})")
+                if self.last_failure_kind in {"dns", "connection"}:
+                    # These failures apply to the hostname, not merely this path.
+                    break
             finally:
+                # Close every handle created during this candidate, including
+                # unexpected popups. Each operation is isolated so one broken
+                # handle cannot prevent cleanup of the others or focus restore.
                 try:
-                    if temporary_handle and temporary_handle in driver.window_handles:
-                        driver.switch_to.window(temporary_handle)
+                    current_handles = list(driver.window_handles)
+                except Exception:
+                    current_handles = []
+                for handle in current_handles:
+                    if handle in original_handles:
+                        continue
+                    try:
+                        driver.switch_to.window(handle)
                         driver.close()
+                        self.temporary_tabs_closed += 1
+                    except Exception as e:
+                        if self._verbose:
+                            print(
+                                f"[-] Website tab cleanup failed: {url} "
+                                f"({type(e).__name__}: {e})"
+                            )
+                try:
+                    if original_handle in driver.window_handles:
+                        driver.switch_to.window(original_handle)
                 except Exception as e:
                     if self._verbose:
-                        print(f"[-] Website tab cleanup failed: {url} ({type(e).__name__}: {e})")
-                finally:
-                    driver.switch_to.window(original_handle)
+                        print(
+                            f"[-] Website focus restore failed: {url} "
+                            f"({type(e).__name__}: {e})"
+                        )
         return source_codes
 
     @staticmethod
     def email_decoder(email):
+        """Decode a Cloudflare-protected hexadecimal email string."""
         decoded_mail = ""
         k = int(email[:2], 16)
 
@@ -200,7 +296,7 @@ class PatternScrapper:
             return False
         return True
 
-    def get_pattern_data(self, source_codes: list):
+    def _collect_pattern_data(self, source_codes: list, validate_emails: bool):
         patterns_data = {"site_email": [], "facebook_links": [], "twitter_links": [], "instagram_links": [],
                          "youtube_links": [], "linkedin_links": []}
 
@@ -225,7 +321,7 @@ class PatternScrapper:
         unique_emails = []
         seen_emails = set()
         for email in patterns_data["site_email"]:
-            if not self._is_valid_email(email):
+            if validate_emails and not self._is_valid_email(email):
                 continue
             email_key = email.lower()
             if email_key not in seen_emails:
@@ -234,7 +330,16 @@ class PatternScrapper:
         patterns_data["site_email"] = unique_emails
         return patterns_data
 
+    def get_raw_pattern_data(self, source_codes: list):
+        """Return extracted patterns before email validation, for diagnostics."""
+        return self._collect_pattern_data(source_codes, validate_emails=False)
+
+    def get_pattern_data(self, source_codes: list):
+        """Return deduplicated, validated emails and social links from HTML pages."""
+        return self._collect_pattern_data(source_codes, validate_emails=True)
+
     def find_patterns(self, driver: WebDriver, site_url: str, suggested_ext: list, unavailable: str = "Not Available"):
+        """Collect contact fields for a site, using the unavailable marker on failure."""
         patterns_data = {"site_email": "", "facebook_links": "", "twitter_links": "", "instagram_links": "",
                          "youtube_links": "", "linkedin_links": ""}
 
@@ -255,7 +360,12 @@ class PatternScrapper:
                 patterns_data[key] = unavailable
             return patterns_data
 
-        social_data = self.get_pattern_data(sources)
+        try:
+            social_data = self.get_pattern_data(sources)
+        finally:
+            # HTML strings can be several megabytes. Release them as soon as
+            # this company's parse finishes rather than retaining the list.
+            sources.clear()
 
         for key in social_data.keys():
             if not social_data[key]:

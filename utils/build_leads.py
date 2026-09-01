@@ -1,4 +1,29 @@
-"""Build stable, deduplicated lead exports from the raw scraper CSV."""
+"""
+Lead Builder
+============
+
+Purpose:
+    Turn Maps and Search discoveries into stable, deduplicated lead records.
+
+Pipeline:
+    google_maps_data.csv -----------\
+    google_search_companies.csv -----+-> build_leads.py -> leads_master.csv
+    search_email_enriched.csv -------+                  -> leads_ready.csv
+    missing_email_enriched.csv ------/                  -> leads_review.csv
+    search_email_fallback.csv -------/
+
+Input:
+    Raw Maps rows, optional Search discoveries, and optional Search-email
+    enrichment results, including source-agnostic missing-email recovery.
+
+Output:
+    A complete master export, a ready subset, and records requiring review,
+    all preserving available country, city, and location metadata.
+
+Previous / next:
+    Maps/Search discovery runs before this file. Search-email enrichment may
+    feed a second build; ``enrich_leads.py`` normally consumes leads_ready.csv.
+"""
 
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -7,6 +32,29 @@ from pathlib import Path
 from re import compile
 from urllib.parse import urlsplit
 
+try:
+    from utils.discovery_timestamps import earliest_added_at
+    from utils.geography import (
+        extract_address_geography,
+        extract_query_geography,
+        format_location,
+        normalize_country,
+    )
+except ModuleNotFoundError:  # Support direct execution from the utils directory.
+    from discovery_timestamps import earliest_added_at
+    from geography import (
+        extract_address_geography,
+        extract_query_geography,
+        format_location,
+        normalize_country,
+    )
+
+
+# ---------------------------------------------------------------------------
+# EMAIL QUALITY AND PRIORITY RULES
+# ---------------------------------------------------------------------------
+# Reject obvious examples/assets, then prefer website-domain and useful role
+# addresses so the most outreach-relevant email becomes the primary address.
 
 EMAIL_PATTERN = compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PLACEHOLDER_DOMAINS = {
@@ -31,10 +79,15 @@ EMAIL_LOCAL_PRIORITY = {
 UNAVAILABLE_VALUES = {"", "not available", "n/a", "none", "null"}
 MASTER_FIELDS = (
     "name", "email", "alternate_emails", "phone", "website",
+    "country", "city", "location",
+    "added_at",
     "email_status", "review_status", "review_reasons", "source",
     "source_queries",
 )
-READY_FIELDS = ("name", "email", "phone", "website")
+READY_FIELDS = (
+    "name", "email", "phone", "website", "country", "city", "location",
+    "added_at",
+)
 
 
 def clean_value(value):
@@ -53,6 +106,7 @@ def normalize_phone(value):
 
 
 def website_domain(value):
+    """Return a lowercase website identity without scheme, path, or ``www``."""
     value = clean_value(value)
     if not value:
         return ""
@@ -62,6 +116,7 @@ def website_domain(value):
 
 
 def is_valid_email(email):
+    """Return whether an address is syntactically usable and not placeholder data."""
     email = email.strip()
     if not EMAIL_PATTERN.fullmatch(email):
         return False
@@ -85,6 +140,7 @@ def email_matches_website(email_domain, web_domain):
 
 
 def email_status(email, web_domain):
+    """Classify an email as website-matching, reviewable, or lacking a website."""
     if not web_domain:
         return "NO_WEBSITE"
     domain = email.rsplit("@", 1)[1].casefold()
@@ -92,6 +148,7 @@ def email_status(email, web_domain):
 
 
 def email_sort_key(email, web_domain):
+    """Return the ranking key used to choose a group's primary outreach email."""
     local_part, domain = email.casefold().rsplit("@", 1)
     status_order = {"MATCH": 0, "NO_WEBSITE": 1, "REVIEW": 2}[email_status(email, web_domain)]
     if domain in FREE_EMAIL_DOMAINS:
@@ -113,6 +170,8 @@ def new_group(index):
         "review_reasons": set(),
         "sources": [],
         "source_queries": [],
+        "geographies": [],
+        "added_at_values": [],
         "rows": 0,
     }
 
@@ -123,6 +182,7 @@ def add_unique(values, value):
 
 
 def merge_groups(target, source):
+    """Combine two records proven to represent the same company."""
     for value in source["names"]:
         add_unique(target["names"], value)
     for value in source["websites"]:
@@ -137,11 +197,14 @@ def merge_groups(target, source):
         add_unique(target["sources"], value)
     for value in source["source_queries"]:
         add_unique(target["source_queries"], value)
+    target["geographies"].extend(source["geographies"])
+    target["added_at_values"].extend(source["added_at_values"])
     target["rows"] += source["rows"]
     target["first_index"] = min(target["first_index"], source["first_index"])
 
 
 def compatible_name_fallback(group, web_domain, phone_key, email_domains):
+    """Allow an exact-name merge only when available identifiers do not conflict."""
     if web_domain and group["website_domains"] and web_domain not in group["website_domains"]:
         return False
     if phone_key and group["phone_keys"] and phone_key not in group["phone_keys"]:
@@ -152,7 +215,54 @@ def compatible_name_fallback(group, web_domain, phone_key, email_domains):
     return True
 
 
+def row_geographies(row, source, row_index):
+    """Return ranked geography evidence without collapsing country conflicts."""
+    candidates = []
+
+    def add_candidate(country, city, location, priority):
+        country = normalize_country(country)
+        city = clean_value(city)
+        location = clean_value(location) or format_location(city, country)
+        if country or city or location:
+            candidates.append({
+                "country": country,
+                "city": city,
+                "location": location,
+                "priority": priority,
+                "row_index": row_index,
+            })
+
+    # Maps address evidence is preferred because it describes the actual
+    # result. Explicit Maps columns follow, then query-derived fallback data.
+    if source == "google_maps":
+        address_geo = extract_address_geography(row.get("address"))
+        add_candidate(**address_geo, priority=0)
+        location_geo = extract_address_geography(row.get("location"))
+        add_candidate(**location_geo, priority=1)
+        add_candidate(
+            row.get("country"), row.get("city"), row.get("location"), 1,
+        )
+    else:
+        location_geo = extract_address_geography(row.get("location"))
+        add_candidate(**location_geo, priority=2)
+        add_candidate(
+            row.get("country"), row.get("city"), row.get("location"), 2,
+        )
+
+    for query in str(row.get("_source_queries") or "").split(";"):
+        query_geo = extract_query_geography(query)
+        add_candidate(**query_geo, priority=3)
+    return candidates
+
+
 def build_groups(rows):
+    """Group raw rows by supported company identities and count rejected emails."""
+
+    # -----------------------------------------------------------------------
+    # COMPANY DEDUPLICATION
+    # -----------------------------------------------------------------------
+    # Domains are strongest; name+phone and name+email-domain provide additional
+    # identities. Exact names alone merge only when no evidence conflicts.
     groups = []
     parent = []
     domain_index = defaultdict(set)
@@ -238,6 +348,8 @@ def build_groups(rows):
         add_unique(group["sources"], source)
         for source_query in source_queries:
             add_unique(group["source_queries"], source_query)
+        group["geographies"].extend(row_geographies(row, source, row_index))
+        group["added_at_values"].append(row.get("added_at", ""))
 
         if ambiguous_name_matches:
             group["review_reasons"].add("ambiguous exact-name match")
@@ -260,6 +372,7 @@ def build_groups(rows):
 
 
 def finalize_group(group):
+    """Convert one merged company group into a master-row review decision."""
     name = group["names"][0] if group["names"] else ""
     website = group["websites"][0] if group["websites"] else ""
     web_domain = website_domain(website)
@@ -268,6 +381,35 @@ def finalize_group(group):
     primary_email = emails[0] if emails else ""
     status = email_status(primary_email, web_domain) if primary_email else ""
     reasons = set(group["review_reasons"])
+
+    countries = {
+        geography["country"] for geography in group["geographies"]
+        if geography["country"]
+    }
+    if len(countries) > 1:
+        reasons.add("conflicting countries")
+    ranked_geographies = sorted(
+        group["geographies"],
+        key=lambda geography: (
+            geography["priority"],
+            not bool(geography["country"]),
+            not bool(geography["city"]),
+            geography["row_index"],
+        ),
+    )
+    selected = ranked_geographies[0] if ranked_geographies else {}
+    country = next((
+        geography["country"] for geography in ranked_geographies
+        if geography["country"]
+    ), "")
+    city = next((
+        geography["city"] for geography in ranked_geographies
+        if geography["city"]
+        and (not country or not geography["country"] or geography["country"] == country)
+    ), "")
+    # Maps locations may be complete street addresses. Keep that useful source
+    # text; query-derived candidates already carry the compact city/country form.
+    location = selected.get("location", "") or format_location(city, country)
 
     if len(group["website_domains"]) > 1:
         reasons.add("multiple conflicting websites")
@@ -287,6 +429,10 @@ def finalize_group(group):
         "alternate_emails": ";".join(emails[1:]),
         "phone": phone,
         "website": website,
+        "country": country,
+        "city": city,
+        "location": location,
+        "added_at": earliest_added_at(group["added_at_values"]),
         "email_status": status,
         "review_status": "REVIEW" if reasons else "READY",
         "review_reasons": "; ".join(sorted(reasons)),
@@ -304,6 +450,7 @@ def write_csv(path, fieldnames, rows):
 
 
 def search_rows(search_input_path):
+    """Adapt Search discovery rows to the raw schema expected by ``build_groups``."""
     if not search_input_path or not search_input_path.exists():
         return []
     with search_input_path.open("r", newline="", encoding="utf-8-sig") as file_handler:
@@ -315,12 +462,17 @@ def search_rows(search_input_path):
                 "site_email": "",
                 "_source": "google_search",
                 "_source_queries": row.get("source_query", ""),
+                "country": row.get("country", ""),
+                "city": row.get("city", ""),
+                "location": row.get("location", ""),
+                "added_at": row.get("added_at", ""),
             }
             for row in DictReader(file_handler)
         ]
 
 
-def enriched_search_rows(email_enrichment_input_path):
+def enriched_email_rows(email_enrichment_input_path, default_source="google_search"):
+    """Adapt validated FOUND enrichment results into raw lead-builder rows."""
     if not email_enrichment_input_path or not email_enrichment_input_path.exists():
         return []
     rows = []
@@ -328,7 +480,10 @@ def enriched_search_rows(email_enrichment_input_path):
         "r", newline="", encoding="utf-8-sig"
     ) as file_handler:
         for row in DictReader(file_handler):
-            if clean_value(row.get("email_enrichment_status")).upper() != "FOUND":
+            enrichment_status = clean_value(
+                row.get("email_enrichment_status") or row.get("status")
+            ).upper()
+            if enrichment_status != "FOUND":
                 continue
             emails = [
                 email
@@ -338,15 +493,93 @@ def enriched_search_rows(email_enrichment_input_path):
             ]
             if not emails:
                 continue
+            sources = {
+                value.strip().casefold()
+                for value in clean_value(row.get("source")).split(";")
+                if value.strip()
+            }
+            source = (
+                "google_maps" if "google_maps" in sources
+                else "google_search" if "google_search" in sources
+                else default_source
+            )
             rows.append({
-                "title": row.get("name", ""),
+                "title": row.get("name") or row.get("company_name", ""),
                 "webpage": row.get("website", ""),
                 "phone_number": row.get("phone", ""),
                 "site_email": ";".join(emails),
-                "_source": "google_search",
-                "_source_queries": row.get("source_queries", ""),
+                "_source": source,
+                "_source_queries": row.get("source_queries") or row.get("source_query", ""),
+                "country": row.get("country", ""),
+                "city": row.get("city", ""),
+                "location": row.get("location", ""),
+                "added_at": row.get("added_at", ""),
             })
     return rows
+
+
+def enriched_search_rows(email_enrichment_input_path):
+    """Backward-compatible adapter for historical Search enrichment state."""
+    return enriched_email_rows(email_enrichment_input_path, "google_search")
+
+
+def preserve_master_added_at(groups, master_path):
+    """Merge prior master timestamps into matching current groups only."""
+    if not master_path.exists():
+        return
+    domain_index = defaultdict(set)
+    name_phone_index = defaultdict(set)
+    name_email_index = defaultdict(set)
+    name_index = defaultdict(set)
+    for group_id, group in enumerate(groups):
+        for domain in group["website_domains"]:
+            domain_index[domain].add(group_id)
+        for name in group["names"]:
+            name_key = normalize_name(name)
+            if not name_key:
+                continue
+            name_index[name_key].add(group_id)
+            for phone_key in group["phone_keys"]:
+                name_phone_index[(name_key, phone_key)].add(group_id)
+            for email in group["emails"]:
+                name_email_index[(name_key, email.rsplit("@", 1)[1])].add(group_id)
+
+    with master_path.open("r", newline="", encoding="utf-8-sig") as file_handler:
+        prior_rows = list(DictReader(file_handler))
+    for row in prior_rows:
+        timestamp = row.get("added_at", "")
+        if not earliest_added_at((timestamp,)):
+            continue
+        candidates = set()
+        domain = website_domain(row.get("website"))
+        if domain:
+            candidates.update(domain_index[domain])
+        name_key = normalize_name(row.get("name"))
+        phone_key = normalize_phone(row.get("phone"))
+        if name_key and phone_key:
+            candidates.update(name_phone_index[(name_key, phone_key)])
+        if name_key:
+            for email in extract_emails(
+                ";".join((row.get("email", ""), row.get("alternate_emails", "")))
+            ):
+                if is_valid_email(email):
+                    candidates.update(
+                        name_email_index[(name_key, email.rsplit("@", 1)[1].casefold())]
+                    )
+        if not candidates and name_key:
+            compatible = {
+                group_id for group_id in name_index[name_key]
+                if compatible_name_fallback(
+                    groups[group_id], domain, phone_key,
+                    {email.rsplit("@", 1)[1].casefold()
+                     for email in extract_emails(row.get("email", ""))
+                     if is_valid_email(email)},
+                )
+            }
+            if len(compatible) == 1:
+                candidates = compatible
+        if len(candidates) == 1:
+            groups[next(iter(candidates))]["added_at_values"].append(timestamp)
 
 
 def build_lead_files(
@@ -354,17 +587,31 @@ def build_lead_files(
     output_folder,
     search_input_path=None,
     email_enrichment_input_path=None,
+    missing_email_enrichment_input_path=None,
+    search_email_fallback_input_path=None,
 ):
+    """Merge all discovery sources and write master, ready, and review CSV files."""
     input_path = Path(input_path)
     output_folder = Path(output_folder)
     search_input_path = Path(search_input_path) if search_input_path else None
     email_enrichment_input_path = (
         Path(email_enrichment_input_path) if email_enrichment_input_path else None
     )
+    missing_email_enrichment_input_path = (
+        Path(missing_email_enrichment_input_path)
+        if missing_email_enrichment_input_path else None
+    )
+    search_email_fallback_input_path = (
+        Path(search_email_fallback_input_path)
+        if search_email_fallback_input_path else None
+    )
     with input_path.open("r", newline="", encoding="utf-8-sig") as file_handler:
         raw_rows = list(DictReader(file_handler))
+    # Maps enters first so its richer phone and email fields remain preferred
+    # when a later Search discovery resolves to the same company.
     for row in raw_rows:
         row["_source"] = "google_maps"
+        row["_source_queries"] = row.get("source_query", "")
 
     if search_input_path is None:
         search_input_path = output_folder / "google_search_companies.csv"
@@ -373,8 +620,20 @@ def build_lead_files(
     if email_enrichment_input_path is None:
         email_enrichment_input_path = output_folder / "search_email_enriched.csv"
     raw_rows.extend(enriched_search_rows(email_enrichment_input_path))
+    if missing_email_enrichment_input_path is None:
+        missing_email_enrichment_input_path = output_folder / "missing_email_enriched.csv"
+    raw_rows.extend(enriched_email_rows(missing_email_enrichment_input_path, "google_maps"))
+    if search_email_fallback_input_path is None:
+        search_email_fallback_input_path = output_folder / "search_email_fallback.csv"
+    # Fallback discovers contact evidence, not a new company-discovery source.
+    # Existing Search rows already retain google_search provenance when present.
+    raw_rows.extend(enriched_email_rows(search_email_fallback_input_path, "google_maps"))
 
     groups, rejected_emails = build_groups(raw_rows)
+    # A rebuild may have fewer/different source rows, but an existing master is
+    # authoritative timestamp evidence. Match it using the same strong company
+    # identities without adding old companies back into the current dataset.
+    preserve_master_added_at(groups, output_folder / "leads_master.csv")
     master_rows = [finalize_group(group) for group in groups]
     ready_rows = [
         {field: row[field] for field in READY_FIELDS}
@@ -418,12 +677,24 @@ def main():
         type=Path,
         help="Optional Search email enrichment CSV (defaults to the output folder)",
     )
+    parser.add_argument(
+        "--missing-email-enrichment-input",
+        type=Path,
+        help="Optional all-source missing-email enrichment CSV (defaults to the output folder)",
+    )
+    parser.add_argument(
+        "--search-email-fallback-input",
+        type=Path,
+        help="Optional Google Search email fallback CSV (defaults to the output folder)",
+    )
     args = parser.parse_args()
     build_lead_files(
         args.input,
         args.output_folder,
         args.search_input,
         args.email_enrichment_input,
+        args.missing_email_enrichment_input,
+        args.search_email_fallback_input,
     )
 
 

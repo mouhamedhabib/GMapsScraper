@@ -1,3 +1,20 @@
+"""
+Concurrent Scraper Status Display
+=================================
+
+Purpose:
+    Render a synchronized terminal status panel for active Maps workers.
+
+Pipeline:
+    google_maps_scraper.py -> pprints.py -> terminal status output
+
+Input:
+    Query progress, scraper mode, output format, and a shared print lock.
+
+Output:
+    Human-readable terminal updates only; no pipeline data files are changed.
+"""
+
 from threading import Lock, active_count
 from psutil import Process
 from platform import system as system_platform
@@ -5,6 +22,8 @@ from os import system
 
 
 class PPrints:
+    """Print one coherent progress display despite concurrent scraper workers."""
+
     HEADER = '\033[95m'
     BLUE = '\033[94m'
     CYAN = '\033[96m'
@@ -19,6 +38,7 @@ class PPrints:
 
     @staticmethod
     def unpack_result_indices(results_indices: any([str, list[int, int]]) = "Calculating"):
+        """Format either a calculation label or total/current result counters."""
         try:
             if results_indices.isalpha():
                 return f"Results: {results_indices}"
@@ -35,6 +55,7 @@ class PPrints:
 
     def print_with_lock(self, query: str, status: str, mode: str,
                         results_indices: any([str, list[int]]) = "Calculating", output_format: str = "CSV"):
+        """Print process, thread, memory, query, and result progress atomically."""
         version = "0.3b"
         with self._print_lock:
             memory_info = self._process.memory_info()
@@ -53,7 +74,7 @@ class PPrints:
                   f"{self.CYAN}RunningThreads: {active_count()-1}\n{self.BLUE}Mode: {mode}\n"
                   f"{self.GREEN}OutPutFile: {output_format}\n{self.BLUE}{results_index_data}\n"
                   f"{self.GREEN}LaunchedDrivers: {launched_drivers}\n"
-                  f"{self.RED}MemoryUsageByScript: {current_memory_usage: .2f}MB\n"
+                  f"{self.RED}Python RSS: {current_memory_usage: .2f}MB\n"
                   f"{self.RED}Warning: Don't open the output file while script is running\n"
                   f"{self.RESET}", end="\r")
 

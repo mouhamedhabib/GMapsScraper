@@ -10,6 +10,7 @@ from utils.google_search_discovery import (
     DISCOVERY_FIELDS,
     atomic_write_discoveries,
     is_suitable_company_url,
+    is_suitable_company_result,
     merge_discoveries,
     read_discoveries,
 )
@@ -66,6 +67,12 @@ class NormalizationAndFilteringTests(TestCase):
 
     def test_pdf_filtering(self):
         self.assertFalse(is_suitable_company_url("https://company.test/brochure.PDF?download=1"))
+
+    def test_ranked_startup_article_is_discovery_noise(self):
+        self.assertFalse(is_suitable_company_result(
+            "163 Top startups in Tunisia for August 2026",
+            "https://directory.test/blog/top-startups-tunisia",
+        ))
 
 
 class DiscoveryMergeTests(TestCase):

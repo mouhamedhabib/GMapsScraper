@@ -1,4 +1,25 @@
-"""Discover likely company websites from ordinary Google Search results."""
+"""
+Google Search Company Discovery
+===============================
+
+Purpose:
+    Discover likely official company websites from ordinary Google results
+    while excluding directories, social networks, job boards, and articles.
+
+Pipeline:
+    google_queries.txt -> google_search_discovery.py
+                       -> google_search_companies.csv -> build_leads.py
+
+Input:
+    One search query per line plus result-limit, delay, and browser settings.
+
+Output:
+    A resumable CSV of company name, normalized website, source query, URL,
+    and deterministic query-derived geographic metadata.
+
+Previous / next:
+    This is an optional discovery entry point; ``build_leads.py`` normally follows.
+"""
 
 from argparse import ArgumentParser
 from csv import DictReader, DictWriter
@@ -11,8 +32,14 @@ from urllib.parse import quote_plus, unquote_plus, urlsplit
 
 try:
     from utils.build_leads import clean_value, website_domain
+    from utils.discovery_timestamps import discovery_timestamp, earliest_added_at
+    from utils.geography import extract_queries_geography
+    from utils.known_companies import KnownCompanies
 except ModuleNotFoundError:  # Support direct execution from the utils directory.
     from build_leads import clean_value, website_domain
+    from discovery_timestamps import discovery_timestamp, earliest_added_at
+    from geography import extract_queries_geography
+    from known_companies import KnownCompanies
 
 
 DEFAULT_QUERY_FILE = Path("./google_queries.txt")
@@ -23,8 +50,15 @@ DISCOVERY_FIELDS = (
     "source",
     "source_query",
     "source_url",
+    "country",
+    "city",
+    "location",
+    "added_at",
 )
 
+# ---------------------------------------------------------------------------
+# OFFICIAL-WEBSITE FILTERS
+# ---------------------------------------------------------------------------
 # Keep this list explicit and conservative. Entries match the domain itself and
 # any of its subdomains.
 BLOCKED_DOMAINS = {
@@ -193,6 +227,7 @@ def domain_is_represented_by_title(domain, title):
 
 
 def is_suitable_company_result(title, url):
+    """Return whether URL and title evidence suggest an official company site."""
     if not is_suitable_company_url(url) or has_aggregator_title(title):
         return False
     domain = website_domain(url)
@@ -232,12 +267,16 @@ def normalize_discovery(row):
     company_name = clean_value(row.get("company_name"))
     if not is_suitable_company_result(company_name, source_url):
         return None
+    source_query = ";".join(split_provenance(row.get("source_query")))
+    geography = extract_queries_geography(source_query)
     return {
         "company_name": company_name_from_title(company_name),
         "website": normalized_website(source_url),
         "source": "google_search",
-        "source_query": ";".join(split_provenance(row.get("source_query"))),
+        "source_query": source_query,
         "source_url": source_url,
+        **geography,
+        "added_at": clean_value(row.get("added_at")),
     }
 
 
@@ -260,11 +299,33 @@ def merge_discoveries(existing_rows, new_rows):
         for query in split_provenance(row["source_query"]):
             add_unique(queries, query)
         current["source_query"] = ";".join(queries)
+        # Re-resolve after merging provenance: compatible queries can supply a
+        # missing city, while conflicting markets must remain visibly blank.
+        current.update(extract_queries_geography(current["source_query"]))
         if not current["company_name"] and row["company_name"]:
             current["company_name"] = row["company_name"]
         if not current["source_url"] and row["source_url"]:
             current["source_url"] = row["source_url"]
+        current["added_at"] = earliest_added_at(
+            (current.get("added_at"), row.get("added_at"))
+        )
     return merged
+
+
+def merge_accepted_discoveries(existing_rows, candidate_rows):
+    """Timestamp only domains that are absent from the durable checkpoint."""
+    discoveries = merge_discoveries(existing_rows, [])
+    known_domains = {website_domain(row.get("website")) for row in discoveries}
+    prepared = []
+    for candidate in candidate_rows:
+        row = dict(candidate)
+        normalized = normalize_discovery(row)
+        domain = website_domain(normalized.get("website")) if normalized else ""
+        if domain and domain not in known_domains:
+            row["added_at"] = discovery_timestamp()
+            known_domains.add(domain)
+        prepared.append(row)
+    return merge_discoveries(discoveries, prepared)
 
 
 def read_discoveries(path):
@@ -275,6 +336,7 @@ def read_discoveries(path):
 
 
 def atomic_write_discoveries(path, rows):
+    """Replace the CSV atomically so an interrupted run retains prior progress."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
@@ -375,9 +437,12 @@ def read_current_search_results(driver, query, limit, timeout, verbose=False):
     return rows, ""
 
 
-def search_query(driver, query, limit, timeout, verbose=False):
+def search_query(driver, query, limit, timeout, verbose=False, start=0):
     driver.set_page_load_timeout(timeout)
-    driver.get("https://www.google.com/search?q=" + quote_plus(query))
+    url = "https://www.google.com/search?q=" + quote_plus(query)
+    if start:
+        url += f"&start={start}"
+    driver.get(url)
     return read_current_search_results(
         driver,
         query,
@@ -385,6 +450,17 @@ def search_query(driver, query, limit, timeout, verbose=False):
         timeout,
         verbose=verbose,
     )
+
+
+def has_next_search_page(driver):
+    """Return whether rendered Search controls advertise another result page."""
+    try:
+        return bool(driver.find_elements(
+            "css selector",
+            "a#pnnext, a[aria-label='Next page'], a[aria-label='Next']",
+        ))
+    except Exception:
+        return False
 
 
 def wait_for_manual_verification(
@@ -396,10 +472,16 @@ def wait_for_manual_verification(
     discoveries,
     verbose=False,
     input_function=None,
+    checkpoint_function=None,
+    result_reader=None,
 ):
     """Wait for explicit confirmation while a person clears verification."""
     input_function = input_function or input
-    atomic_write_discoveries(output_path, discoveries)
+    checkpoint_function = checkpoint_function or (
+        lambda: atomic_write_discoveries(output_path, discoveries)
+    )
+    result_reader = result_reader or read_current_search_results
+    checkpoint_function()
     print("[!] Google verification required.")
     print("[!] Solve the CAPTCHA / verification manually in the Chrome window.")
     print("[!] When normal Google Search results are visible again, return here and press ENTER.")
@@ -410,11 +492,11 @@ def wait_for_manual_verification(
             choice = input_function("Press ENTER to continue, or q to quit: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\n[!] Manual verification aborted; saved current progress.")
-            atomic_write_discoveries(output_path, discoveries)
+            checkpoint_function()
             return [], True
 
         if choice == "q":
-            atomic_write_discoveries(output_path, discoveries)
+            checkpoint_function()
             print("[!] Discovery stopped safely; saved current progress.")
             return [], True
         if choice:
@@ -423,11 +505,11 @@ def wait_for_manual_verification(
 
         blocked_marker = blocked_search_page(driver)
         if blocked_marker:
-            atomic_write_discoveries(output_path, discoveries)
+            checkpoint_function()
             print(f"[!] Google verification is still present ({blocked_marker}).")
             continue
 
-        rows, blocked_marker = read_current_search_results(
+        rows, blocked_marker = result_reader(
             driver,
             query,
             limit,
@@ -435,7 +517,7 @@ def wait_for_manual_verification(
             verbose=verbose,
         )
         if blocked_marker:
-            atomic_write_discoveries(output_path, discoveries)
+            checkpoint_function()
             print(f"[!] Google verification is still present ({blocked_marker}).")
             continue
         print("[+] Google verification cleared; resuming the current query.")
@@ -453,11 +535,17 @@ def discover_companies(
     driver_factory=None,
     input_function=None,
     rebuild=False,
+    incremental=False,
 ):
+    """Run all queries, merge unique domains, and checkpoint after each query."""
     query_file = Path(query_file)
     output_path = Path(output_path)
     queries = load_queries(query_file)
     discoveries = [] if rebuild else merge_discoveries(read_discoveries(output_path), [])
+    known_companies = (
+        KnownCompanies.from_directory(output_path.parent) if incremental else None
+    )
+    overall = {"queries": 0, "inspected": 0, "known": 0, "same_run": 0, "new": 0}
     if not queries or limit == 0:
         atomic_write_discoveries(output_path, discoveries)
         return discoveries
@@ -473,31 +561,94 @@ def discover_companies(
             if verbose:
                 print(f"[+] Searching: {query}")
             try:
-                rows, blocked_marker = search_query(
-                    driver, query, limit, timeout, verbose=verbose
-                )
-                if blocked_marker:
-                    atomic_write_discoveries(output_path, discoveries)
-                    if not windowed:
-                        print(
-                            "[!] Google verification detected; manual verification "
-                            "requires --windowed. Saved progress and stopped safely."
-                        )
-                        break
-                    rows, should_stop = wait_for_manual_verification(
-                        driver,
-                        query,
-                        limit,
-                        timeout,
-                        output_path,
-                        discoveries,
-                        verbose=verbose,
-                        input_function=input_function,
+                query_stats = {"inspected": 0, "known": 0, "same_run": 0, "new": 0}
+                page_start = 0
+                page_attempts = 0
+                inspection_limit = max(100, limit * 10) if incremental else limit
+                should_stop_all = False
+                while (
+                    query_stats["inspected"] < inspection_limit
+                    and (not incremental or page_attempts * 10 < inspection_limit)
+                ):
+                    page_attempts += 1
+                    page_limit = (
+                        min(10, inspection_limit - query_stats["inspected"])
+                        if incremental else limit
                     )
-                    if should_stop:
+                    rows, blocked_marker = search_query(
+                        driver, query, page_limit,
+                        timeout, verbose=verbose, start=page_start,
+                    )
+                    if blocked_marker:
+                        atomic_write_discoveries(output_path, discoveries)
+                        if not windowed:
+                            print(
+                                "[!] Google verification detected; manual verification "
+                                "requires --windowed. Saved progress and stopped safely."
+                            )
+                            should_stop_all = True
+                            break
+                        rows, should_stop = wait_for_manual_verification(
+                            driver, query, page_limit, timeout,
+                            output_path, discoveries, verbose=verbose,
+                            input_function=input_function,
+                        )
+                        if should_stop:
+                            should_stop_all = True
+                            break
+
+                    if not incremental:
+                        discoveries = merge_accepted_discoveries(discoveries, rows)
+                        atomic_write_discoveries(output_path, discoveries)
+                        query_stats["inspected"] += len(rows)
+                        query_stats["new"] += len(rows)
                         break
-                discoveries = merge_discoveries(discoveries, rows)
-                atomic_write_discoveries(output_path, discoveries)
+
+                    if not rows:
+                        if has_next_search_page(driver):
+                            page_start += 10
+                            continue
+                        break
+                    for row in rows:
+                        if query_stats["inspected"] >= inspection_limit:
+                            break
+                        query_stats["inspected"] += 1
+                        duplicate_kind = known_companies.duplicate_kind(row)
+                        if duplicate_kind:
+                            query_stats[duplicate_kind] += 1
+                            continue
+                        if query_stats["new"] >= limit:
+                            break
+                        accepted_row = dict(row)
+                        accepted_row["added_at"] = discovery_timestamp()
+                        updated = merge_discoveries(discoveries, [accepted_row])
+                        if len(updated) == len(discoveries):
+                            query_stats["same_run"] += 1
+                            known_companies.add(row)
+                            continue
+                        # Checkpoint every accepted company. Only after the
+                        # atomic replace succeeds does it become known in memory.
+                        atomic_write_discoveries(output_path, updated)
+                        discoveries = updated
+                        known_companies.add(row)
+                        query_stats["new"] += 1
+                    if query_stats["new"] >= limit:
+                        break
+                    if len(rows) < min(10, inspection_limit) and not has_next_search_page(driver):
+                        break
+                    page_start += 10
+
+                if incremental:
+                    overall["queries"] += 1
+                    for key in ("inspected", "known", "same_run", "new"):
+                        overall[key] += query_stats[key]
+                    print(f"Query: {query}")
+                    print(f"Inspected results: {query_stats['inspected']}")
+                    print(f"Already known skipped: {query_stats['known']}")
+                    print(f"Same-run duplicates skipped: {query_stats['same_run']}")
+                    print(f"New companies added: {query_stats['new']}")
+                if should_stop_all:
+                    break
                 if verbose:
                     print(f"[+] Stored {len(discoveries)} unique company domains")
             except Exception as error:
@@ -510,6 +661,13 @@ def discover_companies(
                 driver.quit()
             except Exception:
                 pass
+    if incremental:
+        print("Overall:")
+        print(f"Queries processed: {overall['queries']}")
+        print(f"Results inspected: {overall['inspected']}")
+        print(f"Known duplicates skipped: {overall['known']}")
+        print(f"Same-run duplicates skipped: {overall['same_run']}")
+        print(f"New companies added: {overall['new']}")
     return discoveries
 
 
@@ -522,6 +680,10 @@ def parse_arguments():
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--incremental", action="store_true",
+        help="Make --limit count only new domains and continue through result pages",
+    )
     parser.add_argument(
         "--rebuild",
         action="store_true",
@@ -550,6 +712,7 @@ def main():
         windowed=arguments.windowed,
         verbose=arguments.verbose,
         rebuild=arguments.rebuild,
+        incremental=arguments.incremental,
     )
     print(f"Unique company domains: {len(discoveries)}")
     print(f"Output: {arguments.output}")

@@ -1,3 +1,24 @@
+"""
+Google Maps Scraper CLI
+=======================
+
+Purpose:
+    Parse command-line options and start concurrent Google Maps scraping.
+
+Pipeline:
+    queries.txt -> maps.py -> google_maps_scraper.py -> google_maps_data.*
+
+Input:
+    A text file containing one Maps search query per line.
+
+Output:
+    Google Maps business records in CSV, JSON, or Excel format. The CSV output
+    is normally consumed next by ``utils/build_leads.py``.
+
+Previous / next:
+    This is the pipeline entry point; ``utils/build_leads.py`` normally follows.
+"""
+
 from utils.threading_controller import FastSearchAlgo
 from argparse import ArgumentParser
 from os.path import isfile
@@ -5,10 +26,13 @@ import sys
 
 
 class GMapsScraper:
+    """Translate CLI settings into one configured, concurrent Maps scrape."""
+
     def __init__(self):
         self._args = None
 
     def arg_parser(self):
+        """Parse scraper options and store the resulting command-line namespace."""
         parser = ArgumentParser(description='Command Line Google Map Scraper by Abdul Moez')
 
         # Input options
@@ -20,6 +44,10 @@ class GMapsScraper:
         parser.add_argument('-l', '--limit',
                             help='Number of results to scrape (-1 for all results, default: -1)',
                             type=int, default=-1)
+        parser.add_argument(
+            '--incremental', action='store_true',
+            help='Make --limit count only new companies and skip known identities early',
+        )
         parser.add_argument('-u', '--unavailable-text',
                             help='Replacement text for unavailable information (default: "Not Available")', type=str,
                             default="Not Available")
@@ -45,6 +73,13 @@ class GMapsScraper:
                             help='Maximum minutes to wait for end of results the waiting time in minutes (default: 1)',
                             type=int,
                             default=1)
+        parser.add_argument(
+            '--low-resource', action='store_true',
+            help=(
+                'Use one worker and resource-conscious Chrome settings; '
+                'legacy -w behavior is unchanged without this flag'
+            ),
+        )
 
         # Custom commands for additional help
         parser.add_argument('--help-query-file',
@@ -55,6 +90,8 @@ class GMapsScraper:
                             help='Get help for specifying the driver path')
 
         self._args = parser.parse_args()
+        if self._args.incremental and self._args.output_format != "CSV":
+            parser.error("--incremental requires --output-format CSV for restart-safe state")
 
     @staticmethod
     def print_query_file_help():
@@ -72,12 +109,14 @@ class GMapsScraper:
         sys.exit(0)
 
     def check_args(self):
+        """Stop with a clear error when the required query file does not exist."""
         q = self._args.query_file
         if not isfile(q):
             print(f"[-] File not found at path: {q}")
             sys.exit(1)
 
     def scrape_maps_data(self):
+        """Load queries, configure worker limits, and run the Maps scraper."""
         self.check_args()
 
         if self._args.help_query_file:
@@ -88,6 +127,8 @@ class GMapsScraper:
 
         queries_list = FastSearchAlgo.load_query_file(file_name=self._args.query_file)
         threads_limit = min(self._args.threads, len(queries_list))
+        if self._args.low_resource:
+            threads_limit = min(threads_limit, 1)
         limit_results = None if self._args.limit == -1 else self._args.limit
 
         algo_obj = FastSearchAlgo(
@@ -101,6 +142,8 @@ class GMapsScraper:
             scroll_minutes=self._args.scroll_minutes,
             verbose=False if self._args.disable_verbose else True,
             output_format=self._args.output_format,
+            incremental=self._args.incremental,
+            low_resource=self._args.low_resource,
         )
 
         algo_obj.fast_search_algorithm(queries_list)

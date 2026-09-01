@@ -1,4 +1,23 @@
-"""Build the final outreach and review CSVs from enriched local lead data."""
+"""
+Outreach Export Builder
+=======================
+
+Purpose:
+    Convert enriched leads into a deduplicated outreach dataset while retaining
+    incomplete or locally flagged records in a companion review export.
+
+Pipeline:
+    leads_enriched_final.csv -> build_outreach.py -> outreach_ready.csv
+                                                -> outreach_review.csv
+
+Input:
+    Enriched lead rows plus nearby master, review, and raw Maps files used to
+    recover trustworthy geography and preserve earlier review decisions.
+
+Output:
+    Outreach-ready rows and a review subset. ``build_outreach_queue.py`` normally
+    consumes ``outreach_ready.csv`` next.
+"""
 
 from argparse import ArgumentParser
 from csv import DictReader, DictWriter
@@ -7,6 +26,11 @@ from pathlib import Path
 from re import IGNORECASE, compile
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
+
+try:
+    from utils.discovery_timestamps import earliest_added_at
+except ModuleNotFoundError:
+    from discovery_timestamps import earliest_added_at
 
 
 DEFAULT_INPUT = Path("./CSV_FILES/leads_enriched_final.csv")
@@ -17,13 +41,16 @@ OUTPUT_FIELDS = (
     "company_name",
     "email",
     "website",
+    "added_at",
+    "country",
+    "city",
+    "location",
     "description",
     "industry",
     "services",
     "website_title",
     "website_meta_description",
     "about_text",
-    "location",
     "linkedin_url",
     "phone",
     "contact_name",
@@ -31,6 +58,12 @@ OUTPUT_FIELDS = (
     "recent_project_news",
     "enrichment_status",
 )
+
+# ---------------------------------------------------------------------------
+# OUTREACH ELIGIBILITY
+# ---------------------------------------------------------------------------
+# Only leads with useful enrichment and a non-placeholder email may enter the
+# outreach export; partial or previously flagged rows remain visible for review.
 
 ELIGIBLE_STATUSES = {"SUCCESS", "PARTIAL"}
 UNAVAILABLE_VALUES = {
@@ -136,6 +169,9 @@ def atomic_write_csv(path, rows):
             temporary_path.unlink()
 
 
+GEOGRAPHY_FIELDS = ("country", "city", "location")
+
+
 def add_index_value(index, key, value):
     if key and value:
         index.setdefault(key, set()).add(value)
@@ -148,29 +184,27 @@ def local_csv_paths(input_path):
     )
 
 
-def load_location_indexes(input_path):
-    domain_locations = {}
-    name_locations = {}
+def load_geography_indexes(input_path):
+    """Index geography from nearby lead and Maps files for conservative recovery."""
+    domain_values = {field: {} for field in GEOGRAPHY_FIELDS}
+    name_values = {field: {} for field in GEOGRAPHY_FIELDS}
     for source_path in local_csv_paths(input_path):
         if source_path == input_path or not source_path.exists():
             continue
         for row in read_csv(source_path):
-            location = clean_value(row.get("location") or row.get("address"))
-            if not location:
-                continue
             website = row.get("website") or row.get("webpage")
             name = row.get("company_name") or row.get("name") or row.get("title")
-            add_index_value(
-                domain_locations,
-                normalize_website_domain(website),
-                location,
-            )
-            add_index_value(
-                name_locations,
-                normalize_company_name(name),
-                location,
-            )
-    return domain_locations, name_locations
+            for field in GEOGRAPHY_FIELDS:
+                value = clean_value(row.get(field))
+                if field == "location" and not value:
+                    value = clean_value(row.get("address"))
+                add_index_value(
+                    domain_values[field], normalize_website_domain(website), value,
+                )
+                add_index_value(
+                    name_values[field], normalize_company_name(name), value,
+                )
+    return domain_values, name_values
 
 
 def unique_index_value(index, key):
@@ -178,16 +212,16 @@ def unique_index_value(index, key):
     return next(iter(values)) if len(values) == 1 else ""
 
 
-def recover_location(row, domain_locations, name_locations):
-    location = clean_value(row.get("location"))
-    if location:
-        return location
+def recover_geography(field, row, domain_values, name_values):
+    value = clean_value(row.get(field))
+    if value:
+        return value
     domain = normalize_website_domain(row.get("website"))
-    location = unique_index_value(domain_locations, domain) if domain else ""
-    if location:
-        return location
+    value = unique_index_value(domain_values[field], domain) if domain else ""
+    if value:
+        return value
     name = normalize_company_name(row.get("company_name"))
-    return unique_index_value(name_locations, name) if name else ""
+    return unique_index_value(name_values[field], name) if name else ""
 
 
 def flagged_local_record(row):
@@ -201,6 +235,7 @@ def flagged_local_record(row):
 
 
 def load_review_indexes(input_path):
+    """Return domain/name indexes for records flagged earlier in lead building."""
     flagged_domains = set()
     flagged_names = set()
     name_identities = {}
@@ -261,6 +296,7 @@ def preference_key(row):
 
 
 def merge_duplicate_rows(rows):
+    """Combine duplicate identities, preferring the most complete enrichment row."""
     ranked_rows = sorted(rows, key=preference_key, reverse=True)
     merged = {field: "" for field in OUTPUT_FIELDS}
     for row in ranked_rows:
@@ -273,10 +309,12 @@ def merge_duplicate_rows(rows):
     merged["enrichment_status"] = clean_value(
         ranked_rows[0].get("enrichment_status")
     ).upper()
+    merged["added_at"] = earliest_added_at(row.get("added_at") for row in rows)
     return merged
 
 
 def build_outreach(input_path, output_path, review_output_path):
+    """Write deduplicated outreach and review CSVs and return row-count metrics."""
     input_rows = read_csv(input_path)
     status_counts = {"SUCCESS": 0, "PARTIAL": 0}
     excluded_statuses = 0
@@ -300,17 +338,16 @@ def build_outreach(input_path, output_path, review_output_path):
             group_order.append(identity)
         groups[identity].append(row)
 
-    domain_locations, name_locations = load_location_indexes(input_path)
+    domain_geography, name_geography = load_geography_indexes(input_path)
     flagged_domains, flagged_names, name_identities = load_review_indexes(input_path)
     outreach_rows = []
     review_rows = []
     for identity in group_order:
         output_row = merge_duplicate_rows(groups[identity])
-        output_row["location"] = recover_location(
-            output_row,
-            domain_locations,
-            name_locations,
-        )
+        for field in GEOGRAPHY_FIELDS:
+            output_row[field] = recover_geography(
+                field, output_row, domain_geography, name_geography,
+            )
         outreach_rows.append(output_row)
         if (
             output_row["enrichment_status"] == "PARTIAL"

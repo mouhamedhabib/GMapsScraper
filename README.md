@@ -77,6 +77,15 @@ python maps.py \
 
 Use `python maps.py --help` to see the CLI help.
 
+For incremental discovery, keep the CSV output in `CSV_FILES` and add
+`--incremental`. Existing identities are loaded once from `leads_master.csv`,
+`google_maps_data.csv`, and `google_search_companies.csv`. In this mode `-l`
+counts newly accepted companies rather than already-known result cards:
+
+```bash
+python3 maps.py -q queries.txt -l 15 -o ./CSV_FILES -of CSV --incremental
+```
+
 ### Command-line options
 
 | Option | Description | Default |
@@ -84,6 +93,7 @@ Use `python maps.py --help` to see the CLI help.
 | `-q`, `--query-file` | Text file containing one query or Maps URL per line | `./queries.txt` |
 | `-w`, `--threads` | Number of concurrent query workers | `1` |
 | `-l`, `--limit` | Maximum results per query; `-1` means all available results | `-1` |
+| `--incremental` | Skip known identities early and make `--limit` count new companies | off |
 | `-u`, `--unavailable-text` | Text used when a value cannot be found | `Not Available` |
 | `-bw`, `--browser-wait` | Browser and page wait timeout in seconds | `15` |
 | `-se`, `--suggested-ext` | Website path to inspect for contacts; repeat for multiple paths | none |
@@ -139,6 +149,51 @@ The builder normalizes unavailable values, rejects malformed or placeholder emai
 
 The lead builder currently expects CSV columns produced by this scraper (`title`, `webpage`, `phone_number`, and `site_email`). Export with `-of CSV` before running it.
 
+### Recover missing emails from any source
+
+After building `leads_master.csv`, the missing-email enricher checks every lead
+that lacks a valid email and has a usable HTTP(S) website. Maps, Search, and
+mixed-source leads are all eligible. Progress is saved after every attempt in
+`missing_email_enriched.csv`.
+
+Test a 10-company batch:
+
+```bash
+python3 -m utils.enrich_missing_emails \
+  --input CSV_FILES/leads_master.csv \
+  --output CSV_FILES/missing_email_enriched.csv \
+  --timeout 15 \
+  --limit 10 \
+  --verbose
+```
+
+For the full run, omit `--limit`. Then run `build_leads.py` again; it reads both
+`search_email_enriched.csv` and `missing_email_enriched.csv` automatically.
+Successful emails still pass through the builder's normal validation and
+deduplication rules. Use `--retry-failed` to retry FAILED websites, up to the
+three-attempt lifetime maximum.
+
+If direct enrichment finishes as `NOT_FOUND` or `FAILED`, the bounded Search
+fallback can inspect up to four company/domain-specific Google queries. It
+opens at most two explicit contact/about results, shares one 10–15 second
+deadline across the company, and checkpoints `search_email_fallback.csv` after
+each company. For a controlled 20-company run:
+
+```bash
+python3 -m utils.search_email_fallback \
+  --input CSV_FILES/leads_master.csv \
+  --enrichment-input CSV_FILES/missing_email_enriched.csv \
+  --output CSV_FILES/search_email_fallback.csv \
+  --limit 20 \
+  --timeout 12 \
+  --windowed \
+  --verbose
+```
+
+Use the windowed mode to solve Google verification manually if prompted; the
+fallback does not automate CAPTCHA handling. The lead builder reads successful
+fallback rows automatically and revalidates every email with its normal rules.
+
 ## Google Search company discovery
 
 Google Search discovery is a separate, optional source and does not change the
@@ -158,6 +213,15 @@ Add `--windowed` to show Chrome. Discoveries are atomically written to
 `company_name,website,source,source_query,source_url`. Repeated runs merge by
 normalized website domain and preserve distinct search queries.
 
+Add `--incremental` to skip domains already present in Maps, Search, or the
+lead master and continue through current result pages until `-l` new domains
+have been saved (or results/the deterministic inspection bound are exhausted):
+
+```bash
+python3 utils/google_search_discovery.py \
+  -q google_queries.txt -l 15 --incremental --delay 3 --timeout 15
+```
+
 The normal `build_leads.py` command automatically reads this discovery file
 when present. It merges Maps and Search records by the existing company
 identity rules and records `source` and `source_queries` in `leads_master.csv`.
@@ -166,6 +230,11 @@ The four-column `leads_ready.csv` format remains unchanged.
 Google Search discovery does not extract email addresses. Search-only records
 therefore remain in `leads_master.csv` and do not enter `leads_ready.csv` until
 a future, separate process obtains and validates an email address.
+
+Ranked-list/article titles such as “163 Top startups in Tunisia for August
+2026” are discovery noise, not company records. The current focused title/path
+filter identifies this case; broader discovery cleanup is intentionally a
+separate task.
 
 ## Troubleshooting
 

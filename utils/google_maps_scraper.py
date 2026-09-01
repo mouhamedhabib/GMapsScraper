@@ -1,3 +1,23 @@
+"""
+Google Maps Result Scraper
+==========================
+
+Purpose:
+    Drive one Chrome session through Google Maps results and extract business
+    details, including public contact data found on company websites.
+
+Pipeline:
+    maps.py -> threading_controller.py -> google_maps_scraper.py
+            -> output_files_formats.py -> google_maps_data.*
+
+Input:
+    One search query plus browser, timeout, result-limit, and output settings.
+
+Output:
+    Dictionaries of business fields, source query, and conservative geographic
+    metadata passed to the selected CSV, JSON, or Excel writer.
+"""
+
 from selenium.common.exceptions import (TimeoutException, NoSuchElementException, StaleElementReferenceException,
                                         NoSuchWindowException)
 from utils.output_files_formats import CSVCreator, XLSXCreator, JSONCreator
@@ -9,6 +29,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.by import By
 import undetected_chromedriver as uc
 from utils.pprints import PPrints
+from utils.geography import resolve_maps_geography
 from threading import Lock, Event
 from subprocess import check_output, DEVNULL
 from platform import system as platform_system
@@ -16,11 +37,13 @@ from time import time, sleep
 from random import uniform
 from os import makedirs
 import re
+from utils.known_companies import KnownCompanies
+from utils.discovery_timestamps import discovery_timestamp
 
 
 class GoogleMaps:
     """
-    A web scraping class for extracting data from Google Maps search results.
+    Extract business records from Google Maps and persist each completed batch.
 
     Attributes:
         _maps_url (str): The base URL for Google Maps.
@@ -95,6 +118,9 @@ class GoogleMaps:
             Start the scraping process for a given query.
     """
 
+    # -----------------------------------------------------------------------
+    # GOOGLE MAPS BROWSER CONFIGURATION
+    # -----------------------------------------------------------------------
     # hl=en forces the English UI so the aria-label/text-based selectors used below
     # (hours, about, cover photo, price) resolve regardless of the visitor's region.
     _maps_url = "https://www.google.com/maps?hl=en"
@@ -106,7 +132,12 @@ class GoogleMaps:
                  output_path: str = "./OUTPUT_FILES", verbose: bool = True,
                  print_lock: Lock = None, result_range: int = None,
                  stop_event: Event = Event(),
-                 scroll_minutes: int = 1
+                 scroll_minutes: int = 1,
+                 incremental: bool = False,
+                 known_companies: KnownCompanies = None,
+                 summary: dict = None,
+                 summary_lock: Lock = None,
+                 low_resource: bool = False,
                  ) -> None:
         """
         Initialize the GoogleMaps scraper instance.
@@ -138,6 +169,24 @@ class GoogleMaps:
         self._thread_lock = print_lock
         self.__output_format = output_format
         self._scroll_minutes = scroll_minutes
+        self._incremental = incremental
+        self._known_companies = known_companies or (
+            KnownCompanies.from_directory(output_path) if incremental else None
+        )
+        self._summary = summary
+        self._summary_lock = summary_lock or Lock()
+        self._inspection_limit = (
+            max(100, result_range * 10)
+            if incremental and result_range is not None
+            else result_range
+        )
+        self._pending_identity = None
+        self._low_resource = low_resource
+        self._driver = None
+        self._browser_instances_created = 0
+        self._browser_instances_recreated = 0
+        self._maps_tabs_opened = 0
+        self._maps_tabs_closed = 0
 
         self._web_pattern_scraper = PatternScrapper(wait_time=self._wait_time, verbose=self._verbose)
         if self.__output_format.lower() == "json":
@@ -198,13 +247,104 @@ class GoogleMaps:
         options = uc.ChromeOptions()
         options.add_argument(argument='--title=Developer - Google Maps Scraper')
         options.add_argument(argument='--disable-popup-blocking')
+        if self._low_resource:
+            self.configure_low_resource_options(options)
         options.add_extension(extension=self._finger_print_defender_ext)
         chrome_version = self.detect_chrome_major_version()
         driver = uc.Chrome(options=options, headless=self._headless, use_subprocess=False,
                            version_main=chrome_version or None)
+        if self._low_resource:
+            self.apply_low_resource_blocking(driver)
         self._wait = WebDriverWait(driver, self._wait_time, ignored_exceptions=(NoSuchElementException,
                                                                                 StaleElementReferenceException))
         return driver
+
+    @staticmethod
+    def configure_low_resource_options(options) -> None:
+        """Apply conservative settings without disabling Maps JavaScript or CSS."""
+        for argument in (
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-notifications",
+            "--autoplay-policy=user-gesture-required",
+        ):
+            options.add_argument(argument)
+        options.add_experimental_option("prefs", {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.notifications": 2,
+        })
+
+    @staticmethod
+    def apply_low_resource_blocking(driver) -> None:
+        """Block font and video payloads while retaining DOM, JavaScript, and CSS."""
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": [
+                "*.woff", "*.woff2", "*.ttf", "*.otf",
+                "*.mp4", "*.webm", "*.avi", "*.mov",
+            ]})
+        except Exception:
+            # Older Chrome/driver combinations may not expose CDP. Scraping is
+            # still correct; the optional byte-saving layer is simply skipped.
+            pass
+
+    def get_or_create_driver(self):
+        """Return this worker's single long-lived browser instance."""
+        if self._driver is None:
+            self._driver = self.create_chrome_driver()
+            if self._browser_instances_created:
+                self._browser_instances_recreated += 1
+            self._browser_instances_created += 1
+        return self._driver
+
+    def quit_driver(self):
+        """Quit the full Chrome/Chromedriver process tree owned by this worker."""
+        driver, self._driver = self._driver, None
+        self._wait = None
+        self._main_handler = None
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    def resource_metrics(self):
+        return {
+            "browser_instances_created": self._browser_instances_created,
+            "browser_instances_recreated": self._browser_instances_recreated,
+            "temporary_tabs_opened": (
+                self._maps_tabs_opened
+                + self._web_pattern_scraper.temporary_tabs_opened
+            ),
+            "temporary_tabs_closed": (
+                self._maps_tabs_closed
+                + self._web_pattern_scraper.temporary_tabs_closed
+            ),
+        }
+
+    def close_extra_tabs(self, driver) -> None:
+        """Close every non-Maps handle and restore the Maps window."""
+        try:
+            handles = list(driver.window_handles)
+        except Exception:
+            return
+        for handle in handles:
+            if handle == self._main_handler:
+                continue
+            try:
+                driver.switch_to.window(handle)
+                driver.close()
+                self._maps_tabs_closed += 1
+            except Exception:
+                pass
+        try:
+            if self._main_handler in driver.window_handles:
+                driver.switch_to.window(self._main_handler)
+        except Exception:
+            pass
 
     @staticmethod
     def load_url(driver: WebDriver, url: str) -> None:
@@ -240,6 +380,7 @@ class GoogleMaps:
             get_link = result.get_attribute("href")
             # Pass the href as an argument so a URL containing quotes can't break the script.
             driver.execute_script('window.open(arguments[0], "_blank");', get_link)
+            self._maps_tabs_opened += 1
             driver.switch_to.window(driver.window_handles[-1])
         else:
             get_link = None
@@ -523,6 +664,7 @@ class GoogleMaps:
         """
         if result != "continue":
             driver.close()
+            self._maps_tabs_closed += 1
             driver.switch_to.window(self._main_handler)
             self._wait.until(EC.presence_of_element_located((By.CLASS_NAME, "hfpxzc")))
 
@@ -545,8 +687,8 @@ class GoogleMaps:
         stagnant_rounds = 0
         while True:
             results = driver.find_elements(By.CLASS_NAME, 'hfpxzc')
-            if self._results_range and len(results) >= self._results_range:
-                results = results[:self._results_range]
+            if self._inspection_limit and len(results) >= self._inspection_limit:
+                results = results[:self._inspection_limit]
                 break
 
             # The feed can transiently return no cards while re-rendering.
@@ -608,13 +750,36 @@ class GoogleMaps:
         self.__pprint_override(query=query, status="Getting Latitude and longitude", results_indices=results_indices)
         lat, long, map_link = self.validate_result_link(result, driver)
 
-        # get cover image
-        self.__pprint_override(query=query, status="Getting cover image", results_indices=results_indices)
-        cover_image = self.get_cover_image(driver)
-
         # get title
         self.__pprint_override(query=query, status="Getting title", results_indices=results_indices)
         card_title = self.get_title(driver)
+
+        # Read the remaining cheap, strong identifiers before any website or
+        # about/contact enrichment. Known companies return immediately.
+        self.__pprint_override(query=query, status="Getting WebLink", results_indices=results_indices)
+        card_website_link = self.get_website_link(driver)
+        self.__pprint_override(query=query, status="Getting Phone Number", results_indices=results_indices)
+        card_phone_number = self.get_phone_number(driver)
+        identity = {
+            "title": card_title,
+            "map_link": map_link,
+            "webpage": card_website_link,
+            "phone_number": card_phone_number,
+        }
+        if self._incremental:
+            duplicate_kind = self._known_companies.duplicate_kind(identity)
+            if duplicate_kind:
+                self.reset_driver_for_next_run(result, driver)
+                return duplicate_kind
+            # Reserve atomically so another query/thread skips the same company.
+            if not self._known_companies.check_and_add(identity):
+                self.reset_driver_for_next_run(result, driver)
+                return "same_run"
+            self._pending_identity = identity
+
+        # get cover image
+        self.__pprint_override(query=query, status="Getting cover image", results_indices=results_indices)
+        cover_image = self.get_cover_image(driver)
 
         # get rating
         self.__pprint_override(query=query, status="Getting rating", results_indices=results_indices)
@@ -631,6 +796,10 @@ class GoogleMaps:
         # get address
         self.__pprint_override(query=query, status="Getting Address", results_indices=results_indices)
         card_address = self.get_address(driver)
+        # An address is stronger evidence than the discovery query. The query
+        # is only used to fill gaps, which avoids replacing Maps evidence with
+        # a broad or ambiguous prospecting phrase.
+        geography = resolve_maps_geography(card_address, query)
 
         # get working hours
         self.__pprint_override(query=query, status="Getting Working hours", results_indices=results_indices)
@@ -640,18 +809,10 @@ class GoogleMaps:
         self.__pprint_override(query=query, status="Getting Menu Links", results_indices=results_indices)
         card_menu_link = self.get_menu_link(driver)
 
-        # get website link
-        self.__pprint_override(query=query, status="Getting WebLink", results_indices=results_indices)
-        card_website_link = self.get_website_link(driver)
-
         # get website data
         self.__pprint_override(query=query, status="Getting WebLink Data", results_indices=results_indices)
         website_data = self._web_pattern_scraper.find_patterns(driver, card_website_link, self._suggested_ext,
                                                                self._unavailable_text)
-
-        # get phone number
-        self.__pprint_override(query=query, status="Getting Phone Number", results_indices=results_indices)
-        card_phone_number = self.get_phone_number(driver)
 
         # get card images
         self.__pprint_override(query=query, status="Getting Images links", results_indices=results_indices)
@@ -675,6 +836,8 @@ class GoogleMaps:
         temp_data["privacy_price"] = privacy_price
         temp_data["category"] = card_category
         temp_data["address"] = card_address
+        temp_data["source_query"] = query
+        temp_data.update(geography)
         temp_data["working_hours"] = card_hours
         temp_data["menu_link"] = card_menu_link
         temp_data["webpage"] = card_website_link
@@ -690,9 +853,14 @@ class GoogleMaps:
         temp_data.update(card_about)
 
         # Store data in runtime
+        # This is the first durable acceptance point. Duplicate exits above
+        # never reach it, so known and same-run companies keep their old date.
+        temp_data["added_at"] = discovery_timestamp()
         temp_list = [temp_data]
         self.__pprint_override(query=query, status="Dumping data in CSV file", results_indices=results_indices)
         self._file_creator.create(list_of_dict_data=temp_list)
+        self._pending_identity = None
+        return "new"
 
     def start_scrapper(self, query: str) -> None:
         """
@@ -706,7 +874,7 @@ class GoogleMaps:
             else:
                 self.__pprint_override(query=query, status="Running the script")
 
-            driver = self.create_chrome_driver()
+            driver = self.get_or_create_driver()
             self.__pprint_override(query=query, status="Loading URL")
 
             if query.lower().strip().startswith("http"):
@@ -726,18 +894,35 @@ class GoogleMaps:
             results = self.scroll_to_the_end_event(driver)
 
             result_indices = [len(results), 1]
+            stats = {"inspected": 0, "known": 0, "same_run": 0, "new": 0}
             for result in results:
                 if self._stop_event.is_set():
                     break
+                if self._incremental and self._results_range is not None and stats["new"] >= self._results_range:
+                    break
                 try:
+                    stats["inspected"] += 1
+                    if self._incremental and result != "continue":
+                        href = result.get_attribute("href") or ""
+                        duplicate_kind = self._known_companies.duplicate_kind({"map_link": href})
+                        if duplicate_kind:
+                            stats[duplicate_kind] += 1
+                            continue
                     # Scrape and store data
-                    self._scrape_result_and_store(driver=driver, result=result, query=query,
-                                                  results_indices=result_indices)
+                    outcome = self._scrape_result_and_store(
+                        driver=driver, result=result, query=query,
+                        results_indices=result_indices,
+                    )
+                    if self._incremental and outcome in stats:
+                        stats[outcome] += 1
                 except Exception as e:
                     # One bad result (stale element, timeout, IO error) must not abort
                     # the whole query — log it, recover the window state, and continue.
                     self.__pprint_override(query=query, status=f"Skipping result ({type(e).__name__})",
                                            results_indices=result_indices)
+                    if self._incremental and self._pending_identity:
+                        self._known_companies.discard(self._pending_identity)
+                        self._pending_identity = None
                     try:
                         for handle in list(driver.window_handles):
                             if handle != self._main_handler:
@@ -747,12 +932,24 @@ class GoogleMaps:
                     except Exception:
                         pass
                 finally:
+                    self.close_extra_tabs(driver)
                     result_indices[1] += 1
 
-            self.__pprint_override(query=query, status="Driver Closed")
-            driver.close()
+            if self._incremental:
+                print(f"Query: {query}")
+                print(f"Inspected results: {stats['inspected']}")
+                print(f"Already known skipped: {stats['known']}")
+                print(f"Same-run duplicates skipped: {stats['same_run']}")
+                print(f"New companies added: {stats['new']}")
+                if self._summary is not None:
+                    with self._summary_lock:
+                        self._summary["queries"] += 1
+                        for key in ("inspected", "known", "same_run", "new"):
+                            self._summary[key] += stats[key]
+            self.__pprint_override(query=query, status="Query Complete")
         except NoSuchWindowException:
             self.__pprint_override(query=query, status="Browser Closed")
+            self.quit_driver()
         except Exception as e:
             # Distinguish a genuine mid-run failure from a user-closed browser.
             self.__pprint_override(query=query, status=f"Aborted ({type(e).__name__}: {e})")

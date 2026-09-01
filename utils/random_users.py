@@ -1,3 +1,10 @@
+"""Browser user-agent catalog used by the Maps scraper's browsing layer.
+
+This data-only module receives no runtime input and produces no files. Scraper
+code imports ``users`` when it needs a plausible browser identity; the selected
+value only supports discovery and is not itself part of the lead pipeline.
+"""
+
 users = [
     'Mozilla/5.0 (Windows NT 6.1; rv:94.0) Gecko/20100101 Firefox/94.0',
     'Mozilla/5.0 (Windows NT 6.1; WOW64; rv:94.0) Gecko/20100101 Firefox/94.0',

@@ -1,4 +1,25 @@
-"""Resumable enrichment of Search-only leads with public website emails."""
+"""
+Search-Only Email Enrichment
+============================
+
+Purpose:
+    Find public website emails for companies discovered only through Search.
+
+Pipeline:
+    leads_master.csv -> enrich_search_emails.py -> search_email_enriched.csv
+                                                   |
+                                                   +-> build_leads.py
+
+Input:
+    Master lead rows, especially Search-only records with a website but no email.
+
+Output:
+    A resumable enrichment CSV with selected emails, geographic metadata,
+    status, and attempt count.
+
+Previous / next:
+    ``build_leads.py`` creates the input and normally runs again after this file.
+"""
 
 from argparse import ArgumentParser
 from csv import DictReader, DictWriter
@@ -33,6 +54,12 @@ else:  # Support direct execution from the utils directory.
 
 DEFAULT_INPUT = Path("./CSV_FILES/leads_master.csv")
 DEFAULT_OUTPUT = Path("./CSV_FILES/search_email_enriched.csv")
+# ---------------------------------------------------------------------------
+# RESUMABLE EMAIL-LOOKUP POLICY
+# ---------------------------------------------------------------------------
+# Persist every attempt and cap lifetime retries so chronically unavailable
+# websites do not consume the browser on every future run.
+
 MAX_LIFETIME_ATTEMPTS = 3
 EMAIL_PAGE_PATHS = (
     "contact",
@@ -45,7 +72,11 @@ OUTPUT_FIELDS = (*MASTER_FIELDS, "email_enrichment_status", "email_enrichment_at
 
 
 class WebsiteCheckFailed(RuntimeError):
-    pass
+    """Signal that no candidate page supplied usable HTML for inspection."""
+
+    def __init__(self, message, kind="other"):
+        super().__init__(message)
+        self.kind = kind
 
 
 def read_csv(path):
@@ -126,7 +157,15 @@ def existing_index(rows):
     }
 
 
-def prepare_records(input_path, output_path):
+def prepare_records(
+    input_path,
+    output_path,
+    target_predicate=is_search_only,
+    website_predicate=None,
+):
+    """Merge current master rows with prior enrichment progress and statuses."""
+    if website_predicate is None:
+        website_predicate = lambda row: bool(website_domain(row.get("website")))
     current_rows = read_csv(input_path)
     previous = existing_index(read_csv(output_path))
     records = []
@@ -138,6 +177,8 @@ def prepare_records(input_path, output_path):
             continue
         seen.add(identity)
         prior = previous.get(identity, {})
+        # Copy the full master contract so email lookup cannot discard source
+        # geography; old CSVs simply supply blanks for the missing keys.
         record = {field: clean_value(input_row.get(field)) for field in MASTER_FIELDS}
 
         prior_emails = valid_row_emails(prior)
@@ -156,10 +197,10 @@ def prepare_records(input_path, output_path):
             parse_attempts(prior.get("email_enrichment_attempts")),
             parse_attempts(input_row.get("email_enrichment_attempts")),
         )
-        if is_search_only(record):
+        if target_predicate(record):
             if valid_row_emails(record):
                 status = "FOUND"
-            elif not website_domain(record.get("website")):
+            elif not website_predicate(record):
                 status = "NO_WEBSITE"
             elif prior_status in {"PENDING", "NOT_FOUND", "FAILED"}:
                 status = prior_status
@@ -175,6 +216,7 @@ def prepare_records(input_path, output_path):
 
 
 def candidate_urls(website, url_creator):
+    """Return a deduplicated homepage/contact/about inspection order."""
     candidates = url_creator(website, list(EMAIL_PAGE_PATHS))
     parsed = urlsplit(website if "://" in website else "http://" + website)
     root = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), "/", "", ""))
@@ -190,17 +232,29 @@ def candidate_urls(website, url_creator):
 
 
 def extract_public_emails(scraper, driver, website):
+    """Return validated public emails found on reachable candidate pages."""
     sources = scraper.get_source_code(
         driver,
         candidate_urls(website, scraper.create_urls),
     )
+    failure_kind = getattr(scraper, "last_failure_kind", None)
+    failure_message = getattr(scraper, "last_failure_message", "")
     if not sources:
-        raise WebsiteCheckFailed("no candidate website page could be loaded")
+        raise WebsiteCheckFailed(
+            failure_message or "no candidate website page could be loaded",
+            kind=failure_kind or "other",
+        )
     emails = scraper.get_pattern_data(sources).get("site_email", [])
-    return [email for email in emails if is_valid_email(email)]
+    valid_emails = [email for email in emails if is_valid_email(email)]
+    if not valid_emails and failure_kind in {"dns", "timeout", "connection"}:
+        # A partial page set with a terminal network failure is inconclusive,
+        # not proof that the company publishes no email.
+        raise WebsiteCheckFailed(failure_message, kind=failure_kind)
+    return valid_emails
 
 
 def set_record_emails(record, emails):
+    """Rank found emails and update the lead's email and review fields in place."""
     unique = {}
     for email in emails:
         if is_valid_email(email):
@@ -245,9 +299,10 @@ def summarize(records, attempted, skipped_max_attempts):
     return summary
 
 
-def enrich_search_emails(
-    input_path=DEFAULT_INPUT,
-    output_path=DEFAULT_OUTPUT,
+def run_email_enrichment(
+    records,
+    output_path,
+    target_predicate,
     limit=None,
     timeout=15,
     verbose=False,
@@ -255,12 +310,8 @@ def enrich_search_emails(
     driver_factory=None,
     scraper_factory=None,
 ):
-    input_path = Path(input_path)
+    """Run the shared resumable browser loop for a selected set of records."""
     output_path = Path(output_path)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input CSV not found: {input_path}")
-
-    records = prepare_records(input_path, output_path)
     atomic_write_csv(output_path, records)
     browser = BrowserSession(driver_factory or create_chrome_driver)
     if scraper_factory is None:
@@ -268,20 +319,29 @@ def enrich_search_emails(
             from utils.web_site_scraper import PatternScrapper
         else:
             from web_site_scraper import PatternScrapper
-        scraper_factory = lambda: PatternScrapper(wait_time=timeout, verbose=verbose)
+        scraper_factory = lambda: PatternScrapper(
+            wait_time=timeout,
+            overall_timeout=timeout,
+            verbose=False,
+        )
     scraper = scraper_factory()
     attempted = 0
     skipped_max_attempts = 0
+    skipped_existing_result = 0
+    found_this_run = 0
+    not_found_this_run = 0
+    failed_this_run = 0
     browser_exhausted = False
 
     try:
         for record in records:
-            if not is_search_only(record):
+            if not target_predicate(record):
                 continue
             status = record["email_enrichment_status"]
             if status in {"FOUND", "NO_WEBSITE"}:
                 continue
             if status == "FAILED" and not retry_failed:
+                skipped_existing_result += 1
                 continue
             attempts = parse_attempts(record["email_enrichment_attempts"])
             if attempts >= MAX_LIFETIME_ATTEMPTS:
@@ -298,14 +358,25 @@ def enrich_search_emails(
                 if found:
                     set_record_emails(record, found)
                     record["email_enrichment_status"] = "FOUND"
+                    found_this_run += 1
                 else:
                     record["email_enrichment_status"] = "NOT_FOUND"
+                    not_found_this_run += 1
             except WebsiteCheckFailed as error:
                 record["email_enrichment_status"] = "FAILED"
+                failed_this_run += 1
                 if verbose:
-                    print(f"[-] Website check failed for {record['website']}: {error}")
+                    labels = {
+                        "dns": "FAILED_DNS",
+                        "timeout": "FAILED_TIMEOUT",
+                        "connection": "FAILED_CONNECTION",
+                    }
+                    label = labels.get(error.kind, "FAILED")
+                    subject = record["name"] or record["website"]
+                    print(f"[{label}] {subject} - {error}")
             except Exception as error:
                 record["email_enrichment_status"] = "FAILED"
+                failed_this_run += 1
                 if verbose:
                     print(
                         f"[-] Email enrichment failed for {record['name'] or record['website']}: "
@@ -316,7 +387,7 @@ def enrich_search_emails(
                     if not browser.can_recreate():
                         browser_exhausted = True
             atomic_write_csv(output_path, records)
-            if verbose:
+            if verbose and record["email_enrichment_status"] != "FAILED":
                 print(f"[{record['email_enrichment_status']}] {record['name']}")
             if browser_exhausted:
                 break
@@ -324,7 +395,46 @@ def enrich_search_emails(
         browser.close()
         atomic_write_csv(output_path, records)
 
-    return summarize(records, attempted, skipped_max_attempts)
+    return {
+        "attempted": attempted,
+        "found": found_this_run,
+        "not_found": not_found_this_run,
+        "failed": failed_this_run,
+        "skipped_existing_result": skipped_existing_result,
+        "skipped_max_attempts": skipped_max_attempts,
+    }
+
+
+def enrich_search_emails(
+    input_path=DEFAULT_INPUT,
+    output_path=DEFAULT_OUTPUT,
+    limit=None,
+    timeout=15,
+    verbose=False,
+    retry_failed=False,
+    driver_factory=None,
+    scraper_factory=None,
+):
+    """Enrich eligible Search-only rows, checkpointing after every attempt."""
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {input_path}")
+
+    records = prepare_records(input_path, output_path)
+    counters = run_email_enrichment(
+        records=records,
+        output_path=output_path,
+        target_predicate=is_search_only,
+        limit=limit,
+        timeout=timeout,
+        verbose=verbose,
+        retry_failed=retry_failed,
+        driver_factory=driver_factory,
+        scraper_factory=scraper_factory,
+    )
+
+    return summarize(records, counters["attempted"], counters["skipped_max_attempts"])
 
 
 def parse_arguments():

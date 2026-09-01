@@ -1,4 +1,22 @@
-"""Resumable batch company enrichment for the curated leads-ready CSV."""
+"""
+Lead Context Enrichment Runner
+==============================
+
+Purpose:
+    Add website-backed company context to curated leads through a resumable,
+    retry-limited browser batch.
+
+Pipeline:
+    leads_ready.csv -> enrich_leads.py -> company_enrichment.py
+                    -> leads_enriched.csv -> build_outreach.py
+
+Input:
+    Ready lead rows containing company name, email, website, and phone.
+
+Output:
+    Enriched lead rows with context fields, propagated geography, status, and
+    lifetime attempt count. ``build_outreach.py`` normally runs next.
+"""
 
 from argparse import ArgumentParser
 from csv import DictReader, DictWriter
@@ -10,6 +28,17 @@ from subprocess import DEVNULL, check_output
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
 
+try:
+    from utils.discovery_timestamps import earliest_added_at
+except ModuleNotFoundError:
+    from discovery_timestamps import earliest_added_at
+
+
+# ---------------------------------------------------------------------------
+# RESUMABLE BATCH CONTRACT
+# ---------------------------------------------------------------------------
+# Existing output is merged by stable company identity so successful context is
+# retained and repeatedly failing sites stop after a bounded number of attempts.
 
 DEFAULT_INPUT = Path("./CSV_FILES/leads_ready.csv")
 DEFAULT_OUTPUT = Path("./CSV_FILES/leads_enriched.csv")
@@ -19,6 +48,7 @@ OUTPUT_FIELDS = (
     "company_name",
     "email",
     "website",
+    "added_at",
     "description",
     "industry",
     "services",
@@ -26,6 +56,8 @@ OUTPUT_FIELDS = (
     "website_meta_description",
     "hero_text",
     "about_text",
+    "country",
+    "city",
     "location",
     "linkedin_url",
     "phone",
@@ -138,14 +170,18 @@ def atomic_write_csv(path, rows):
             temporary_path.unlink()
 
 
-def add_location(index, key, location):
-    if key and location:
-        index.setdefault(key, set()).add(location)
+GEOGRAPHY_FIELDS = ("country", "city", "location")
 
 
-def load_location_indexes(input_path):
-    domain_locations = {}
-    name_locations = {}
+def add_geography(index, key, value):
+    if key and value:
+        index.setdefault(key, set()).add(value)
+
+
+def load_geography_indexes(input_path):
+    """Index unambiguous geography from nearby master and raw Maps CSV files."""
+    domain_values = {field: {} for field in GEOGRAPHY_FIELDS}
+    name_values = {field: {} for field in GEOGRAPHY_FIELDS}
     local_sources = (
         input_path.parent / "leads_master.csv",
         input_path.parent / "google_maps_data.csv",
@@ -154,31 +190,36 @@ def load_location_indexes(input_path):
         if source_path == input_path or not source_path.exists():
             continue
         for row in read_csv(source_path):
-            location = clean_value(row.get("location") or row.get("address"))
-            if not location:
-                continue
             name = row.get("company_name") or row.get("name") or row.get("title")
             website = row.get("website") or row.get("webpage")
-            add_location(domain_locations, normalize_website_domain(website), location)
-            add_location(name_locations, normalize_company_name(name), location)
-    return domain_locations, name_locations
+            for field in GEOGRAPHY_FIELDS:
+                value = clean_value(row.get(field))
+                if field == "location" and not value:
+                    value = clean_value(row.get("address"))
+                add_geography(
+                    domain_values[field], normalize_website_domain(website), value,
+                )
+                add_geography(
+                    name_values[field], normalize_company_name(name), value,
+                )
+    return domain_values, name_values
 
 
-def unique_location(index, key):
+def unique_geography(index, key):
     values = index.get(key, set())
     return next(iter(values)) if len(values) == 1 else ""
 
 
-def recover_location(row, domain_locations, name_locations):
-    direct = clean_value(row.get("location"))
+def recover_geography(field, row, domain_values, name_values):
+    direct = clean_value(row.get(field))
     if direct:
         return direct
     domain = normalize_website_domain(row.get("website"))
-    location = unique_location(domain_locations, domain) if domain else ""
-    if location:
-        return location
+    value = unique_geography(domain_values[field], domain) if domain else ""
+    if value:
+        return value
     name = normalize_company_name(row.get("name") or row.get("company_name"))
-    return unique_location(name_locations, name) if name else ""
+    return unique_geography(name_values[field], name) if name else ""
 
 
 def input_identity(row, row_index):
@@ -190,6 +231,7 @@ def input_identity(row, row_index):
 
 
 def deduplicate_input_rows(rows):
+    """Keep one input row per domain, falling back to normalized company name."""
     deduplicated = []
     identity_indexes = {}
     for row_index, row in enumerate(rows):
@@ -200,7 +242,7 @@ def deduplicate_input_rows(rows):
             deduplicated.append(dict(row))
             continue
         existing = deduplicated[existing_index]
-        for field in ("name", "email", "website", "phone", "location"):
+        for field in ("name", "email", "website", "phone", *GEOGRAPHY_FIELDS):
             if not clean_value(existing.get(field)) and clean_value(row.get(field)):
                 existing[field] = row[field]
     return deduplicated
@@ -241,6 +283,9 @@ def merge_existing_records(records):
             if value and not clean_value(merged.get(field)):
                 merged[field] = value
         attempts = max(attempts, parse_attempts(record.get("enrichment_attempts")))
+    merged["added_at"] = earliest_added_at(
+        record.get("added_at") for record in records
+    )
     merged["enrichment_attempts"] = str(attempts)
     return merged
 
@@ -250,6 +295,7 @@ def has_useful_enrichment(record):
 
 
 def enrichment_status(record, unexpected_failure=False):
+    """Classify extracted context by completeness and failure state."""
     if not normalize_website_domain(record.get("website")):
         return "NO_WEBSITE"
     has_source = any(
@@ -269,10 +315,11 @@ def enrichment_status(record, unexpected_failure=False):
 
 
 def prepare_records(input_path, output_path):
+    """Merge ready leads with prior output and return resumable work records."""
     input_rows = deduplicate_input_rows(read_csv(input_path))
     existing_rows = read_csv(output_path)
     domain_index, name_index = build_existing_indexes(existing_rows)
-    domain_locations, name_locations = load_location_indexes(input_path)
+    domain_geography, name_geography = load_geography_indexes(input_path)
     records = []
     already_enriched = 0
 
@@ -288,18 +335,26 @@ def prepare_records(input_path, output_path):
             "email": input_row.get("email"),
             "website": input_row.get("website"),
             "phone": input_row.get("phone"),
+            "country": input_row.get("country"),
+            "city": input_row.get("city"),
+            "location": input_row.get("location"),
+            "added_at": input_row.get("added_at"),
         }
         for field, value in source_values.items():
             cleaned = clean_value(value)
             if cleaned:
-                record[field] = cleaned
+                if field == "added_at":
+                    record[field] = earliest_added_at((record[field], cleaned))
+                else:
+                    record[field] = cleaned
 
-        if not clean_value(record.get("location")):
-            record["location"] = recover_location(
-                input_row,
-                domain_locations,
-                name_locations,
-            )
+        # Geography is source metadata, not website enrichment. Preserve direct
+        # input first and recover only an unambiguous missing field locally.
+        for field in GEOGRAPHY_FIELDS:
+            if not clean_value(record.get(field)):
+                record[field] = recover_geography(
+                    field, input_row, domain_geography, name_geography,
+                )
 
         attempts = parse_attempts(record.get("enrichment_attempts"))
         record["enrichment_attempts"] = str(attempts)
@@ -352,6 +407,7 @@ def detect_chrome_major_version(uc_module):
 
 
 def create_chrome_driver():
+    """Create a Chrome driver aligned with the locally installed major version."""
     import undetected_chromedriver as uc
 
     options = uc.ChromeOptions()
@@ -459,6 +515,7 @@ def enrich_leads_batch(
     driver_factory=None,
     enrichment_function=None,
 ):
+    """Enrich pending leads and atomically checkpoint after every attempt."""
     input_path = Path(input_path)
     output_path = Path(output_path)
     if not input_path.exists():

@@ -1,4 +1,22 @@
-"""Conservative, source-backed company context extraction from public websites."""
+"""
+Company Website Enrichment
+==========================
+
+Purpose:
+    Extract concise, source-backed company context from public website pages
+    without inventing missing facts.
+
+Pipeline:
+    enrich_leads.py -> company_enrichment.py -> enriched company fields
+
+Input:
+    A Selenium driver, one company website URL, and a page-load timeout.
+
+Output:
+    Title, meta description, hero/about text, services, LinkedIn URL, a concise
+    description, and a conservative industry classification. ``enrich_leads.py``
+    writes these fields to ``leads_enriched.csv``.
+"""
 
 from re import IGNORECASE, compile, findall, split
 from time import monotonic
@@ -9,6 +27,12 @@ from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
+
+# ---------------------------------------------------------------------------
+# OUTPUT CONTRACT AND DESCRIPTION QUALITY RULES
+# ---------------------------------------------------------------------------
+# Empty strings explicitly represent unsupported facts. Noise and marketing
+# filters keep navigation, error pages, and calls to action out of descriptions.
 
 EMPTY_ENRICHMENT = {
     "website_title": "",
@@ -28,6 +52,12 @@ DESCRIPTION_FIELDS = (
     "services",
     "website_title",
 )
+
+# ---------------------------------------------------------------------------
+# CONSERVATIVE INDUSTRY CLASSIFICATION
+# ---------------------------------------------------------------------------
+# Evidence from descriptive page regions outweighs generic service/title terms;
+# ambiguous or weak evidence intentionally produces an empty industry value.
 
 INDUSTRY_FIELD_WEIGHTS = {
     "website_meta_description": 5,
@@ -482,6 +512,7 @@ def _empty_result():
 
 
 def _candidate_urls(website_url):
+    """Return normalized homepage and common context-page candidates."""
     website_url = normalize_whitespace(website_url)
     if not website_url:
         return []
@@ -525,6 +556,7 @@ def _deduplicate_candidates(candidates):
 
 
 def _discover_internal_pages(source, homepage_url, maximum=4):
+    """Return a bounded set of same-domain about/service links from the homepage."""
     soup = _soup(source)
     homepage_domain = _normalized_domain(homepage_url)
     homepage_key = urlunsplit(
@@ -647,6 +679,7 @@ def _has_useful_page_text(source, visible_text, is_homepage=False):
 
 
 def _load_pages(driver, candidates, timeout, verbose):
+    """Load useful candidate pages within time bounds and return their HTML."""
     pages = []
     original_handle = driver.current_window_handle
     candidate_timeout = max(1, timeout or 15)
@@ -865,6 +898,7 @@ def _block_text(element):
 
 
 def _extract_about(parsed_pages):
+    """Select concise about/company text from parsed candidate pages."""
     preferred_blocks = []
     about_fallbacks = []
     for page in parsed_pages:
@@ -896,6 +930,7 @@ def _service_item(value):
 
 
 def _extract_services(parsed_pages):
+    """Return distinct service labels supported by visible website content."""
     items = []
     for page in parsed_pages:
         if page["kind"] not in {"homepage", "services"}:
