@@ -28,9 +28,16 @@ Previous / next:
 from argparse import ArgumentParser
 from collections import defaultdict
 from csv import DictReader, DictWriter
+from datetime import datetime, timezone
+from hashlib import sha256
+from json import dump, load
+import os
 from pathlib import Path
 from re import compile
+from shutil import copyfile
+from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 try:
     from utils.discovery_timestamps import earliest_added_at
@@ -40,6 +47,7 @@ try:
         format_location,
         normalize_country,
     )
+    from utils.maps_identity import maps_identities_for
 except ModuleNotFoundError:  # Support direct execution from the utils directory.
     from discovery_timestamps import earliest_added_at
     from geography import (
@@ -48,6 +56,7 @@ except ModuleNotFoundError:  # Support direct execution from the utils directory
         format_location,
         normalize_country,
     )
+    from maps_identity import maps_identities_for
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +88,7 @@ EMAIL_LOCAL_PRIORITY = {
 UNAVAILABLE_VALUES = {"", "not available", "n/a", "none", "null"}
 MASTER_FIELDS = (
     "name", "email", "alternate_emails", "phone", "website",
+    "map_place_id", "maps_identity",
     "country", "city", "location",
     "added_at",
     "email_status", "review_status", "review_reasons", "source",
@@ -88,6 +98,8 @@ READY_FIELDS = (
     "name", "email", "phone", "website", "country", "city", "location",
     "added_at",
 )
+SNAPSHOT_MANIFEST = "leads_snapshot.json"
+SNAPSHOT_PENDING = ".leads_snapshot.pending.json"
 
 
 def clean_value(value):
@@ -164,6 +176,9 @@ def new_group(index):
         "names": [],
         "websites": [],
         "website_domains": set(),
+        "map_place_ids": set(),
+        "map_place_urls": set(),
+        "name_keys": set(),
         "phones": [],
         "phone_keys": set(),
         "emails": {},
@@ -171,7 +186,9 @@ def new_group(index):
         "sources": [],
         "source_queries": [],
         "geographies": [],
+        "address_keys": set(),
         "added_at_values": [],
+        "match_counts": defaultdict(int),
         "rows": 0,
     }
 
@@ -190,6 +207,9 @@ def merge_groups(target, source):
     for value in source["phones"]:
         add_unique(target["phones"], value)
     target["website_domains"].update(source["website_domains"])
+    target["map_place_ids"].update(source["map_place_ids"])
+    target["map_place_urls"].update(source["map_place_urls"])
+    target["name_keys"].update(source["name_keys"])
     target["phone_keys"].update(source["phone_keys"])
     target["emails"].update(source["emails"])
     target["review_reasons"].update(source["review_reasons"])
@@ -198,7 +218,10 @@ def merge_groups(target, source):
     for value in source["source_queries"]:
         add_unique(target["source_queries"], value)
     target["geographies"].extend(source["geographies"])
+    target["address_keys"].update(source["address_keys"])
     target["added_at_values"].extend(source["added_at_values"])
+    for kind, count in source["match_counts"].items():
+        target["match_counts"][kind] += count
     target["rows"] += source["rows"]
     target["first_index"] = min(target["first_index"], source["first_index"])
 
@@ -213,6 +236,66 @@ def compatible_name_fallback(group, web_domain, phone_key, email_domains):
     if email_domains and group_email_domains and email_domains.isdisjoint(group_email_domains):
         return False
     return True
+
+
+def group_company_email_domains(group):
+    return {
+        email.rsplit("@", 1)[1].casefold() for email in group["emails"]
+        if email.rsplit("@", 1)[1].casefold() not in FREE_EMAIL_DOMAINS
+    }
+
+
+def sets_conflict(first, second):
+    return bool(first and second and first.isdisjoint(second))
+
+
+def identity_conflicts(group, evidence, match_kind):
+    """Return reasons that veto attaching ``evidence`` through ``match_kind``.
+
+    A Maps match is authoritative for a place. Other identity kinds are vetoed
+    when they would cross explicit stronger evidence. Domain matches also stop
+    at distinct Maps places when a phone or address distinguishes branches.
+    """
+    group_maps = group["map_place_ids"] | group["map_place_urls"]
+    row_maps = evidence["map_place_ids"] | evidence["map_place_urls"]
+    distinct_maps = sets_conflict(group_maps, row_maps)
+    domain_conflict = sets_conflict(
+        group["website_domains"], evidence["website_domains"],
+    )
+    phone_conflict = sets_conflict(group["phone_keys"], evidence["phone_keys"])
+    name_conflict = sets_conflict(group["name_keys"], evidence["name_keys"])
+    email_conflict = sets_conflict(
+        group_company_email_domains(group), evidence["email_domains"],
+    )
+    address_conflict = sets_conflict(group["address_keys"], evidence["address_keys"])
+
+    if match_kind == "maps":
+        return set()
+    if match_kind == "domain":
+        if distinct_maps:
+            reasons = {"conflicting maps identities"}
+            if phone_conflict or address_conflict:
+                reasons.add("shared domain across distinct places")
+            return reasons
+        if name_conflict and phone_conflict:
+            return {"conflicting strong identities"}
+        return set()
+    if match_kind in {"name_phone", "name_email"}:
+        reasons = set()
+        if distinct_maps:
+            reasons.add("conflicting maps identities")
+        if domain_conflict:
+            reasons.add("conflicting strong identities")
+        return reasons
+
+    reasons = set()
+    if distinct_maps:
+        reasons.add("conflicting maps identities")
+    if domain_conflict or phone_conflict or email_conflict:
+        reasons.add("conflicting strong identities")
+    if address_conflict:
+        reasons.add("conflicting location evidence")
+    return reasons
 
 
 def row_geographies(row, source, row_index):
@@ -261,24 +344,18 @@ def build_groups(rows):
     # -----------------------------------------------------------------------
     # COMPANY DEDUPLICATION
     # -----------------------------------------------------------------------
-    # Domains are strongest; name+phone and name+email-domain provide additional
-    # identities. Exact names alone merge only when no evidence conflicts.
+    # Precedence is Maps place, domain, name+phone, name+email-domain, then an
+    # exact-name fallback. An incoming row never unions multiple established
+    # groups: a unique highest-precedence compatible match wins; a tie becomes
+    # a separate review group. This is the bridge-conflict veto.
     groups = []
-    parent = []
+    place_id_index = defaultdict(set)
+    place_url_index = defaultdict(set)
     domain_index = defaultdict(set)
     name_phone_index = defaultdict(set)
     name_email_index = defaultdict(set)
     name_index = defaultdict(set)
     rejected_emails = 0
-
-    def find(group_id):
-        while parent[group_id] != group_id:
-            parent[group_id] = parent[parent[group_id]]
-            group_id = parent[group_id]
-        return group_id
-
-    def active_ids(group_ids):
-        return {find(group_id) for group_id in group_ids}
 
     for row_index, row in enumerate(rows):
         name = clean_value(row.get("title"))
@@ -287,6 +364,14 @@ def build_groups(rows):
         web_domain = website_domain(website)
         phone = clean_value(row.get("phone_number"))
         phone_key = normalize_phone(phone)
+        maps_identities = maps_identities_for(row)
+        map_place_id = maps_identities["place_id"]
+        map_place_url = maps_identities["place_url"]
+        address_key = normalize_name(
+            row.get("address") or row.get("location") or format_location(
+                clean_value(row.get("city")), normalize_country(row.get("country")),
+            )
+        )
         source = clean_value(row.get("_source")) or "google_maps"
         source_queries = [
             clean_value(value) for value in (row.get("_source_queries") or "").split(";")
@@ -299,51 +384,105 @@ def build_groups(rows):
                 valid_emails.setdefault(email.casefold(), email)
             else:
                 rejected_emails += 1
-        email_domains = {email.rsplit("@", 1)[1].casefold() for email in valid_emails}
+        email_domains = {
+            email.rsplit("@", 1)[1].casefold() for email in valid_emails
+            if email.rsplit("@", 1)[1].casefold() not in FREE_EMAIL_DOMAINS
+        }
+        evidence = {
+            "map_place_ids": {map_place_id} if map_place_id else set(),
+            "map_place_urls": {map_place_url} if map_place_url else set(),
+            "website_domains": {web_domain} if web_domain else set(),
+            "name_keys": {name_key} if name_key else set(),
+            "phone_keys": {phone_key} if phone_key else set(),
+            "email_domains": email_domains,
+            "address_keys": {address_key} if address_key else set(),
+        }
 
-        strong_matches = set()
+        candidate_kinds = defaultdict(set)
+        if map_place_id:
+            for candidate in place_id_index[map_place_id]:
+                candidate_kinds[candidate].add("maps")
+        if map_place_url:
+            for candidate in place_url_index[map_place_url]:
+                candidate_kinds[candidate].add("maps")
         if web_domain:
-            strong_matches.update(active_ids(domain_index[web_domain]))
+            for candidate in domain_index[web_domain]:
+                candidate_kinds[candidate].add("domain")
         if name_key and phone_key:
-            strong_matches.update(active_ids(name_phone_index[(name_key, phone_key)]))
+            for candidate in name_phone_index[(name_key, phone_key)]:
+                candidate_kinds[candidate].add("name_phone")
         if name_key:
             for domain in email_domains:
-                strong_matches.update(active_ids(name_email_index[(name_key, domain)]))
+                for candidate in name_email_index[(name_key, domain)]:
+                    candidate_kinds[candidate].add("name_email")
+
+        priority = {"maps": 0, "domain": 1, "name_phone": 2, "name_email": 3, "name": 4}
+        compatible = []
+        rejected = defaultdict(set)
+        for candidate, kinds in candidate_kinds.items():
+            best_kind = min(kinds, key=priority.get)
+            reasons = identity_conflicts(groups[candidate], evidence, best_kind)
+            if reasons:
+                rejected[candidate].update(reasons)
+            else:
+                compatible.append((priority[best_kind], candidate, best_kind))
 
         ambiguous_name_matches = set()
-        if not strong_matches and name_key:
-            compatible_name_matches = set()
-            for group_id in active_ids(name_index[name_key]):
-                if compatible_name_fallback(groups[group_id], web_domain, phone_key, email_domains):
-                    compatible_name_matches.add(group_id)
+        if not candidate_kinds and name_key:
+            for candidate in name_index[name_key]:
+                reasons = identity_conflicts(groups[candidate], evidence, "name")
+                if reasons:
+                    rejected[candidate].update(reasons)
+                    ambiguous_name_matches.add(candidate)
                 else:
-                    ambiguous_name_matches.add(group_id)
-            if len(compatible_name_matches) == 1:
-                strong_matches.update(compatible_name_matches)
-            elif len(compatible_name_matches) > 1:
-                ambiguous_name_matches.update(compatible_name_matches)
+                    compatible.append((priority["name"], candidate, "name"))
 
-        if strong_matches:
-            group_id = min(strong_matches, key=lambda candidate: groups[candidate]["first_index"])
-            for other_id in sorted(strong_matches):
-                other_id = find(other_id)
-                if other_id != group_id:
-                    merge_groups(groups[group_id], groups[other_id])
-                    parent[other_id] = group_id
-        else:
+        group_id = None
+        selected_kind = ""
+        if compatible:
+            best_priority = min(item[0] for item in compatible)
+            best = [item for item in compatible if item[0] == best_priority]
+            if len(best) == 1:
+                group_id = best[0][1]
+                selected_kind = best[0][2]
+            else:
+                ambiguous_name_matches.update(item[1] for item in best)
+
+        bridge_candidates = set(candidate_kinds)
+        if len(bridge_candidates) > 1:
+            for candidate in bridge_candidates:
+                groups[candidate]["review_reasons"].add("identity bridge conflict")
+            if group_id is not None:
+                groups[group_id]["review_reasons"].add("identity bridge conflict")
+
+        if group_id is None:
             group_id = len(groups)
             groups.append(new_group(row_index))
-            parent.append(group_id)
 
         group = groups[group_id]
+        if selected_kind:
+            group["match_counts"][selected_kind] += 1
+        for candidate, reasons in rejected.items():
+            groups[candidate]["review_reasons"].update(reasons)
+            group["review_reasons"].update(reasons)
+        if len(bridge_candidates) > 1:
+            group["review_reasons"].add("identity bridge conflict")
         group["rows"] += 1
         add_unique(group["names"], name)
         add_unique(group["websites"], website)
         add_unique(group["phones"], phone)
         if web_domain:
             group["website_domains"].add(web_domain)
+        if map_place_id:
+            group["map_place_ids"].add(map_place_id)
+        if map_place_url:
+            group["map_place_urls"].add(map_place_url)
+        if name_key:
+            group["name_keys"].add(name_key)
         if phone_key:
             group["phone_keys"].add(phone_key)
+        if address_key:
+            group["address_keys"].add(address_key)
         group["emails"].update(valid_emails)
         add_unique(group["sources"], source)
         for source_query in source_queries:
@@ -354,8 +493,12 @@ def build_groups(rows):
         if ambiguous_name_matches:
             group["review_reasons"].add("ambiguous exact-name match")
             for ambiguous_id in ambiguous_name_matches:
-                groups[find(ambiguous_id)]["review_reasons"].add("ambiguous exact-name match")
+                groups[ambiguous_id]["review_reasons"].add("ambiguous exact-name match")
 
+        if map_place_id:
+            place_id_index[map_place_id].add(group_id)
+        if map_place_url:
+            place_url_index[map_place_url].add(group_id)
         if web_domain:
             domain_index[web_domain].add(group_id)
         if name_key and phone_key:
@@ -366,9 +509,8 @@ def build_groups(rows):
         if name_key:
             name_index[name_key].add(group_id)
 
-    active_groups = [group for group_id, group in enumerate(groups) if find(group_id) == group_id]
-    active_groups.sort(key=lambda group: group["first_index"])
-    return active_groups, rejected_emails
+    groups.sort(key=lambda group: group["first_index"])
+    return groups, rejected_emails
 
 
 def finalize_group(group):
@@ -381,6 +523,11 @@ def finalize_group(group):
     primary_email = emails[0] if emails else ""
     status = email_status(primary_email, web_domain) if primary_email else ""
     reasons = set(group["review_reasons"])
+    map_place_id = sorted(group["map_place_ids"])[0] if group["map_place_ids"] else ""
+    maps_identity = (
+        sorted(group["map_place_urls"])[0]
+        if group["map_place_urls"] else map_place_id
+    )
 
     countries = {
         geography["country"] for geography in group["geographies"]
@@ -429,6 +576,8 @@ def finalize_group(group):
         "alternate_emails": ";".join(emails[1:]),
         "phone": phone,
         "website": website,
+        "map_place_id": map_place_id,
+        "maps_identity": maps_identity,
         "country": country,
         "city": city,
         "location": location,
@@ -442,11 +591,198 @@ def finalize_group(group):
 
 
 def write_csv(path, fieldnames, rows):
+    """Write and durably flush a complete CSV at ``path``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as file_handler:
         writer = DictWriter(file_handler, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+        file_handler.flush()
+        os.fsync(file_handler.fileno())
+
+
+def _fsync_directory(path):
+    """Persist directory-entry changes on filesystems that support it."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        # Some non-POSIX filesystems do not support directory fsync. File data
+        # is still fsynced and every publication rename remains atomic.
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _temporary_path(folder, prefix):
+    with NamedTemporaryFile(dir=folder, prefix=prefix, delete=False) as handle:
+        return Path(handle.name)
+
+
+def _atomic_write_json(path, value):
+    temporary = _temporary_path(path.parent, f".{path.name}.tmp-")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _backup_path(folder, filename):
+    return folder / f".{filename}.snapshot-backup"
+
+
+def _copy_durable(source, destination):
+    copyfile(source, destination)
+    with destination.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _remove_transaction_files(folder, transaction):
+    # Remove and persist the recovery instruction first. Backups are retained
+    # until that point, so a crash during cleanup can never leave a journal
+    # referring to already-deleted recovery data.
+    (folder / SNAPSHOT_PENDING).unlink(missing_ok=True)
+    _fsync_directory(folder)
+    for details in transaction.get("files", {}).values():
+        backup_name = details.get("backup")
+        if backup_name:
+            (folder / backup_name).unlink(missing_ok=True)
+    _fsync_directory(folder)
+
+
+def _rollback_snapshot(folder, transaction):
+    """Idempotently restore every path recorded by a pending transaction."""
+    restore_temps = []
+    try:
+        for filename, details in transaction["files"].items():
+            final_path = folder / filename
+            if details["existed"]:
+                backup_path = folder / details["backup"]
+                if not backup_path.exists():
+                    raise RuntimeError(
+                        f"Cannot recover lead snapshot: missing {backup_path.name}"
+                    )
+                restore_path = _temporary_path(folder, f".{filename}.restore-")
+                restore_temps.append(restore_path)
+                _copy_durable(backup_path, restore_path)
+                os.replace(restore_path, final_path)
+            else:
+                final_path.unlink(missing_ok=True)
+        _fsync_directory(folder)
+    finally:
+        for restore_path in restore_temps:
+            restore_path.unlink(missing_ok=True)
+
+
+def recover_interrupted_snapshot(output_folder):
+    """Recover an interrupted prior publication before a normal build."""
+    output_folder = Path(output_folder)
+    pending_path = output_folder / SNAPSHOT_PENDING
+    if not pending_path.exists():
+        return False
+    with pending_path.open("r", encoding="utf-8") as handle:
+        transaction = load(handle)
+
+    manifest_path = output_folder / SNAPSHOT_MANIFEST
+    committed_generation = ""
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            committed_generation = load(handle).get("generation_id", "")
+    if committed_generation != transaction.get("generation_id"):
+        _rollback_snapshot(output_folder, transaction)
+    _remove_transaction_files(output_folder, transaction)
+    return True
+
+
+def publish_lead_snapshot(output_folder, outputs):
+    """Publish the three lead CSVs as one recoverable logical generation.
+
+    Filesystems do not provide a multi-file atomic rename. The pending journal
+    therefore precedes the rename window, while the committed manifest follows
+    it. Handled failures roll back immediately; a killed process is recovered
+    by ``recover_interrupted_snapshot`` on the next normal build.
+    """
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    recover_interrupted_snapshot(output_folder)
+    generation_id = uuid4().hex
+    created_at = datetime.now(timezone.utc).isoformat()
+    staged = {}
+    transaction = {
+        "schema_version": 1,
+        "generation_id": generation_id,
+        "files": {},
+    }
+    pending_written = False
+    commit_complete = False
+    rollback_complete = False
+    try:
+        # Nothing under a final filename changes until every CSV is complete.
+        for filename, fieldnames, rows in outputs:
+            stage_path = _temporary_path(output_folder, f".{filename}.tmp-")
+            staged[filename] = stage_path
+            write_csv(stage_path, fieldnames, rows)
+
+        manifest_files = {}
+        for filename, _fieldnames, rows in outputs:
+            final_path = output_folder / filename
+            backup_path = _backup_path(output_folder, filename)
+            backup_path.unlink(missing_ok=True)
+            existed = final_path.exists()
+            if existed:
+                _copy_durable(final_path, backup_path)
+            transaction["files"][filename] = {
+                "backup": backup_path.name,
+                "existed": existed,
+            }
+            manifest_files[filename] = {
+                "rows": len(rows),
+                "sha256": sha256(staged[filename].read_bytes()).hexdigest(),
+            }
+
+        _atomic_write_json(output_folder / SNAPSHOT_PENDING, transaction)
+        pending_written = True
+        for filename, _fieldnames, _rows in outputs:
+            os.replace(staged[filename], output_folder / filename)
+        _fsync_directory(output_folder)
+        _atomic_write_json(output_folder / SNAPSHOT_MANIFEST, {
+            "schema_version": 1,
+            "generation_id": generation_id,
+            "created_at": created_at,
+            "files": manifest_files,
+        })
+        commit_complete = True
+    except BaseException:
+        if pending_written and not commit_complete:
+            try:
+                _rollback_snapshot(output_folder, transaction)
+                rollback_complete = True
+            except BaseException as recovery_error:
+                raise RuntimeError(
+                    "Lead snapshot publication failed and automatic rollback was "
+                    "incomplete; rerun build_leads to recover from the pending journal"
+                ) from recovery_error
+        raise
+    finally:
+        for stage_path in staged.values():
+            stage_path.unlink(missing_ok=True)
+        # After a failed rollback, retain the journal/backups for retry.
+        if commit_complete or rollback_complete or not pending_written:
+            try:
+                _remove_transaction_files(output_folder, transaction)
+            except OSError:
+                # The snapshot is already committed/restored. Any backup left
+                # behind is deterministic and removed before the next commit.
+                pass
 
 
 def search_rows(search_input_path):
@@ -507,6 +843,8 @@ def enriched_email_rows(email_enrichment_input_path, default_source="google_sear
                 "title": row.get("name") or row.get("company_name", ""),
                 "webpage": row.get("website", ""),
                 "phone_number": row.get("phone", ""),
+                "map_place_id": row.get("map_place_id", ""),
+                "maps_identity": row.get("maps_identity", ""),
                 "site_email": ";".join(emails),
                 "_source": source,
                 "_source_queries": row.get("source_queries") or row.get("source_query", ""),
@@ -528,10 +866,16 @@ def preserve_master_added_at(groups, master_path):
     if not master_path.exists():
         return
     domain_index = defaultdict(set)
+    place_id_index = defaultdict(set)
+    place_url_index = defaultdict(set)
     name_phone_index = defaultdict(set)
     name_email_index = defaultdict(set)
     name_index = defaultdict(set)
     for group_id, group in enumerate(groups):
+        for place_id in group["map_place_ids"]:
+            place_id_index[place_id].add(group_id)
+        for place_url in group["map_place_urls"]:
+            place_url_index[place_url].add(group_id)
         for domain in group["website_domains"]:
             domain_index[domain].add(group_id)
         for name in group["names"]:
@@ -542,7 +886,9 @@ def preserve_master_added_at(groups, master_path):
             for phone_key in group["phone_keys"]:
                 name_phone_index[(name_key, phone_key)].add(group_id)
             for email in group["emails"]:
-                name_email_index[(name_key, email.rsplit("@", 1)[1])].add(group_id)
+                email_domain = email.rsplit("@", 1)[1]
+                if email_domain not in FREE_EMAIL_DOMAINS:
+                    name_email_index[(name_key, email_domain)].add(group_id)
 
     with master_path.open("r", newline="", encoding="utf-8-sig") as file_handler:
         prior_rows = list(DictReader(file_handler))
@@ -551,6 +897,11 @@ def preserve_master_added_at(groups, master_path):
         if not earliest_added_at((timestamp,)):
             continue
         candidates = set()
+        maps_identities = maps_identities_for(row)
+        if maps_identities["place_id"]:
+            candidates.update(place_id_index[maps_identities["place_id"]])
+        if maps_identities["place_url"]:
+            candidates.update(place_url_index[maps_identities["place_url"]])
         domain = website_domain(row.get("website"))
         if domain:
             candidates.update(domain_index[domain])
@@ -563,9 +914,9 @@ def preserve_master_added_at(groups, master_path):
                 ";".join((row.get("email", ""), row.get("alternate_emails", "")))
             ):
                 if is_valid_email(email):
-                    candidates.update(
-                        name_email_index[(name_key, email.rsplit("@", 1)[1].casefold())]
-                    )
+                    email_domain = email.rsplit("@", 1)[1].casefold()
+                    if email_domain not in FREE_EMAIL_DOMAINS:
+                        candidates.update(name_email_index[(name_key, email_domain)])
         if not candidates and name_key:
             compatible = {
                 group_id for group_id in name_index[name_key]
@@ -582,7 +933,7 @@ def preserve_master_added_at(groups, master_path):
             groups[next(iter(candidates))]["added_at_values"].append(timestamp)
 
 
-def build_lead_files(
+def load_lead_input_rows(
     input_path,
     output_folder,
     search_input_path=None,
@@ -590,7 +941,7 @@ def build_lead_files(
     missing_email_enrichment_input_path=None,
     search_email_fallback_input_path=None,
 ):
-    """Merge all discovery sources and write master, ready, and review CSV files."""
+    """Read and adapt all discovery inputs without changing any files."""
     input_path = Path(input_path)
     output_folder = Path(output_folder)
     search_input_path = Path(search_input_path) if search_input_path else None
@@ -628,6 +979,64 @@ def build_lead_files(
     # Fallback discovers contact evidence, not a new company-discovery source.
     # Existing Search rows already retain google_search provenance when present.
     raw_rows.extend(enriched_email_rows(search_email_fallback_input_path, "google_maps"))
+    return raw_rows
+
+
+def analyze_identity_changes(
+    input_path,
+    output_folder,
+    search_input_path=None,
+    email_enrichment_input_path=None,
+    missing_email_enrichment_input_path=None,
+    search_email_fallback_input_path=None,
+):
+    """Print a read-only identity analysis; never write production CSVs."""
+    output_folder = Path(output_folder)
+    raw_rows = load_lead_input_rows(
+        input_path, output_folder, search_input_path, email_enrichment_input_path,
+        missing_email_enrichment_input_path, search_email_fallback_input_path,
+    )
+    groups, _ = build_groups(raw_rows)
+    master_path = output_folder / "leads_master.csv"
+    if master_path.exists():
+        with master_path.open("r", newline="", encoding="utf-8-sig") as handle:
+            current_master_count = sum(1 for _ in DictReader(handle))
+    else:
+        current_master_count = 0
+    bridge_groups = sum(
+        "identity bridge conflict" in group["review_reasons"] for group in groups
+    )
+    conflict_reasons = {
+        "conflicting strong identities", "conflicting maps identities",
+        "shared domain across distinct places", "identity bridge conflict",
+    }
+    conflict_review_groups = sum(
+        bool(group["review_reasons"] & conflict_reasons) for group in groups
+    )
+    same_place_merges = sum(group["match_counts"]["maps"] for group in groups)
+    print("READ-ONLY identity comparison (no files written)")
+    print(f"Current master companies: {current_master_count}")
+    print(f"New unique companies from current inputs: {len(groups)}")
+    print(f"Groups involved in prevented bridge merges: {bridge_groups}")
+    print(f"New identity-conflict review groups: {conflict_review_groups}")
+    print(f"Rows newly joined by same-place identity: {same_place_merges}")
+
+
+def build_lead_files(
+    input_path,
+    output_folder,
+    search_input_path=None,
+    email_enrichment_input_path=None,
+    missing_email_enrichment_input_path=None,
+    search_email_fallback_input_path=None,
+):
+    """Merge all discovery sources and write master, ready, and review CSV files."""
+    output_folder = Path(output_folder)
+    recover_interrupted_snapshot(output_folder)
+    raw_rows = load_lead_input_rows(
+        input_path, output_folder, search_input_path, email_enrichment_input_path,
+        missing_email_enrichment_input_path, search_email_fallback_input_path,
+    )
 
     groups, rejected_emails = build_groups(raw_rows)
     # A rebuild may have fewer/different source rows, but an existing master is
@@ -642,9 +1051,11 @@ def build_lead_files(
     ]
     review_rows = [row for row in master_rows if row["review_status"] == "REVIEW"]
 
-    write_csv(output_folder / "leads_master.csv", MASTER_FIELDS, master_rows)
-    write_csv(output_folder / "leads_ready.csv", READY_FIELDS, ready_rows)
-    write_csv(output_folder / "leads_review.csv", MASTER_FIELDS, review_rows)
+    publish_lead_snapshot(output_folder, (
+        ("leads_master.csv", MASTER_FIELDS, master_rows),
+        ("leads_ready.csv", READY_FIELDS, ready_rows),
+        ("leads_review.csv", MASTER_FIELDS, review_rows),
+    ))
 
     domain_matches = sum(row["email_status"] == "MATCH" for row in master_rows)
     missing_email = sum(not row["email"] for row in master_rows)
@@ -687,8 +1098,14 @@ def main():
         type=Path,
         help="Optional Google Search email fallback CSV (defaults to the output folder)",
     )
+    parser.add_argument(
+        "--analyze-identities",
+        action="store_true",
+        help="Compare identity grouping read-only; do not write lead CSVs",
+    )
     args = parser.parse_args()
-    build_lead_files(
+    operation = analyze_identity_changes if args.analyze_identities else build_lead_files
+    operation(
         args.input,
         args.output_folder,
         args.search_input,

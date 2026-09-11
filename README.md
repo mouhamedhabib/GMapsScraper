@@ -145,9 +145,35 @@ python utils/build_leads.py \
 | `leads_ready.csv` | Records that have an email and no detected review condition |
 | `leads_review.csv` | Ambiguous or conflicting records requiring manual review |
 
+The three lead files are staged and flushed before publication. Each pathname
+is replaced atomically, and `leads_snapshot.json` is committed last to identify
+the complete generation. Because a filesystem cannot atomically rename three
+files together, a short commit window is recorded in a pending journal; a
+handled failure rolls back immediately, while the next normal build recovers
+the last complete snapshot after a process or power interruption. CSVs, transaction
+metadata, backups, and directory entries are `fsync`-ed at this boundary where
+the filesystem supports directory syncing.
+
 The builder normalizes unavailable values, rejects malformed or placeholder email addresses, merges records using supported company identifiers, prefers useful contact addresses, and flags conflicts instead of silently treating them as ready. `leads_ready.csv` is a quality-control output, not a guarantee that every address is deliverable or appropriate to contact.
 
 The lead builder currently expects CSV columns produced by this scraper (`title`, `webpage`, `phone_number`, and `site_email`). Export with `-of CSV` before running it.
+
+### Enrich and finalize company context
+
+Company enrichment keeps resumable progress in `leads_enriched.csv`. Publish
+that working state through the structural finalizer before building outreach:
+
+```bash
+python3 -m utils.enrich_leads
+python3 -m utils.finalize_enrichment
+python3 -m utils.build_outreach
+```
+
+The finalizer validates row identities and CSV structure, fills columns missing
+from older files with blank values, and atomically publishes the canonical
+`CSV_FILES/leads_enriched_final.csv`. It does not change enrichment content or
+statuses. `build_outreach.py` consumes that repository-owned final file by
+default.
 
 ### Recover missing emails from any source
 
@@ -197,11 +223,12 @@ fallback rows automatically and revalidates every email with its normal rules.
 ## Google Search company discovery
 
 Google Search discovery is a separate, optional source and does not change the
-Maps scraper. Run it with:
+Maps scraper. Since `google_queries.txt` now belongs to job discovery, pass a
+company-oriented query file explicitly when using this legacy optional command:
 
 ```bash
 python3 utils/google_search_discovery.py \
-  -q google_queries.txt \
+  -q queries.txt \
   -l 20 \
   --delay 3 \
   --timeout 15 \
@@ -219,13 +246,25 @@ have been saved (or results/the deterministic inspection bound are exhausted):
 
 ```bash
 python3 utils/google_search_discovery.py \
-  -q google_queries.txt -l 15 --incremental --delay 3 --timeout 15
+  -q queries.txt -l 15 --incremental --delay 3 --timeout 15
 ```
 
 The normal `build_leads.py` command automatically reads this discovery file
 when present. It merges Maps and Search records by the existing company
 identity rules and records `source` and `source_queries` in `leads_master.csv`.
 The four-column `leads_ready.csv` format remains unchanged.
+
+Final grouping uses Maps place identity, website domain, exact name plus phone,
+exact name plus company-email domain, then a conflict-free exact-name fallback.
+An incoming row never unions multiple established groups: a unique strongest
+compatible match may receive it, while tied or conflicting matches stay
+separate and are routed to review. Distinct Maps places never merge through a
+shared domain. Preview the result without writing any CSV with:
+
+```bash
+python3 utils/build_leads.py --analyze-identities \
+  --input CSV_FILES/google_maps_data.csv --output-folder CSV_FILES
+```
 
 Google Search discovery does not extract email addresses. Search-only records
 therefore remain in `leads_master.csv` and do not enter `leads_ready.csv` until
@@ -235,6 +274,107 @@ Ranked-list/article titles such as “163 Top startups in Tunisia for August
 2026” are discovery noise, not company records. The current focused title/path
 filter identifies this case; broader discovery cleanup is intentionally a
 separate task.
+
+## Google Search job discovery (Phase 1)
+
+The two discovery paths remain separate:
+
+- `queries.txt` feeds `python maps.py` and discovers companies.
+- `google_queries.txt` feeds `python -m job_search.discovery` and discovers
+  individual job pages.
+
+Job discovery recognizes Greenhouse, Lever, Ashby, Workable,
+SmartRecruiters, Teamtailor, and conservative generic company career/job URLs.
+It removes known tracking parameters, extracts provider job IDs where reliable,
+fetches only the accepted page, and stores operational state in SQLite. It does
+not perform candidate matching, contact discovery, email work, applications,
+outreach, or any AI calls.
+
+Run a small test that stops after three new jobs for each query:
+
+```bash
+.venv/bin/python -m job_search.discovery \
+  --query-file google_queries.txt \
+  --limit 3 \
+  --delay 3 \
+  --timeout 15 \
+  --windowed \
+  --verbose
+```
+
+For normal discovery:
+
+```bash
+.venv/bin/python -m job_search.discovery \
+  --query-file google_queries.txt \
+  --limit 20 \
+  --delay 3 \
+  --timeout 15 \
+  --windowed \
+  --verbose
+```
+
+`--limit` means maximum **new** jobs per query. Already-known jobs update
+`last_seen_at` and source evidence without consuming that limit. Pagination is
+bounded to prevent an endless scan. In windowed mode, a Google verification
+page pauses for manual completion; headless mode checkpoints SQLite and stops.
+
+The default database is `data/job_search.db`. Tables are created automatically,
+foreign keys are enabled on every connection, and `PRAGMA user_version` applies
+the lightweight schema version. SQLite is authoritative; no CSV is used for job
+state.
+
+Filter newly stored jobs with deterministic policy `v1.1` (no network or AI calls):
+
+```bash
+.venv/bin/python -m job_search.filtering
+```
+
+Use `--rebuild` to replace evaluations for the selected policy version, or keep
+historical decisions under a new version with `--policy-version v2`. Policy v1.1
+uses only `published_at` for age decisions and records deterministic source quality
+(`DIRECT_COMPANY`, `ATS`, `JOB_PLATFORM`, or `UNKNOWN`). The shortlist
+views are read-only:
+
+```bash
+.venv/bin/python -m job_search.filtering --show-pass
+.venv/bin/python -m job_search.filtering --show-review
+```
+
+Generic collection pages remain in SQLite for audit/history, but discovery now
+rejects them with `GENERIC_JOB_LISTING_PAGE`; rebuilding filter policy `v1.1` marks
+any already-stored collection rows as rejected without deleting or changing job
+identity. To refill missing fields on existing generic individual postings, make
+one bounded HTTP request per incomplete row with:
+
+```bash
+.venv/bin/python -m job_search.maintenance --limit 23 --verbose
+```
+
+If an individual site rejects normal HTTP (for example with a Cloudflare 403), an
+explicit fallback can reuse one browser while still visiting only each selected
+job URL, without crawling links:
+
+```bash
+.venv/bin/python -m job_search.maintenance \
+  --job-id 14 --timeout 60 --browser-fallback --windowed --verbose
+.venv/bin/python -m job_search.filtering --policy-version v1.1 --rebuild
+```
+
+### Docker
+
+The job command can run in Docker with:
+
+```bash
+docker compose run --rm job-search \
+  python -m job_search.discovery \
+  --limit 20 --delay 3 --timeout 15 --verbose
+```
+
+Compose stores `/app/data/job_search.db` in the named volume
+`job_search_data`, which stays in Docker/WSL Linux storage instead of binding a
+database file to a Windows NTFS path. The default container run is headless;
+use the local windowed command when manual Google verification is needed.
 
 ## Troubleshooting
 

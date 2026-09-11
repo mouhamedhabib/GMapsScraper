@@ -1,0 +1,16 @@
+services:
+  job-search:
+    build: .
+    command:
+      - python
+      - -m
+      - job_search.discovery
+      - --query-file
+      - /app/google_queries.txt
+      - --database
+      - /app/data/job_search.db
+    volumes:
+      - job_search_data:/app/data
+
+volumes:
+  job_search_data:

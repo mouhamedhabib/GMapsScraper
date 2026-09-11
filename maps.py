@@ -21,6 +21,7 @@ Previous / next:
 
 from utils.threading_controller import FastSearchAlgo
 from argparse import ArgumentParser
+from os import R_OK, access
 from os.path import isfile
 import sys
 
@@ -30,6 +31,7 @@ class GMapsScraper:
 
     def __init__(self):
         self._args = None
+        self._parser = None
 
     def arg_parser(self):
         """Parse scraper options and store the resulting command-line namespace."""
@@ -42,8 +44,8 @@ class GMapsScraper:
         parser.add_argument('-w', '--threads',
                             help='Number of threads to use (default: 1)', type=int, default=1)
         parser.add_argument('-l', '--limit',
-                            help='Number of results to scrape (-1 for all results, default: -1)',
-                            type=int, default=-1)
+                            help='Maximum number of results to scrape (default: 1)',
+                            type=int, default=1)
         parser.add_argument(
             '--incremental', action='store_true',
             help='Make --limit count only new companies and skip known identities early',
@@ -89,7 +91,16 @@ class GMapsScraper:
         parser.add_argument('--help-driver-path', action='store_true',
                             help='Get help for specifying the driver path')
 
+        self._parser = parser
         self._args = parser.parse_args()
+        if self._args.limit < 1:
+            parser.error("--limit must be >= 1")
+        if self._args.threads < 1:
+            parser.error("--threads must be >= 1")
+        if self._args.browser_wait < 1:
+            parser.error("--browser-wait must be >= 1")
+        if self._args.scroll_minutes < 1:
+            parser.error("--scroll-minutes must be >= 1")
         if self._args.incremental and self._args.output_format != "CSV":
             parser.error("--incremental requires --output-format CSV for restart-safe state")
 
@@ -105,31 +116,37 @@ class GMapsScraper:
     @staticmethod
     def print_limit_help():
         print("Use this option to specify the maximum number of results to scrape.")
-        print("Use '-1' to scrape all results.")
+        print("The limit must be at least 1.")
         sys.exit(0)
 
     def check_args(self):
-        """Stop with a clear error when the required query file does not exist."""
+        """Validate and return normalized queries before scraper initialization."""
         q = self._args.query_file
         if not isfile(q):
-            print(f"[-] File not found at path: {q}")
-            sys.exit(1)
+            self._parser.error(f"Query file does not exist or is not a regular file: {q}")
+        if not access(q, R_OK):
+            self._parser.error(f"Query file is not readable: {q}")
+        try:
+            queries = FastSearchAlgo.load_query_file(file_name=q)
+        except (OSError, UnicodeError) as exc:
+            self._parser.error(f"Could not read query file {q}: {exc}")
+        if not queries:
+            self._parser.error(f"No usable search queries found in {q}")
+        return queries
 
     def scrape_maps_data(self):
         """Load queries, configure worker limits, and run the Maps scraper."""
-        self.check_args()
-
         if self._args.help_query_file:
             self.print_query_file_help()
 
         if self._args.help_limit:
             self.print_limit_help()
 
-        queries_list = FastSearchAlgo.load_query_file(file_name=self._args.query_file)
+        queries_list = self.check_args()
         threads_limit = min(self._args.threads, len(queries_list))
         if self._args.low_resource:
             threads_limit = min(threads_limit, 1)
-        limit_results = None if self._args.limit == -1 else self._args.limit
+        limit_results = self._args.limit
 
         algo_obj = FastSearchAlgo(
             unavailable_text=self._args.unavailable_text,

@@ -15,8 +15,8 @@ Input:
     recover trustworthy geography and preserve earlier review decisions.
 
 Output:
-    Outreach-ready rows and a review subset. ``build_outreach_queue.py`` normally
-    consumes ``outreach_ready.csv`` next.
+    Mutually exclusive outreach-ready and review rows.
+    ``build_outreach_queue.py`` normally consumes ``outreach_ready.csv`` next.
 """
 
 from argparse import ArgumentParser
@@ -29,13 +29,22 @@ from urllib.parse import urlsplit
 
 try:
     from utils.discovery_timestamps import earliest_added_at
+    from utils.enrichment_schema import (
+        CANONICAL_ENRICHMENT_FIELDS,
+        normalize_enrichment_row,
+    )
 except ModuleNotFoundError:
     from discovery_timestamps import earliest_added_at
+    from enrichment_schema import (
+        CANONICAL_ENRICHMENT_FIELDS,
+        normalize_enrichment_row,
+    )
 
 
 DEFAULT_INPUT = Path("./CSV_FILES/leads_enriched_final.csv")
 DEFAULT_OUTPUT = Path("./CSV_FILES/outreach_ready.csv")
 DEFAULT_REVIEW_OUTPUT = Path("./CSV_FILES/outreach_review.csv")
+ENRICHMENT_INPUT_FIELDS = CANONICAL_ENRICHMENT_FIELDS
 
 OUTPUT_FIELDS = (
     "company_name",
@@ -275,6 +284,20 @@ def is_locally_flagged(row, flagged_domains, flagged_names, name_identities):
     )
 
 
+def needs_outreach_review(row, flagged_domains, flagged_names, name_identities):
+    """Return whether an otherwise eligible row must be held for review."""
+    return (
+        clean_value(row.get("enrichment_status")).upper() == "PARTIAL"
+        or not clean_value(row.get("description"))
+        or is_locally_flagged(
+            row,
+            flagged_domains,
+            flagged_names,
+            name_identities,
+        )
+    )
+
+
 def row_identity(row, row_index):
     domain = normalize_website_domain(row.get("website"))
     if domain:
@@ -315,7 +338,10 @@ def merge_duplicate_rows(rows):
 
 def build_outreach(input_path, output_path, review_output_path):
     """Write deduplicated outreach and review CSVs and return row-count metrics."""
-    input_rows = read_csv(input_path)
+    input_rows = [
+        normalize_enrichment_row(row, preserve_extra=True)
+        for row in read_csv(input_path)
+    ]
     status_counts = {"SUCCESS": 0, "PARTIAL": 0}
     excluded_statuses = 0
     eligible_rows = []
@@ -348,18 +374,15 @@ def build_outreach(input_path, output_path, review_output_path):
             output_row[field] = recover_geography(
                 field, output_row, domain_geography, name_geography,
             )
-        outreach_rows.append(output_row)
-        if (
-            output_row["enrichment_status"] == "PARTIAL"
-            or not output_row["description"]
-            or is_locally_flagged(
-                output_row,
-                flagged_domains,
-                flagged_names,
-                name_identities,
-            )
+        if needs_outreach_review(
+            output_row,
+            flagged_domains,
+            flagged_names,
+            name_identities,
         ):
             review_rows.append(output_row.copy())
+        else:
+            outreach_rows.append(output_row)
 
     atomic_write_csv(output_path, outreach_rows)
     atomic_write_csv(review_output_path, review_rows)
@@ -368,6 +391,8 @@ def build_outreach(input_path, output_path, review_output_path):
         "success": status_counts["SUCCESS"],
         "partial": status_counts["PARTIAL"],
         "excluded": excluded_statuses,
+        "eligible": len(group_order),
+        "ready": len(outreach_rows),
         "outreach": len(outreach_rows),
         "review": len(review_rows),
     }
@@ -394,8 +419,9 @@ def main():
     print(f"SUCCESS: {summary['success']}")
     print(f"PARTIAL: {summary['partial']}")
     print(f"Excluded incomplete/failed: {summary['excluded']}")
-    print(f"Final outreach rows: {summary['outreach']}")
-    print(f"Review rows: {summary['review']}")
+    print(f"Eligible leads: {summary['eligible']}")
+    print(f"Ready to send: {summary['ready']}")
+    print(f"Needs review: {summary['review']}")
 
 
 if __name__ == "__main__":

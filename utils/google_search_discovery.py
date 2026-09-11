@@ -35,14 +35,18 @@ try:
     from utils.discovery_timestamps import discovery_timestamp, earliest_added_at
     from utils.geography import extract_queries_geography
     from utils.known_companies import KnownCompanies
+    from utils.google_search_client import extract_organic_results as extract_raw_organic_results
 except ModuleNotFoundError:  # Support direct execution from the utils directory.
     from build_leads import clean_value, website_domain
     from discovery_timestamps import discovery_timestamp, earliest_added_at
     from geography import extract_queries_geography
     from known_companies import KnownCompanies
+    from google_search_client import extract_organic_results as extract_raw_organic_results
 
 
-DEFAULT_QUERY_FILE = Path("./google_queries.txt")
+# ``google_queries.txt`` is reserved for the job layer. Company Search remains
+# available and defaults to the same company-oriented input as Maps.
+DEFAULT_QUERY_FILE = Path("./queries.txt")
 DEFAULT_OUTPUT = Path("./CSV_FILES/google_search_companies.csv")
 DISCOVERY_FIELDS = (
     "company_name",
@@ -387,30 +391,28 @@ def blocked_search_page(driver):
     return next((marker for marker in BLOCKED_PAGE_MARKERS if marker in page_text), "")
 
 
-def extract_organic_results(driver, limit, verbose=False):
+def extract_organic_results(
+    driver, limit, verbose=False, resolution_timeout=3.0,
+    resolution_cache=None,
+):
     """Extract title/link pairs from rendered organic result containers."""
-    discoveries = []
-    seen_urls = set()
-    containers = driver.find_elements("css selector", "div.MjjYud, div.g")
-    for container in containers:
-        if len(discoveries) >= limit:
-            break
-        try:
-            heading = container.find_element("css selector", "h3")
-            anchor = heading.find_element("xpath", "ancestor::a[1]")
-            title = clean_value(heading.text)
-            url = clean_value(anchor.get_attribute("href"))
-            if not title or url in seen_urls or not is_suitable_company_result(title, url):
-                continue
-            seen_urls.add(url)
-            discoveries.append({"company_name": title, "source_url": url})
-        except Exception as error:
-            if verbose:
-                print(f"[-] Skipping unreadable result: {type(error).__name__}: {error}")
-    return discoveries
+    rows = extract_raw_organic_results(
+        driver,
+        limit,
+        verbose=verbose,
+        accept_result=is_suitable_company_result,
+        resolution_timeout=resolution_timeout,
+        resolution_cache=resolution_cache,
+    )
+    return [
+        {"company_name": row["title"], "source_url": row["url"]}
+        for row in rows
+    ]
 
 
-def read_current_search_results(driver, query, limit, timeout, verbose=False):
+def read_current_search_results(
+    driver, query, limit, timeout, verbose=False, resolution_cache=None,
+):
     """Read results from the current page without navigating or refreshing it."""
     from selenium.common.exceptions import TimeoutException
     from selenium.webdriver.support.ui import WebDriverWait
@@ -431,13 +433,22 @@ def read_current_search_results(driver, query, limit, timeout, verbose=False):
     blocked_marker = blocked_search_page(driver)
     if blocked_marker:
         return [], blocked_marker
-    rows = extract_organic_results(driver, limit, verbose=verbose)
+    if resolution_cache is None:
+        resolution_cache = getattr(driver, "_google_result_url_cache", None)
+    rows = extract_organic_results(
+        driver, limit, verbose=verbose,
+        resolution_timeout=min(3.0, max(0.5, timeout)),
+        resolution_cache=resolution_cache,
+    )
     for row in rows:
         row.update({"source": "google_search", "source_query": query})
     return rows, ""
 
 
-def search_query(driver, query, limit, timeout, verbose=False, start=0):
+def search_query(
+    driver, query, limit, timeout, verbose=False, start=0,
+    resolution_cache=None,
+):
     driver.set_page_load_timeout(timeout)
     url = "https://www.google.com/search?q=" + quote_plus(query)
     if start:
@@ -449,6 +460,7 @@ def search_query(driver, query, limit, timeout, verbose=False, start=0):
         limit,
         timeout,
         verbose=verbose,
+        resolution_cache=resolution_cache,
     )
 
 
@@ -551,12 +563,17 @@ def discover_companies(
         return discoveries
 
     driver = None
+    resolution_cache = {}
     try:
         try:
             driver = (driver_factory or create_chrome_driver)(windowed=windowed)
         except Exception as error:
             print(f"[-] Browser unavailable: {type(error).__name__}: {error}")
             return discoveries
+        try:
+            driver._google_result_url_cache = resolution_cache
+        except Exception:
+            pass
         for query_index, query in enumerate(queries):
             if verbose:
                 print(f"[+] Searching: {query}")

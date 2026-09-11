@@ -45,6 +45,15 @@ EMPTY_ENRICHMENT = {
     "industry": "",
 }
 
+FAILURE_TYPE_PRIORITY = {
+    "UNKNOWN_NAVIGATION": 0,
+    "BROWSER": 1,
+    "CONNECTION": 2,
+    "SSL": 3,
+    "DNS": 4,
+    "TIMEOUT": 5,
+}
+
 DESCRIPTION_FIELDS = (
     "website_meta_description",
     "about_text",
@@ -511,6 +520,44 @@ def _empty_result():
     return dict(EMPTY_ENRICHMENT)
 
 
+def _navigation_failure_type(error):
+    """Return a concise category for an expected page-navigation failure."""
+    if isinstance(error, TimeoutException):
+        return "TIMEOUT"
+
+    name = type(error).__name__.casefold()
+    message = str(error).casefold()
+    if any(marker in message for marker in (
+            "err_name_not_resolved", "name_not_resolved", "dns_probe",
+            "no address associated with hostname", "temporary failure in name resolution",
+            "nodename nor servname provided")):
+        return "DNS"
+    if any(marker in message for marker in (
+            "err_cert_", "err_ssl_", "ssl error", "certificate error",
+            "certificate verify failed")):
+        return "SSL"
+    if any(marker in message for marker in (
+            "err_connection_", "connection refused", "connection reset",
+            "connection aborted", "connection closed", "failed to establish a new connection",
+            "network is unreachable")):
+        return "CONNECTION"
+    if ("webdriver" in name or "session" in name or "no such window" in message
+            or "chrome not reachable" in message or "disconnected" in message):
+        return "BROWSER"
+    return "UNKNOWN_NAVIGATION"
+
+
+def _record_navigation_failure(outcome, error):
+    if outcome is None:
+        return
+    failure_type = _navigation_failure_type(error)
+    outcome["had_navigation_failure"] = True
+    current = outcome.get("failure_type", "")
+    if (not current or FAILURE_TYPE_PRIORITY[failure_type]
+            > FAILURE_TYPE_PRIORITY.get(current, -1)):
+        outcome["failure_type"] = failure_type
+
+
 def _candidate_urls(website_url):
     """Return normalized homepage and common context-page candidates."""
     website_url = normalize_whitespace(website_url)
@@ -678,14 +725,17 @@ def _has_useful_page_text(source, visible_text, is_homepage=False):
     return len(normalize_whitespace(cleaned)) >= 40 and len(words) >= 6
 
 
-def _load_pages(driver, candidates, timeout, verbose):
+def _load_pages(driver, candidates, timeout, verbose, outcome=None):
     """Load useful candidate pages within time bounds and return their HTML."""
     pages = []
     original_handle = driver.current_window_handle
     candidate_timeout = max(1, timeout or 15)
 
     for kind, url in candidates:
+        if outcome is not None:
+            outcome["pages_attempted"] += 1
         temporary_handle = None
+        candidate_loaded = False
         try:
             driver.switch_to.new_window("tab")
             temporary_handle = driver.current_window_handle
@@ -733,6 +783,9 @@ def _load_pages(driver, candidates, timeout, verbose):
                 visible_text = driver.execute_script(
                     "return document.body ? document.body.innerText : '';"
                 )
+                if outcome is not None and not candidate_loaded:
+                    outcome["pages_loaded"] += 1
+                    candidate_loaded = True
                 if _has_useful_page_text(
                     source,
                     visible_text,
@@ -750,16 +803,19 @@ def _load_pages(driver, candidates, timeout, verbose):
                     print(f"[-] Company enrichment page had insufficient text: "
                           f"{url} ({action})")
         except TimeoutException as error:
+            _record_navigation_failure(outcome, error)
             if verbose:
-                print(f"[-] Company enrichment URL timed out: {url} "
+                print(f"[FAILED_TIMEOUT] Company enrichment URL timed out: {url} "
                       f"({type(error).__name__}: {error})")
             try:
                 driver.execute_script("window.stop();")
             except Exception:
                 pass
         except Exception as error:
+            failure_type = _navigation_failure_type(error)
+            _record_navigation_failure(outcome, error)
             if verbose:
-                print(f"[-] Company enrichment URL failed: {url} "
+                print(f"[FAILED_{failure_type}] Company enrichment URL failed: {url} "
                       f"({type(error).__name__}: {error})")
         finally:
             try:
@@ -780,15 +836,24 @@ def _load_pages(driver, candidates, timeout, verbose):
     return pages
 
 
-def _load_company_pages(driver, website_url, timeout, verbose):
+def _load_company_pages(driver, website_url, timeout, verbose, outcome=None):
     candidates = _candidate_urls(website_url)
     if not candidates:
         return []
 
-    homepage_pages = _load_pages(driver, candidates[:1], timeout, verbose)
+    load_options = (driver, candidates[:1], timeout, verbose)
+    homepage_pages = (
+        _load_pages(*load_options, outcome=outcome)
+        if outcome is not None else _load_pages(*load_options)
+    )
     homepage_page = homepage_pages[0] if homepage_pages else None
     secondary = _secondary_candidates(website_url, homepage_page)
-    return homepage_pages + _load_pages(driver, secondary, timeout, verbose)
+    secondary_options = (driver, secondary, timeout, verbose)
+    secondary_pages = (
+        _load_pages(*secondary_options, outcome=outcome)
+        if outcome is not None else _load_pages(*secondary_options)
+    )
+    return homepage_pages + secondary_pages
 
 
 def _soup(source):
@@ -995,9 +1060,19 @@ def _extract_linkedin(parsed_pages):
 
 def enrich_company(driver, website_url, timeout=15, verbose=False) -> dict:
     """Return conservative company context extracted directly from website HTML."""
-    pages = _load_company_pages(driver, website_url, timeout, verbose)
+    outcome = {
+        "pages_attempted": 0,
+        "pages_loaded": 0,
+        "had_navigation_failure": False,
+        "failure_type": "",
+    }
+    pages = _load_company_pages(
+        driver, website_url, timeout, verbose, outcome=outcome,
+    )
     if not pages:
-        return _empty_result()
+        result = _empty_result()
+        result["_meta"] = outcome
+        return result
 
     homepage_page = next((page for page in pages if page["kind"] == "homepage"), None)
     homepage_soup = _soup(homepage_page["source"]) if homepage_page else None
@@ -1010,4 +1085,5 @@ def enrich_company(driver, website_url, timeout=15, verbose=False) -> dict:
     result["linkedin_url"] = _extract_linkedin(pages)
     result["description"] = build_company_description(result)
     result["industry"] = classify_company_industry(result)
+    result["_meta"] = outcome
     return result

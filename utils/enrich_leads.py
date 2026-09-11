@@ -8,14 +8,15 @@ Purpose:
 
 Pipeline:
     leads_ready.csv -> enrich_leads.py -> company_enrichment.py
-                    -> leads_enriched.csv -> build_outreach.py
+                    -> leads_enriched.csv -> finalize_enrichment.py
+                    -> leads_enriched_final.csv -> build_outreach.py
 
 Input:
     Ready lead rows containing company name, email, website, and phone.
 
 Output:
-    Enriched lead rows with context fields, propagated geography, status, and
-    lifetime attempt count. ``build_outreach.py`` normally runs next.
+    Resumable enriched lead rows with context fields, propagated metadata,
+    status, and lifetime attempt count. ``finalize_enrichment.py`` runs next.
 """
 
 from argparse import ArgumentParser
@@ -30,8 +31,18 @@ from urllib.parse import urlsplit
 
 try:
     from utils.discovery_timestamps import earliest_added_at
+    from utils.enrichment_schema import (
+        CANONICAL_ENRICHMENT_FIELDS,
+        COMPANY_ENRICHMENT_FIELDS,
+        SOURCE_CONTEXT_FIELDS,
+    )
 except ModuleNotFoundError:
     from discovery_timestamps import earliest_added_at
+    from enrichment_schema import (
+        CANONICAL_ENRICHMENT_FIELDS,
+        COMPANY_ENRICHMENT_FIELDS,
+        SOURCE_CONTEXT_FIELDS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -44,45 +55,8 @@ DEFAULT_INPUT = Path("./CSV_FILES/leads_ready.csv")
 DEFAULT_OUTPUT = Path("./CSV_FILES/leads_enriched.csv")
 MAX_LIFETIME_ATTEMPTS = 3
 
-OUTPUT_FIELDS = (
-    "company_name",
-    "email",
-    "website",
-    "added_at",
-    "description",
-    "industry",
-    "services",
-    "website_title",
-    "website_meta_description",
-    "hero_text",
-    "about_text",
-    "country",
-    "city",
-    "location",
-    "linkedin_url",
-    "phone",
-    "enrichment_status",
-    "enrichment_attempts",
-)
-
-ENRICHMENT_FIELDS = (
-    "description",
-    "industry",
-    "services",
-    "website_title",
-    "website_meta_description",
-    "hero_text",
-    "about_text",
-    "linkedin_url",
-)
-
-SOURCE_CONTEXT_FIELDS = (
-    "services",
-    "website_title",
-    "website_meta_description",
-    "hero_text",
-    "about_text",
-)
+OUTPUT_FIELDS = CANONICAL_ENRICHMENT_FIELDS
+ENRICHMENT_FIELDS = COMPANY_ENRICHMENT_FIELDS
 
 UNAVAILABLE_VALUES = {
     "",
@@ -294,7 +268,11 @@ def has_useful_enrichment(record):
     return any(clean_value(record.get(field)) for field in ENRICHMENT_FIELDS)
 
 
-def enrichment_status(record, unexpected_failure=False):
+def enrichment_status(
+    record,
+    unexpected_failure=False,
+    inspection_failure=False,
+):
     """Classify extracted context by completeness and failure state."""
     if not normalize_website_domain(record.get("website")):
         return "NO_WEBSITE"
@@ -307,7 +285,7 @@ def enrichment_status(record, unexpected_failure=False):
         return "SUCCESS"
     if has_useful_enrichment(record):
         return "PARTIAL"
-    if unexpected_failure:
+    if unexpected_failure or inspection_failure:
         return "FAILED"
     if parse_attempts(record.get("enrichment_attempts")) == 0:
         return "PENDING"
@@ -339,6 +317,8 @@ def prepare_records(input_path, output_path):
             "city": input_row.get("city"),
             "location": input_row.get("location"),
             "added_at": input_row.get("added_at"),
+            "source": input_row.get("source"),
+            "source_queries": input_row.get("source_queries"),
         }
         for field, value in source_values.items():
             cleaned = clean_value(value)
@@ -375,6 +355,19 @@ def merge_enrichment(record, enrichment):
         value = clean_value((enrichment or {}).get(field))
         if value:
             record[field] = value
+
+
+def inspection_failure_metadata(enrichment):
+    """Return (failed, subtype) without leaking internal metadata to CSV rows."""
+    meta = (enrichment or {}).get("_meta", {})
+    if not isinstance(meta, dict):
+        return False, ""
+    failed = (
+        not has_useful_enrichment(enrichment or {})
+        and parse_attempts(meta.get("pages_loaded")) == 0
+        and bool(meta.get("had_navigation_failure"))
+    )
+    return failed, clean_value(meta.get("failure_type")).upper()
 
 
 def load_enrichment_function():
@@ -546,6 +539,8 @@ def enrich_leads_batch(
             attempts += 1
             record["enrichment_attempts"] = str(attempts)
             unexpected_failure = False
+            inspection_failure = False
+            failure_type = ""
 
             try:
                 driver = browser.get()
@@ -558,8 +553,12 @@ def enrich_leads_batch(
                     verbose=verbose,
                 )
                 merge_enrichment(record, enrichment)
+                inspection_failure, failure_type = inspection_failure_metadata(
+                    enrichment
+                )
             except Exception as error:
                 unexpected_failure = True
+                failure_type = "BROWSER" if is_driver_failure(error) else "UNKNOWN_NAVIGATION"
                 if verbose:
                     print(
                         f"[-] Enrichment failed for {record['company_name'] or record['website']}: "
@@ -573,12 +572,16 @@ def enrich_leads_batch(
             record["enrichment_status"] = enrichment_status(
                 record,
                 unexpected_failure=unexpected_failure,
+                inspection_failure=inspection_failure,
             )
             atomic_write_csv(output_path, records)
 
             if verbose:
+                display_status = record["enrichment_status"]
+                if display_status == "FAILED" and failure_type:
+                    display_status = f"FAILED_{failure_type}"
                 print(
-                    f"[{record['enrichment_status']}] "
+                    f"[{display_status}] "
                     f"{record['company_name'] or record['website']}"
                 )
             if browser_exhausted:

@@ -147,19 +147,73 @@ class BuildTimestampTests(TestCase):
         build_lead_files(root / "google_maps_data.csv", root)
         return root, read_csv(root / "leads_master.csv")
 
-    def test_duplicate_merge_uses_earliest_timestamp(self):
-        _, rows = self.build([maps_row()], [search_row()])
+    @staticmethod
+    def master_row(stamp=""):
+        row = {field: "" for field in MASTER_FIELDS}
+        row.update({
+            "name": "Acme", "website": "https://acme.test",
+            "added_at": stamp,
+        })
+        return row
+
+    def test_old_master_blank_and_maps_valid_keeps_maps_timestamp(self):
+        _, rows = self.build([maps_row(stamp=STAMP_1)], existing=[self.master_row()])
         self.assertEqual(rows[0]["added_at"], STAMP_1)
 
-    def test_rebuild_preserves_existing_timestamp(self):
-        existing = {field: "" for field in MASTER_FIELDS}
-        existing.update({"name": "Acme", "website": "https://acme.test", "added_at": STAMP_1})
-        _, rows = self.build([maps_row(stamp=STAMP_2)], existing=[existing])
+    def test_old_master_valid_and_maps_blank_keeps_master_timestamp(self):
+        _, rows = self.build([maps_row(stamp="")], existing=[self.master_row(STAMP_1)])
         self.assertEqual(rows[0]["added_at"], STAMP_1)
 
-    def test_legacy_company_remains_blank(self):
+    def test_old_master_later_and_maps_earlier_keeps_earliest_timestamp(self):
+        _, rows = self.build(
+            [maps_row(stamp=STAMP_1)], existing=[self.master_row(STAMP_2)],
+        )
+        self.assertEqual(rows[0]["added_at"], STAMP_1)
+
+    def test_maps_later_and_search_earlier_keeps_earliest_timestamp(self):
+        _, rows = self.build([maps_row(stamp=STAMP_2)], [search_row(STAMP_1)])
+        self.assertEqual(rows[0]["added_at"], STAMP_1)
+
+    def test_all_timestamp_sources_blank_remain_blank(self):
+        _, rows = self.build(
+            [maps_row(stamp="")], [search_row("")], [self.master_row()],
+        )
+        self.assertEqual(rows[0]["added_at"], "")
+
+    def test_rebuild_is_idempotent(self):
+        root, _ = self.build(
+            [maps_row(stamp=STAMP_2)], [search_row(STAMP_1)],
+            [self.master_row()],
+        )
+        output_names = ("leads_master.csv", "leads_ready.csv", "leads_review.csv")
+        first_build = {name: (root / name).read_bytes() for name in output_names}
+
+        build_lead_files(root / "google_maps_data.csv", root)
+
+        self.assertEqual(
+            {name: (root / name).read_bytes() for name in output_names},
+            first_build,
+        )
+
+    def test_legacy_row_without_timestamp_evidence_remains_blank(self):
         _, rows = self.build([maps_row(stamp="")])
         self.assertEqual(rows[0]["added_at"], "")
+
+    def test_source_timestamps_propagate_to_ready_and_review_outputs(self):
+        ready = maps_row(name="Ready", stamp=STAMP_1)
+        review = {
+            **maps_row(name="Review", stamp=STAMP_2),
+            "webpage": "https://review.test",
+            "site_email": "contact@different.test",
+        }
+        root, master_rows = self.build([ready, review])
+
+        self.assertEqual(
+            {row["name"]: row["added_at"] for row in master_rows},
+            {"Ready": STAMP_1, "Review": STAMP_2},
+        )
+        self.assertEqual(read_csv(root / "leads_ready.csv")[0]["added_at"], STAMP_1)
+        self.assertEqual(read_csv(root / "leads_review.csv")[0]["added_at"], STAMP_2)
 
 
 class PropagationTests(TestCase):

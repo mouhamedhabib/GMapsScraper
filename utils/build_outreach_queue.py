@@ -30,6 +30,7 @@ from tempfile import NamedTemporaryFile
 if __package__:
     from utils.build_outreach import (
         clean_value,
+        flagged_local_record,
         is_valid_email,
         normalize_email,
         normalize_website_domain,
@@ -37,6 +38,7 @@ if __package__:
 else:  # Support direct execution from the utils directory.
     from build_outreach import (
         clean_value,
+        flagged_local_record,
         is_valid_email,
         normalize_email,
         normalize_website_domain,
@@ -74,6 +76,15 @@ RESPONSE_STATUSES = {
 # address after it was sent, skipped, bounced, or unsubscribed.
 
 PROTECTED_RESPONSE_STATUSES = {"BOUNCED", "UNSUBSCRIBED"}
+
+
+def explicitly_requires_review(row):
+    """Defensively reject review-marked rows from a custom ready file."""
+    return (
+        clean_value(row.get("enrichment_status")).upper() == "PARTIAL"
+        or not clean_value(row.get("description"))
+        or flagged_local_record(row)
+    )
 
 
 def read_csv(path):
@@ -189,6 +200,8 @@ def build_queue(input_path, history_path, output_path, exclude_failed=False):
     seen_emails = set()
     seen_domains = set()
     for row in outreach_rows:
+        if explicitly_requires_review(row):
+            continue
         email = normalize_email(row.get("email"))
         domain = normalize_website_domain(row.get("website"))
         if not is_valid_email(email):

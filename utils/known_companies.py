@@ -3,77 +3,25 @@
 from csv import DictReader
 from pathlib import Path
 from threading import Lock
-from urllib.parse import parse_qs, unquote, urlsplit, urlunsplit
-import re
-
 try:
     from utils.build_leads import clean_value, normalize_name, normalize_phone, website_domain
+    from utils.maps_identity import maps_identities_for, normalize_place_id, normalize_place_url
 except ModuleNotFoundError:  # Support direct execution from the utils directory.
     from build_leads import clean_value, normalize_name, normalize_phone, website_domain
-
-
-PLACE_DATA_ID = re.compile(r"!1s([^!/?&#]+)", re.IGNORECASE)
-
-
-def normalize_place_id(value):
-    """Extract a stable Google place/cid identity when one is present."""
-    value = clean_value(value)
-    if not value:
-        return ""
-    parsed = urlsplit(value if "://" in value else "//" + value)
-    query = parse_qs(parsed.query)
-    for key in ("place_id", "query_place_id", "cid"):
-        candidate = clean_value((query.get(key) or [""])[0])
-        if candidate:
-            identity_type = "place_id" if key in {"place_id", "query_place_id"} else key
-            return f"{identity_type}:{candidate.casefold()}"
-    match = PLACE_DATA_ID.search(value)
-    if match:
-        candidate = unquote(match.group(1)).casefold()
-        return ("place_id:" if candidate.startswith("chij") else "data:") + candidate
-    return ""
-
-
-def normalize_place_url(value):
-    """Normalize an exact Maps place URL without treating its name as identity."""
-    value = clean_value(value)
-    if not value:
-        return ""
-    parsed = urlsplit(value if "://" in value else "//" + value)
-    host = (parsed.hostname or "").casefold()
-    lowered_path = parsed.path.casefold()
-    if (
-        "google." not in host
-        or "/maps/" not in lowered_path
-        or ("/place/" not in lowered_path)
-        or ("/@" not in lowered_path and "/data=" not in lowered_path)
-    ):
-        return ""
-    # Query parameters and fragments are commonly tracking/session state. Keep
-    # the full path, which includes Maps' stable data token when supplied.
-    path = unquote(parsed.path).rstrip("/")
-    return urlunsplit(("https", "google.com", path, "", "")) if path else ""
+    from maps_identity import maps_identities_for, normalize_place_id, normalize_place_url
 
 
 def identities_for(row):
     """Return conservative identities found in either raw or master schemas."""
-    maps_url = clean_value(
-        row.get("map_link") or row.get("place_url") or row.get("maps_url")
-    )
-    explicit_place_id = clean_value(row.get("place_id"))
-    place_id = (
-        ("place_id:" + explicit_place_id.casefold())
-        if explicit_place_id
-        else normalize_place_id(maps_url)
-    )
+    maps_identities = maps_identities_for(row)
     domain = website_domain(
         row.get("webpage") or row.get("website") or row.get("source_url")
     )
     name = normalize_name(row.get("title") or row.get("company_name") or row.get("name"))
     phone = normalize_phone(row.get("phone_number") or row.get("phone"))
     return {
-        "place_id": place_id.casefold(),
-        "place_url": normalize_place_url(maps_url),
+        "place_id": maps_identities["place_id"],
+        "place_url": maps_identities["place_url"],
         "domain": domain,
         "name_phone": (name, phone) if name and phone else None,
     }

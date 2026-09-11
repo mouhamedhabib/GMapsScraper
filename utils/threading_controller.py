@@ -39,6 +39,14 @@ class FastSearchAlgo:
                  incremental: bool = False,
                  low_resource: bool = False,
                  ) -> None:
+        if workers < 1:
+            raise ValueError("workers must be >= 1")
+        if result_range is not None and result_range < 1:
+            raise ValueError("result_range must be >= 1 when provided")
+        if wait_time < 1:
+            raise ValueError("wait_time must be >= 1")
+        if scroll_minutes < 1:
+            raise ValueError("scroll_minutes must be >= 1")
         if suggested_ext is None:
             suggested_ext = ["contact-us", "contact"]
 
@@ -83,6 +91,8 @@ class FastSearchAlgo:
 
     def fast_search_algorithm(self, query_list: list[str]):
         """Submit all queries to the worker pool and surface worker exceptions."""
+        if not query_list:
+            raise ValueError("query_list must contain at least one usable query")
         query_list_range = len(query_list)
         self._query_list = query_list
         previous_sigint = signal(SIGINT, self.signal_handler)
@@ -159,14 +169,6 @@ class FastSearchAlgo:
 
     @staticmethod
     def load_query_file(file_name: str):
-        """Return stripped query lines, or an empty list when the file is missing."""
-        try:
-            file_data = open(file_name, "r", encoding="utf-8").readlines()
-        except (FileNotFoundError, FileNotFoundError):
-            return []
-
-        clean_data = []
-        for data in file_data:
-            clean_data.append(data.strip())
-
-        return clean_data
+        """Return non-empty, stripped query lines from a UTF-8 text file."""
+        with open(file_name, "r", encoding="utf-8") as query_file:
+            return [line.strip() for line in query_file if line.strip()]

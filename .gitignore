@@ -165,6 +165,12 @@ CLAUDE.md
 # CSV files
 /CSV_FILES/
 
+# Local job-search operational state (Docker uses a named volume instead).
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+/data/*.db-journal
+
 # Local browser installer
 /google-chrome-stable_current_amd64.deb
 
