@@ -6,7 +6,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from job_search.filtering import DEFAULT_POLICY_VERSION, evaluate_job, filter_stored_jobs
+from job_search.filtering import (
+    DEFAULT_POLICY_VERSION,
+    evaluate_job,
+    extract_experience,
+    filter_stored_jobs,
+)
+from job_search.geography import normalize_geography
 from job_search.maintenance import repair_incomplete_generic_jobs
 from job_search.providers import ParsedJob
 from job_search.storage import connect_database, upsert_job
@@ -65,6 +71,20 @@ class RuleTests(TestCase):
         cloud_infrastructure = self.decision("Cloud Engineer")
         self.assertReason(cloud_infrastructure, "REVIEW_ROLE_UNCLEAR")
 
+    def test_programmer_ai_and_reactjs_developer_titles_are_relevant(self):
+        for title in (
+            "[Hiring] Junior Java Programmer @EUROPEAN DYNAMICS",
+            "[Hiring] AI Developer @ECS Tech Inc",
+            "Frontend ReactJS Developer with French | SNI",
+        ):
+            with self.subTest(title=title):
+                result = self.decision(title)
+                self.assertReason(result, "PASS_RELEVANT_ROLE")
+                self.assertNotIn("REVIEW_ROLE_UNCLEAR", [reason.code for reason in result.reasons])
+        researcher = self.decision("AI Researcher")
+        self.assertEqual(researcher.status, "REJECT")
+        self.assertNotIn("PASS_RELEVANT_ROLE", [reason.code for reason in researcher.reasons])
+
     def test_experience_thresholds_and_optional_experience(self):
         for years in (1, 2):
             result = self.decision(description=f"{years} years of experience required.")
@@ -81,6 +101,84 @@ class RuleTests(TestCase):
         self.assertReason(preferred, "REVIEW_EXPERIENCE_PREFERRED")
         ranged = self.decision(description="The role requires 1–3 years.")
         self.assertEqual((ranged.experience_min_years, ranged.experience_max_years), (1, 3))
+
+    def test_french_experience_extraction(self):
+        fixed_cases = (
+            ("5 ans d'expérience", 5),
+            ("5 ans d’expérience", 5),
+            ("au moins 5 ans d'expérience", 5),
+            ("au moins cinq ans", 5),
+            ("minimum de 5 ans", 5),
+            ("un minimum de 5 ans", 5),
+            ("5 années d'expérience", 5),
+            ("expérience de 5 ans minimum", 5),
+            ("vous justifiez de 5 ans d'expérience", 5),
+            ("vous disposez de 5 ans d'expérience", 5),
+            ("vous avez 5 ans d'expérience", 5),
+            ("expérience professionnelle de 5 ans", 5),
+            ("trois ans d'expérience", 3),
+        )
+        for description, expected in fixed_cases:
+            with self.subTest(description=description):
+                evidence = extract_experience(description)
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0].minimum, expected)
+                self.assertIsNone(evidence[0].maximum)
+                self.assertFalse(evidence[0].preferred)
+
+        range_cases = (
+            ("3 à 5 ans d'expérience", 3, 5),
+            ("3-5 ans d'expérience", 3, 5),
+            ("entre 3 et 5 ans d'expérience", 3, 5),
+            ("1 à 2 ans", 1, 2),
+            ("1-2 ans d'expérience", 1, 2),
+        )
+        for description, minimum, maximum in range_cases:
+            with self.subTest(description=description):
+                evidence = extract_experience(description)
+                self.assertEqual((evidence[0].minimum, evidence[0].maximum), (minimum, maximum))
+
+    def test_french_optional_approximate_and_false_positive_context(self):
+        for description in (
+            "Idéalement 5 ans d'expérience",
+            "5 ans serait un plus",
+            "Expérience de 5 ans souhaitée",
+        ):
+            with self.subTest(description=description):
+                evidence = extract_experience(description)
+                self.assertEqual(len(evidence), 1)
+                self.assertTrue(evidence[0].preferred)
+                result = self.decision(description=description)
+                self.assertNotEqual(result.status, "REJECT")
+                self.assertReason(result, "REVIEW_EXPERIENCE_PREFERRED")
+
+        approximate = extract_experience("environ 3 ans d'expérience")
+        self.assertTrue(approximate[0].approximate)
+        for description in (
+            "expérience significative",
+            "expérience confirmée",
+            "solide expérience",
+            "Java 8",
+            "Angular 17",
+            "équipe de 5 personnes",
+            "75009 Paris",
+        ):
+            with self.subTest(description=description):
+                self.assertEqual(extract_experience(description), ())
+
+    def test_french_job_43_shaped_description_uses_existing_policy(self):
+        description = (
+            "Nous recherchons un développeur backend pour concevoir des API. "
+            "Vous justifiez d'au moins 5 ans d'expérience professionnelle "
+            "dans le développement logiciel. Python et PostgreSQL sont requis."
+        )
+        result = self.decision(description=description)
+        self.assertEqual(result.status, "REJECT")
+        self.assertReason(result, "REJECT_EXPERIENCE_5_PLUS")
+        self.assertGreaterEqual(result.experience_min_years, 5)
+        evidence = result.matched_terms["experience_evidence"]
+        self.assertEqual(evidence[0]["source"], "description")
+        self.assertIn("5 ans d'expérience", evidence[0]["experience_text"])
 
     def test_irrelevant_role_only_uses_title(self):
         self.assertReason(self.decision("DevOps Engineer"), "REJECT_ROLE_DEVOPS")
@@ -142,6 +240,139 @@ class RuleTests(TestCase):
         self.assertNotEqual(local.status, "REJECT")
         structured = self.decision(location="Paris", country="FR")
         self.assertEqual(structured.status, "REVIEW")
+
+    def test_worldwide_remote_requires_explicit_job_eligibility(self):
+        incidental_descriptions = (
+            "We serve customers worldwide with credential-security products.",
+            "Our globally distributed customers rely on this platform.",
+            "Join an international company with offices on three continents.",
+            "Our products are used worldwide by millions of people.",
+            "The company operates globally and builds an international brand.",
+            "Open to candidates worldwide.",
+            "Open to candidates worldwide to build remote-monitoring products.",
+        )
+        for description in incidental_descriptions:
+            with self.subTest(description=description):
+                result = self.decision(description=description, location="Paris, France")
+                self.assertNotIn(
+                    "PASS_REMOTE_WORLDWIDE",
+                    [reason.code for reason in result.reasons],
+                )
+                self.assertReason(result, "REVIEW_LOCATION_PREFERRED_MARKET")
+
+        for title, location in (
+            ("Worldwide Backend Developer", "Paris, France"),
+            ("Backend Developer", "Worldwide"),
+        ):
+            with self.subTest(title=title, location=location):
+                result = self.decision(title, location=location)
+                self.assertNotIn(
+                    "PASS_REMOTE_WORLDWIDE",
+                    [reason.code for reason in result.reasons],
+                )
+
+        seattle = self.decision(
+            description="We support customers worldwide and operate globally.",
+            location="Seattle", city="Seattle",
+        )
+        self.assertEqual(seattle.status, "REJECT")
+        self.assertReason(seattle, "REJECT_LOCATION_US_ONLY")
+        self.assertNotIn(
+            "PASS_REMOTE_WORLDWIDE", [reason.code for reason in seattle.reasons]
+        )
+
+        for description, location in (
+            ("Work remotely from anywhere in Quebec.", "Montreal, Canada"),
+            ("This role is remote anywhere within Europe.", "Remote in Europe"),
+        ):
+            with self.subTest(description=description):
+                result = self.decision(description=description, location=location)
+                self.assertNotIn(
+                    "PASS_REMOTE_WORLDWIDE",
+                    [reason.code for reason in result.reasons],
+                )
+
+    def test_explicit_worldwide_remote_phrases_remain_eligible(self):
+        descriptions = (
+            "This role is remote worldwide.",
+            "You may work remotely from anywhere in the world.",
+            "This position lets you work from anywhere.",
+            "The job is remote anywhere in the world.",
+            "We are hiring worldwide for a remote position.",
+            "This remote role is open to candidates worldwide.",
+            "Open to candidates worldwide. This is a remote role.",
+            "This job can be performed remote globally.",
+        )
+        for description in descriptions:
+            with self.subTest(description=description):
+                result = self.decision(description=description, location="")
+                self.assertEqual(result.status, "PASS")
+                self.assertReason(result, "PASS_REMOTE_WORLDWIDE")
+
+        for location in ("Remote - Worldwide", "Location: Worldwide / Remote"):
+            with self.subTest(location=location):
+                result = self.decision(location=location)
+                self.assertEqual(result.status, "PASS")
+                self.assertReason(result, "PASS_REMOTE_WORLDWIDE")
+
+        structured = self.decision(location="Worldwide", remote_policy="REMOTE")
+        self.assertEqual(structured.status, "PASS")
+        self.assertReason(structured, "PASS_REMOTE_WORLDWIDE")
+
+    def test_worldwide_remote_regression_uses_job_content_not_an_id(self):
+        dashlane_shaped = self.decision(
+            "Software Engineer - Security Features",
+            description=(
+                "About the company: millions of consumers and over 25,000 brands "
+                "worldwide trust our products. We have grown to more than 300 "
+                "employees globally. About the role: join our product development "
+                "team based in Paris."
+            ),
+            location="Paris, France", country="France", city="Paris",
+        )
+        self.assertEqual(dashlane_shaped.status, "REVIEW")
+        self.assertReason(dashlane_shaped, "REVIEW_LOCATION_PREFERRED_MARKET")
+        self.assertNotIn(
+            "PASS_REMOTE_WORLDWIDE",
+            [reason.code for reason in dashlane_shaped.reasons],
+        )
+
+        europe = self.decision(
+            description="This is a remote role within Europe for an international company.",
+            location="Remote in Europe",
+        )
+        self.assertEqual(europe.status, "REVIEW")
+        self.assertReason(europe, "REVIEW_LOCATION_EUROPE")
+        self.assertNotIn(
+            "PASS_REMOTE_WORLDWIDE", [reason.code for reason in europe.reasons]
+        )
+
+    def test_normalized_geography_does_not_use_description_substrings(self):
+        cases = (
+            (("Seattle", "Seattle", "", ""), ("United States", "UNITED_STATES")),
+            (("Sliema, Malta", "Sliema", "", ""), ("Malta", "EUROPE")),
+            (("Iași, Romania", "Iași", "", ""), ("Romania", "EUROPE")),
+            (("Breda, Netherlands", "Breda", "", ""), ("Netherlands", "EUROPE")),
+            (("Unlisted City", "Unlisted City", "", ""), ("", "UNKNOWN")),
+        )
+        for values, expected in cases:
+            with self.subTest(location=values[0]):
+                result = normalize_geography(*values)
+                self.assertEqual((result.country, result.region), expected)
+
+        seattle = self.decision(
+            location="Seattle", city="Seattle",
+            description="We serve customers in the U.S., Canada, Europe, and Australia.",
+        )
+        self.assertNotIn("REVIEW_LOCATION_EUROPE", [reason.code for reason in seattle.reasons])
+        self.assertReason(seattle, "REJECT_LOCATION_US_ONLY")
+        self.assertEqual(seattle.matched_terms["normalized_country"], ["United States"])
+
+        false_location = self.decision(
+            "[Hiring] AI Developer @ECS Tech Inc", location="ai", city="ai",
+        )
+        self.assertReason(false_location, "REVIEW_LOCATION_UNKNOWN")
+        self.assertEqual(false_location.matched_terms["normalized_country"], [])
 
     def test_quality_age_and_extraction(self):
         missing = self.decision(description="")
@@ -220,6 +451,45 @@ class RuleTests(TestCase):
         ), NOW)
         self.assertEqual(result.status, "REJECT")
         self.assertEqual(result.primary_reason, "GENERIC_JOB_LISTING_PAGE")
+
+    def test_live_general_careers_and_vacancies_pages_are_rejected(self):
+        cases = (
+            (
+                "Software Engineering Careers & Job Opportunities | Accenture",
+                "Explore careers and job opportunities in software engineering.",
+                "https://www.accenture.com/be-en/careers/explore-careers/area-of-interest/software-engineering-careers",
+            ),
+            (
+                "Junior developer jobs - 29 vacancies on JobScout24",
+                "Search open roles from multiple employers.",
+                "https://www.jobscout24.ch/en/jobs/junior%20developer",
+            ),
+        )
+        for title, description, url in cases:
+            with self.subTest(title=title):
+                result = evaluate_job(job(
+                    title, description, location="", canonical_url=url,
+                ), NOW)
+                self.assertEqual(result.status, "REJECT")
+                self.assertEqual(result.primary_reason, "GENERIC_JOB_LISTING_PAGE")
+
+    def test_live_transformation_consulting_titles_are_rejected(self):
+        titles = (
+            "Consultant(e) Débutant(e) en projets de transformation métier et IT, secteur Assurance (H/F) 1",
+            "Consultant.e Junior en Transformation Digitale -Boosting CTO - Audit IT",
+        )
+        for title in titles:
+            with self.subTest(title=title):
+                result = self.decision(title, description="Accompagner les transformations métier et IT.")
+                self.assertEqual(result.status, "REJECT")
+                self.assertEqual(result.primary_reason, "REJECT_ROLE_CONSULTING")
+
+        developer = self.decision(
+            "Backend Developer",
+            description="Collaborate with consulting teams on transformation projects.",
+        )
+        self.assertNotEqual(developer.status, "REJECT")
+        self.assertReason(developer, "PASS_RELEVANT_ROLE")
 
 
 class PersistenceTests(TestCase):

@@ -315,14 +315,84 @@ For normal discovery:
 ```
 
 `--limit` means maximum **new** jobs per query. Already-known jobs update
-`last_seen_at` and source evidence without consuming that limit. Pagination is
-bounded to prevent an endless scan. In windowed mode, a Google verification
+`last_seen_at` and normalized query provenance without consuming that limit;
+rejected/noise results do not consume it either. Search pages use `start=0`,
+`start=10`, `start=20`, and so on until the new-job target, exhaustion, a
+repeated result page, verification, or the deterministic per-query inspection
+cap `max(50, limit * 20)` is reached. In windowed mode, a Google verification
 page pauses for manual completion; headless mode checkpoints SQLite and stops.
+
+`google_queries.txt` is the authoritative job query file. Blank lines and lines
+whose first non-whitespace character is `#` are ignored. Whitespace-normalized,
+case-insensitive duplicates are executed once, while the first query's original
+text is retained for Google and provenance. Queries are never derived from a CV
+or rewritten. `queries.txt` remains the separate Maps/company input.
+
+An optional recency hint can be sent to Google without changing the query text:
+
+```bash
+.venv/bin/python -m job_search.discovery --limit 3 --recent-days 14 --verbose
+```
+
+This adds Google's best-effort `tbs=qdr:d14` request parameter. It is not an
+exact publication guarantee, and visible relative dates such as “2 days ago”
+are retained only as search-result evidence. Only a job page/provider can set
+`published_at`.
 
 The default database is `data/job_search.db`. Tables are created automatically,
 foreign keys are enabled on every connection, and `PRAGMA user_version` applies
 the lightweight schema version. SQLite is authoritative; no CSV is used for job
-state.
+state. `job_source_queries` preserves each query independently with first/last
+seen timestamps and optional snippet, displayed-domain, and Google relative-date
+evidence. Rediscovery through another query updates provenance without fetching
+or duplicating a known job page.
+
+## Daily Workflow v1
+
+The daily workflow is a deterministic orchestration layer over the existing
+Maps discovery, job discovery, completion, hard-filter, and review-priority
+functions. It contains no AI, contact, outreach, application, or qualification
+logic. The safe default does not run Google Maps: it discovers jobs, establishes
+their scoped v1.1 decisions, completes only new REVIEW jobs (bounded by
+`completion_limit`), re-filters only this run's new jobs, computes their review
+priorities, and writes a report.
+
+Settings live in `config/daily_workflow.json`; command-line options override
+them. Each operational run creates `workflow_runs` and attaches every observed
+job to `workflow_run_jobs` as `NEW`, `KNOWN`, or `UPDATED`. Reports therefore
+use run membership rather than a calendar date. JSON is atomically published to
+`data/reports/run_<run_id>.json` and, for SUCCESS or PARTIAL runs,
+`data/reports/latest.json`. The default shortlist contains new PASS jobs and new
+HIGH-priority REVIEW jobs; add `--include-medium` explicitly to include MEDIUM.
+
+Validate the daily setup without opening Chrome or changing SQLite:
+
+```bash
+.venv/bin/python -m job_search.daily_workflow --dry-run --jobs-only
+```
+
+Run a small jobs-only daily test:
+
+```bash
+.venv/bin/python -m job_search.daily_workflow --jobs-only --job-limit 1 --completion-limit 3 --recent-days 14 --delay 3 --timeout 15 --windowed
+```
+
+Run the normal daily workflow with incremental Maps discovery enabled:
+
+```bash
+.venv/bin/python -m job_search.daily_workflow --with-maps
+```
+
+Display the latest report without web requests, browser startup, or job writes:
+
+```bash
+.venv/bin/python -m job_search.daily_workflow --report-only
+```
+
+Use `--report-only --run-id <run_id>` for a specific run. A failed optional
+phase is recorded and the workflow continues safely as PARTIAL; individual
+completion failures are already isolated by the completion module. Ctrl+C marks
+the persistent run INTERRUPTED and does not replace the last good `latest.json`.
 
 Filter newly stored jobs with deterministic policy `v1.1` (no network or AI calls):
 
@@ -359,6 +429,17 @@ job URL, without crawling links:
 .venv/bin/python -m job_search.maintenance \
   --job-id 14 --timeout 60 --browser-fallback --windowed --verbose
 .venv/bin/python -m job_search.filtering --policy-version v1.1 --rebuild
+```
+
+For a deterministic repair of explicit `REVIEW` rows, use the review repair
+command. It fills only blank fields, re-filters each successfully repaired row,
+and records each attempt. `--final-pass` requires explicit job IDs and marks
+them ineligible for later automatic repair retries:
+
+```bash
+.venv/bin/python -m job_search.repair_reviews \
+  --job-id 1 --job-id 13 --job-id 20 \
+  --final-pass --verbose
 ```
 
 ### Docker

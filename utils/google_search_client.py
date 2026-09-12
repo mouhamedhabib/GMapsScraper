@@ -444,6 +444,15 @@ def _displayed_domain(displayed_url_text):
     return (parsed.hostname or "").casefold().rstrip(".")
 
 
+def _google_result_date_text(snippet):
+    """Keep Google's visible relative date as evidence, never as a job date."""
+    match = search(
+        r"\b(?:today|yesterday|\d+\s+(?:minutes?|hours?|days?|weeks?|months?|years?)\s+ago)\b",
+        snippet or "", IGNORECASE,
+    )
+    return match.group(0) if match else ""
+
+
 def _find_result_anchor(driver, result_index, expected_title, expected_raw_url):
     """Re-identify one result exactly after earlier click resolutions."""
     try:
@@ -547,6 +556,11 @@ def extract_organic_results(
                 displayed_domain = _displayed_domain(displayed_url_text)
                 if displayed_domain:
                     row["displayed_domain"] = displayed_domain
+            if snippet:
+                row["result_snippet"] = snippet
+                date_text = _google_result_date_text(snippet)
+                if date_text:
+                    row["google_result_date_text"] = date_text
             if resolution.http_resolution:
                 row["http_resolution"] = resolution.http_resolution
             if resolution.browser_resolution:

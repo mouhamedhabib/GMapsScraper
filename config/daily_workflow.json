@@ -1,0 +1,14 @@
+{
+  "job_query_file": "google_queries.txt",
+  "maps_query_file": "queries.txt",
+  "maps_output_folder": "CSV_FILES",
+  "job_limit": 3,
+  "recent_days": 14,
+  "delay": 3,
+  "timeout": 15,
+  "windowed": true,
+  "completion_limit": 20,
+  "maps_limit": 3,
+  "maps_threads": 1,
+  "run_maps": false
+}

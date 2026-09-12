@@ -6,6 +6,8 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+from requests import ConnectionError
+
 from job_search.discovery import discover_jobs
 from job_search.normalization import normalize_job_url
 from job_search.providers import (
@@ -15,6 +17,7 @@ from job_search.providers import (
     classify_job_result,
     detect_provider,
     extract_source_job_id,
+    fetch_job,
     is_job_result,
     parse_job_html,
 )
@@ -88,6 +91,14 @@ class JobUrlTests(TestCase):
             ("FastAPI jobs in Germany | 216 open jobs", "https://www.wearedevelopers.com/jobs/ls/germany/fastapi"),
             ("Missions freelance et emplois NestJS", "https://www.free-work.com/fr/tech-it/jobs/nestjs"),
             ("Missions freelance et emplois FastAPI", "https://www.free-work.com/fr/tech-it/jobs/fastapi"),
+            (
+                "Software Engineering Careers & Job Opportunities | Accenture",
+                "https://www.accenture.com/be-en/careers/explore-careers/area-of-interest/software-engineering-careers",
+            ),
+            (
+                "Junior developer jobs - 29 vacancies on JobScout24",
+                "https://www.jobscout24.ch/en/jobs/junior%20developer",
+            ),
         )
         for title, url in cases:
             with self.subTest(url=url):
@@ -101,6 +112,17 @@ class JobUrlTests(TestCase):
             "https://careers.cognizant.com/india-en/jobs/00069080335/java-backend-developer",
         )
         self.assertTrue(result.accepted)
+
+    def test_tanitjobs_and_bayt_individual_paths_remain_eligible(self):
+        cases = (
+            "https://www.tanitjobs.com/job/754705/software-engineer",
+            "https://www.bayt.com/en/tunisia/jobs/full-stack-ai-developer-talent-pool-75157668",
+        )
+        for url in cases:
+            with self.subTest(url=url):
+                result = classify_job_result("Software developer", url)
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.provider, "generic")
 
     def test_listing_title_does_not_break_supported_ats_identity(self):
         result = classify_job_result(
@@ -205,9 +227,61 @@ class JobUrlTests(TestCase):
             normalize_job_url("HTTPS://Jobs.Lever.co/acme/abc/?utm_source=x&team=eng#apply"),
             "https://jobs.lever.co/acme/abc?team=eng",
         )
+        self.assertEqual(
+            normalize_job_url(
+                "https://www.tanitjobs.com/job/754705/software-engineer?"
+                "__cf_chl_rt_tk=ephemeral&utm_source=search&job=754705#apply"
+            ),
+            "https://www.tanitjobs.com/job/754705/software-engineer?job=754705",
+        )
 
 
 class ParserTests(TestCase):
+    def test_job_board_title_evidence_beats_generic_site_title(self):
+        tanit_url = "https://www.tanitjobs.com/job/754705/software-engineer"
+        h1 = parse_job_html(
+            tanit_url,
+            """<title>Offres d'emploi et travail en Tunisie</title>
+            <meta property="og:title" content="Offres d'emploi et travail en Tunisie">
+            <main><h1>Software Engineer</h1></main>""",
+        )
+        self.assertEqual(h1.title, "Software Engineer")
+        self.assertEqual(h1.evidence_sources["title"], "html_job_heading")
+
+        slug = parse_job_html(
+            tanit_url, "<title>Offres d'emploi et travail en Tunisie</title>"
+        )
+        self.assertEqual(slug.title, "Software Engineer")
+        self.assertEqual(slug.evidence_sources["title"], "url_structured_title")
+
+        french_slug = parse_job_html(
+            "https://www.tanitjobs.com/job/458385/developpeur-full-stack",
+            "<title>Offres d'emploi et travail en Tunisie</title>",
+        )
+        self.assertEqual(french_slug.title, "Developpeur Full Stack")
+
+        bayt = parse_job_html(
+            "https://www.bayt.com/en/tunisia/jobs/full-stack-ai-developer-talent-pool-75157668",
+            '<meta property="og:title" content="Full Stack (AI) Developer (Talent Pool) at Viseven - Tunis">',
+        )
+        self.assertEqual(
+            bayt.title,
+            "Full Stack (AI) Developer (Talent Pool) at Viseven - Tunis",
+        )
+
+    def test_individual_url_title_survives_blocked_fetch(self):
+        session = Mock()
+        session.get.side_effect = ConnectionError("blocked")
+        result = fetch_job(
+            "https://www.tanitjobs.com/job/754705/software-engineer?"
+            "__cf_chl_rt_tk=ephemeral",
+            session=session,
+        )
+        self.assertEqual(result.fetch_status, "FAILED")
+        self.assertEqual(result.title, "Software Engineer")
+        self.assertEqual(result.canonical_url, "https://www.tanitjobs.com/job/754705/software-engineer")
+        self.assertEqual(result.evidence_sources["title"], "url_structured_title")
+
     def test_json_ld_job_fields(self):
         html = '''<script type="application/ld+json">{
           "@type":"JobPosting", "title":"Backend Engineer",
@@ -298,14 +372,35 @@ class ParserTests(TestCase):
             "https://jobs.lever.co/acme/abc": "ATS",
             "https://jobs.ashbyhq.com/acme/abc": "ATS",
             "https://careers.capgemini.com/job/123": "DIRECT_COMPANY",
+            "https://jobs.infineon.com/job/123": "DIRECT_COMPANY",
+            "https://bitwarden.com/careers/123": "DIRECT_COMPANY",
+            "https://craegroup.com/careers/123": "DIRECT_COMPANY",
+            "https://remotive.com/remote/jobs/software-development/example": "JOB_PLATFORM",
+            "https://www.simplyhired.co.uk/job/example": "JOB_PLATFORM",
+            "https://www.jobleads.com/us/job/example": "JOB_PLATFORM",
+            "https://bebee.com/us/jobs/example": "JOB_PLATFORM",
+            "https://internshala.com/job/detail/example": "JOB_PLATFORM",
             "https://www.wizbii.com/company/acme/job/backend": "JOB_PLATFORM",
             "https://waytolearnx.com/jobs/backend-developer": "JOB_PLATFORM",
             "https://jobs.welovedevs.com/company/backend": "JOB_PLATFORM",
             "https://example.test/opening/123": "UNKNOWN",
+            "https://example.test/careers/123": "UNKNOWN",
         }
         for url, expected in cases.items():
             with self.subTest(url=url):
                 self.assertEqual(classify_source_quality(url), expected)
+
+    def test_technology_tokens_cannot_be_derived_locations(self):
+        for token in ("AI", "ML", "backend", "frontend", "fullstack", "software",
+                      "developer", "engineer", "Java", "Python", "ReactJS",
+                      "NestJS", "FastAPI", "Laravel"):
+            with self.subTest(token=token):
+                parsed = parse_job_html(
+                    f"https://example.test/jobs/{token}-developer-123",
+                    f"<h1>{token} Developer</h1>",
+                )
+                self.assertEqual(parsed.city, "")
+                self.assertEqual(parsed.location_text, "")
 
 
 class StorageTests(TestCase):

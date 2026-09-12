@@ -130,6 +130,7 @@ class FastSearchAlgo:
             f"{self._resource_summary['temporary_tabs_opened']}/"
             f"{self._resource_summary['temporary_tabs_closed']}"
         )
+        return dict(self._summary)
 
     def _start_scrapper_threads(self, thread_id: int, query_list_range: int) -> None:
         maps_obj = GoogleMaps(unavailable_text=self._unavailable_text, headless=self._headless,

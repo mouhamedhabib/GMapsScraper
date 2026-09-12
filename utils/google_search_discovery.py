@@ -365,8 +365,25 @@ def atomic_write_discoveries(path, rows):
 
 
 def load_queries(path):
+    """Load user-authored queries, preserving the first spelling verbatim.
+
+    Surrounding whitespace is not part of a query. Internal whitespace and
+    case are preserved for execution/provenance, but collapsed case-insensitive
+    whitespace is used to identify duplicates.
+    """
+    queries = []
+    seen = set()
     with path.open("r", encoding="utf-8-sig") as file_handler:
-        return [line.strip() for line in file_handler if line.strip()]
+        for line in file_handler:
+            original = line.strip()
+            if not original or original.startswith("#"):
+                continue
+            normalized = " ".join(original.split()).casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            queries.append(original)
+    return queries
 
 
 def create_chrome_driver(windowed=False):

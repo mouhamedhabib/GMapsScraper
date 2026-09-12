@@ -9,6 +9,16 @@ TRACKING_KEYS = {
 }
 
 
+def _is_tracking_key(key):
+    folded = key.casefold()
+    return (
+        folded.startswith("utm_")
+        or folded.startswith("__cf_chl_")
+        or folded.startswith("cf_chl_")
+        or folded in TRACKING_KEYS
+    )
+
+
 def normalize_job_url(url):
     """Remove tracking noise while retaining unknown identity-bearing parameters."""
     value = (url or "").strip()
@@ -31,8 +41,7 @@ def normalize_job_url(url):
         path = path.rstrip("/")
     query = []
     for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        folded = key.casefold()
-        if folded.startswith("utm_") or folded in TRACKING_KEYS:
+        if _is_tracking_key(key):
             continue
         query.append((key, value))
     query.sort(key=lambda pair: (pair[0].casefold(), pair[1]))

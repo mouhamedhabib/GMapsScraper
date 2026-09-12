@@ -20,7 +20,9 @@ from job_search.providers import (
     GENERIC_LISTING_REASON,
     classify_source_quality,
     generic_listing_reason,
+    is_safe_location_value,
 )
+from job_search.geography import normalize_geography
 from job_search.storage import DEFAULT_DATABASE, connect_database, utc_now
 
 
@@ -40,6 +42,7 @@ class ExperienceRequirement:
     maximum: int | None
     preferred: bool
     text: str
+    approximate: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,11 +59,12 @@ class FilterDecision:
 RELEVANT_ROLE_PATTERNS = {
     "software developer": r"\bsoftware developer\b",
     "software engineer": r"\bsoftware engineer(?:\s+i)?\b",
-    "full stack developer": r"\bfull[ -]?stack\b(?:\s+[.&+#\w-]+){0,5}\s+(?:developers?|engineers?)\b",
-    "frontend developer": r"\bfront[ -]?end (?:developers?|engineers?)\b",
+    "full stack developer": r"\bfull[ -]?stack\b(?:\s+[().&+#\w-]+){0,5}\s+(?:developers?|engineers?)\b",
+    "frontend developer": r"\bfront[ -]?end(?:\s+[.&+#\w-]+){0,3}\s+(?:developers?|engineers?)\b",
     "backend developer": r"\bback[ -]?end (?:developers?|engineers?)\b",
     "web developer": r"\bweb developers?\b",
-    "technology developer": r"\b(?:java|python|php|laravel|javascript|typescript|react(?:\.js)?|next(?:\.js|js)|node(?:\.js|js)|nest(?:\.js|js)|fastapi|django|angular|\.net|dotnet) (?:developers?|engineers?)\b",
+    "technology developer": r"\b(?:ai|artificial intelligence|machine learning|ml|java|python|php|laravel|javascript|typescript|react(?:\.?js)?|next(?:\.js|js)|node(?:\.js|js)|nest(?:\.js|js)|fastapi|django|angular|\.net|dotnet) (?:developers?|engineers?)\b",
+    "programmer": r"\b(?:(?:software|java|python|php|javascript|typescript) )?programmers?\b",
     "cloud developer": r"\bcloud developers?\b",
     "developpeur": r"\bdeveloppeu(?:r|se)s?\b",
     "developpeur logiciel": r"\bdeveloppeu(?:r|se)s? logiciel(?:le)?s?\b",
@@ -72,7 +76,7 @@ RELEVANT_ROLE_PATTERNS = {
 
 REJECT_ROLE_PATTERNS = (
     ("REJECT_ROLE_PRODUCT", "product/project-management role", r"\b(?:product manager|product owner|project manager|scrum master)\b"),
-    ("REJECT_ROLE_CONSULTING", "consulting/value-engineering role", r"\b(?:value engineer|solutions? consultant|pre[ -]?sales engineer)\b"),
+    ("REJECT_ROLE_CONSULTING", "consulting/value-engineering role", r"\b(?:consultant(?:e|\.e)?s?|consultant\(e\)|value engineer|pre[ -]?sales engineer)(?!\w)"),
     ("REJECT_ROLE_SALES", "sales/business-development role", r"\b(?:sales|account executive|business development|customer success)\b"),
     ("REJECT_ROLE_DESIGN", "design role", r"\b(?:ux|ui|graphic) designer\b"),
     ("REJECT_ROLE_NON_SOFTWARE", "non-software research/security role", r"\b(?:(?:ai|ml|machine learning) researcher|security analyst|soc analyst)\b"),
@@ -123,8 +127,13 @@ STACK_MISMATCH_PATTERNS = (
 NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "un": 1, "une": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5,
+    "sept": 7, "huit": 8, "neuf": 9, "dix": 10,
 }
-NUMBER_TOKEN = r"(?:\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+NUMBER_TOKEN = (
+    r"(?:\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"un|une|deux|trois|quatre|cinq|sept|huit|neuf|dix)"
+)
 EXPERIENCE_RE = re.compile(
     rf"(?P<prefix>minimum(?: of)?|at least)?\s*(?P<min>{NUMBER_TOKEN})\s*"
     rf"(?:(?:-|–|—|to)\s*(?P<max>{NUMBER_TOKEN})\s*)?(?P<plus>\+)?\s*"
@@ -141,7 +150,70 @@ RANGE_OR_PLUS_EXPERIENCE_RE = re.compile(
     rf"(?P<min>{NUMBER_TOKEN})\s*(?:(?:-|–|—|to)\s*(?P<max>{NUMBER_TOKEN})|(?P<plus>\+))\s*years?",
     re.I,
 )
-OPTIONAL_RE = re.compile(r"\b(?:preferred|nice to have|nice-to-have|bonus|desirable|a plus)\b", re.I)
+FRENCH_EXPERIENCE_SUFFIX = r"d[\'\u2019\u02bc]exp[ée]rience(?:\s+professionnelle)?"
+FRENCH_YEAR_TOKEN = r"(?:ann(?:[ée]e|ee)s?|ans?)\b"
+FRENCH_RANGE_SEPARATOR = r"(?:-|–|—|à|a)"
+FRENCH_LEADING_EXPERIENCE_RE = re.compile(
+    rf"\bexp[ée]rience(?:\s+professionnelle)?\s+de\s+"
+    rf"(?P<approx>environ\s+)?(?P<min>{NUMBER_TOKEN})\s*"
+    rf"(?:{FRENCH_RANGE_SEPARATOR}\s*(?P<max>{NUMBER_TOKEN})\s*)?"
+    rf"{FRENCH_YEAR_TOKEN}(?:\s+minimum)?",
+    re.I,
+)
+FRENCH_POSSESSION_EXPERIENCE_RE = re.compile(
+    rf"\bvous\s+(?:(?:justifiez|disposez)\s+(?:de\s+|d[\'\u2019\u02bc])|avez\s+)"
+    rf"(?P<approx>environ\s+)?(?P<prefix>au\s+moins\s+)?(?P<min>{NUMBER_TOKEN})\s*"
+    rf"(?:{FRENCH_RANGE_SEPARATOR}\s*(?P<max>{NUMBER_TOKEN})\s*)?"
+    rf"{FRENCH_YEAR_TOKEN}(?:\s+{FRENCH_EXPERIENCE_SUFFIX})?(?:\s+minimum)?",
+    re.I,
+)
+FRENCH_BETWEEN_EXPERIENCE_RE = re.compile(
+    rf"\bentre\s+(?P<min>{NUMBER_TOKEN})\s+et\s+(?P<max>{NUMBER_TOKEN})\s+"
+    rf"{FRENCH_YEAR_TOKEN}(?:\s+{FRENCH_EXPERIENCE_SUFFIX})?",
+    re.I,
+)
+FRENCH_EXPERIENCE_RE = re.compile(
+    rf"\b(?P<approx>environ\s+)?"
+    rf"(?P<prefix>au\s+moins|un\s+minimum\s+de|minimum(?:\s+de)?)?\s*"
+    rf"(?P<min>{NUMBER_TOKEN})\s*"
+    rf"(?:{FRENCH_RANGE_SEPARATOR}\s*(?P<max>{NUMBER_TOKEN})\s*)?"
+    rf"{FRENCH_YEAR_TOKEN}"
+    rf"(?P<experience>\s+{FRENCH_EXPERIENCE_SUFFIX})?"
+    rf"(?P<minimum_after>\s+minimum)?",
+    re.I,
+)
+OPTIONAL_RE = re.compile(
+    r"\b(?:preferred|nice to have|nice-to-have|bonus|desirable|a plus|"
+    r"id[ée]alement|de pr[ée]f[ée]rence|souhait[ée]e?|serait un plus|un plus|"
+    r"appr[ée]ci[ée]e?)\b",
+    re.I,
+)
+
+WORLDWIDE_REMOTE_RE = re.compile(
+    r"\bremote(?:ly)?\s*(?:[-,:/]\s*)?(?:worldwide|globally|"
+    r"anywhere(?:\s+in the world|(?!\s+(?:in|within|across|throughout)\b))|"
+    r"from anywhere(?:\s+in the world|(?!\s+(?:in|within|across|throughout)\b)))\b|"
+    r"\b(?:worldwide|globally)\s*(?:[-,:/]\s*)?remote\b|"
+    r"\bwork(?:ing)?\s+(?:remotely\s+)?from anywhere"
+    r"(?:\s+in the world|(?!\s+(?:in|within|across|throughout)\b))\b|"
+    r"\bhiring\s+worldwide\s+for\s+(?:a\s+)?remote\b|"
+    r"\blocation\s*:\s*(?:remote\s*[-,/]\s*worldwide|worldwide\s*[-,/]\s*remote)\b",
+    re.I,
+)
+CANDIDATES_WORLDWIDE_RE = re.compile(
+    r"\b(?:open to|hiring)\s+(?:remote\s+)?candidates?\s+worldwide\b",
+    re.I,
+)
+REMOTE_JOB_CONTEXT_RE = re.compile(
+    r"\bremote\s+(?:role|position|job|work(?:ing)?|candidates?)\b|"
+    r"\b(?:role|position|job|work)\s+(?:is\s+)?remote\b|"
+    r"\bwork(?:ing)?\s+remotely\b|\bwork from home\b|\btelecommut",
+    re.I,
+)
+STRUCTURED_WORLDWIDE_LOCATION_RE = re.compile(
+    r"^(?:remote\s*[-,/]\s*)?(?:worldwide|anywhere(?:\s+in the world)?)(?:\s*[-,/]\s*remote)?$",
+    re.I,
+)
 
 
 def _value(row: Mapping, name: str) -> str:
@@ -164,33 +236,67 @@ def _number(value: str | None) -> int | None:
     return int(value) if value.isdigit() else NUMBER_WORDS.get(value.casefold())
 
 
+def _match_group(match: re.Match, name: str) -> str | None:
+    """Return an optional named group shared by only some parser patterns."""
+    try:
+        return match.group(name)
+    except IndexError:
+        return None
+
+
+def _sentence_context(text: str, start: int, end: int) -> str:
+    sentence_start = max((text.rfind(mark, 0, start) for mark in ".;\n"), default=-1) + 1
+    candidates = [text.find(mark, end) for mark in ".;\n"]
+    candidates = [position for position in candidates if position >= 0]
+    sentence_end = min(candidates) if candidates else min(len(text), end + 80)
+    return text[sentence_start:sentence_end]
+
+
 def extract_experience(text: str) -> tuple[ExperienceRequirement, ...]:
     """Extract explicit experience requirements, retaining optional context."""
     requirements = []
-    matches = list(EXPERIENCE_RE.finditer(text or ""))
-    for pattern in (OPTIONAL_EXPERIENCE_RE, RANGE_OR_PLUS_EXPERIENCE_RE):
-        matches.extend(
-            match for match in pattern.finditer(text or "")
-            if not any(match.start() < existing.end() and existing.start() < match.end() for existing in matches)
-        )
+    text = text or ""
+    matches: list[re.Match] = []
+    patterns = (
+        EXPERIENCE_RE,
+        FRENCH_LEADING_EXPERIENCE_RE,
+        FRENCH_POSSESSION_EXPERIENCE_RE,
+        FRENCH_BETWEEN_EXPERIENCE_RE,
+        FRENCH_EXPERIENCE_RE,
+        OPTIONAL_EXPERIENCE_RE,
+        RANGE_OR_PLUS_EXPERIENCE_RE,
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            if any(match.start() < existing.end() and existing.start() < match.end() for existing in matches):
+                continue
+            if pattern is FRENCH_EXPERIENCE_RE:
+                context = _sentence_context(text, *match.span())
+                has_clear_context = bool(
+                    _match_group(match, "prefix")
+                    or _match_group(match, "max")
+                    or _match_group(match, "experience")
+                    or _match_group(match, "minimum_after")
+                    or OPTIONAL_RE.search(context)
+                )
+                if not has_clear_context:
+                    continue
+            matches.append(match)
     for match in sorted(matches, key=lambda item: item.start()):
-        minimum = _number(match.group("min") or match.group("min2"))
+        minimum = _number(_match_group(match, "min") or _match_group(match, "min2"))
         if minimum is None:
             continue
-        maximum = _number(match.group("max"))
+        maximum = _number(_match_group(match, "max"))
         start, end = match.span()
         # Optional qualifiers usually occur in the same sentence, commonly just
         # before or after the numeric requirement.
-        sentence_start = max((text.rfind(mark, 0, start) for mark in ".;\n"), default=-1) + 1
-        candidates = [text.find(mark, end) for mark in ".;\n"]
-        candidates = [position for position in candidates if position >= 0]
-        sentence_end = min(candidates) if candidates else min(len(text), end + 80)
-        context = text[sentence_start:sentence_end]
+        context = _sentence_context(text, start, end)
         requirements.append(ExperienceRequirement(
             minimum=minimum,
             maximum=maximum,
             preferred=bool(OPTIONAL_RE.search(context)),
             text=" ".join(match.group(0).split()),
+            approximate=bool(_match_group(match, "approx")),
         ))
     return tuple(requirements)
 
@@ -213,6 +319,32 @@ def detect_remote_policy(row: Mapping) -> str:
     return "UNKNOWN"
 
 
+def has_worldwide_remote_eligibility(
+    row: Mapping, *, title: str, description: str, location_text: str, location: str
+) -> bool:
+    """Return whether stored evidence explicitly permits worldwide remote work.
+
+    Bare marketing or company-scope words such as ``worldwide`` and ``globally``
+    are intentionally insufficient. Structured REMOTE data can establish the
+    remote half of the claim when the structured location supplies its scope.
+    """
+    structured_remote = _value(row, "remote_policy").upper() == "REMOTE"
+    if structured_remote and STRUCTURED_WORLDWIDE_LOCATION_RE.fullmatch(location_text):
+        return True
+
+    text = " ".join((title, location, description))
+    return bool(
+        WORLDWIDE_REMOTE_RE.search(text)
+        or (
+            CANDIDATES_WORLDWIDE_RE.search(text)
+            and (
+                structured_remote
+                or REMOTE_JOB_CONTEXT_RE.search(text)
+            )
+        )
+    )
+
+
 def _date(value: str) -> datetime | None:
     if not value:
         return None
@@ -231,8 +363,14 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
     title = _value(row, "title")
     folded_title = _fold(title)
     description = _value(row, "description")
-    country = _value(row, "country")
-    location = " ".join((_value(row, "location_text"), _value(row, "city"), country)).strip()
+    raw_location = _value(row, "location_text")
+    raw_city = _value(row, "city")
+    raw_country = _value(row, "country")
+    location_text = raw_location if is_safe_location_value(raw_location) else ""
+    city = raw_city if is_safe_location_value(raw_city, city=True) else ""
+    country = raw_country if is_safe_location_value(raw_country) else ""
+    location = " ".join(filter(None, (location_text, city, country))).strip()
+    geography = normalize_geography(location_text, city, country, title)
     all_text = " ".join((title, description, location))
     relevant_roles = [name for name, pattern in RELEVANT_ROLE_PATTERNS.items() if re.search(pattern, folded_title, re.I)]
     technologies = extract_technologies(" ".join((title, description)))
@@ -252,14 +390,19 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
         all_text, re.I,
     )
     no_sponsorship = re.search(r"\b(?:no (?:visa )?sponsorship|we do not sponsor)\b", all_text, re.I)
-    tunisian_location = bool(re.search(r"\b(?:tunisia|tunisian|tunis)\b", location, re.I) or country.casefold() in {"tn", "tun"})
+    worldwide = has_worldwide_remote_eligibility(
+        row, title=title, description=description,
+        location_text=location_text, location=location,
+    )
+    tunisian_location = geography.region == "TUNISIA"
     if (explicitly_foreign_auth or (no_sponsorship and not tunisian_location)) and not sponsorship_available:
         hard.append(Reason("REJECT_WORK_AUTHORIZATION", "The posting explicitly requires existing work authorization or offers no sponsorship."))
 
     us_only = re.search(r"\b(?:us|u\.s\.|united states)[ -]only\b|\bmust reside in (?:the )?(?:us|u\.s\.|united states)\b", all_text, re.I)
+    us_location = geography.region == "UNITED_STATES"
     restricted_resident = re.search(r"\bcanada residents? only\b", all_text, re.I)
-    if (us_only or restricted_resident) and not sponsorship_available:
-        code = "REJECT_LOCATION_US_ONLY" if us_only else "REJECT_LOCATION_CANADA_ONLY"
+    if (us_only or us_location or restricted_resident) and not sponsorship_available and not worldwide:
+        code = "REJECT_LOCATION_US_ONLY" if us_only or us_location else "REJECT_LOCATION_CANADA_ONLY"
         hard.append(Reason(code, "The posting explicitly restricts applicants to an incompatible location."))
 
     if SENIORITY_PATTERN.search(title):
@@ -294,19 +437,23 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
     if optional and any(item.minimum >= 4 for item in optional):
         review.append(Reason("REVIEW_EXPERIENCE_PREFERRED", "Higher experience is stated only as preferred, not mandatory."))
 
-    worldwide = re.search(r"\b(?:worldwide|work from anywhere|anywhere in the world|global(?:ly)? remote)\b", all_text, re.I)
     tunisia = tunisian_location or re.search(r"remote (?:from|in) tunisia", all_text, re.I)
-    europe = re.search(r"\b(?:europe|eu remote|remote (?:in|within|across) (?:the )?eu)\b", all_text, re.I)
-    preferred_country = re.search(r"\b(?:france|belgium|switzerland|ireland|united kingdom|uk|canada)\b", location, re.I) or country.casefold() in {"fr", "fra", "be", "bel", "ch", "che", "ie", "irl", "gb", "gbr", "ca", "can"}
+    europe = geography.region == "EUROPE" or bool(re.search(
+        r"\b(?:europe|eu remote|remote (?:in|within|across) (?:the )?eu)\b",
+        " ".join((title, location)), re.I,
+    )) or bool(re.search(r"\bremote (?:in|within|across) (?:the )?(?:eu|europe)\b|\b(?:eu|europe)[ -]remote\b", description, re.I))
+    preferred_country = geography.country in {
+        "France", "Belgium", "Switzerland", "Ireland", "United Kingdom", "Canada",
+    }
     relocation = re.search(r"\brelocation (?:is )?(?:available|provided|possible|offered)\b", all_text, re.I)
     if worldwide:
         passed.append(Reason("PASS_REMOTE_WORLDWIDE", "The posting explicitly allows worldwide remote work."))
     elif tunisia:
         passed.append(Reason("PASS_LOCATION_TUNISIA", "The posting is located in Tunisia or explicitly permits remote work from Tunisia."))
-    elif europe:
-        review.append(Reason("REVIEW_LOCATION_EUROPE", "The posting is Europe/EU remote and work authorization needs review."))
     elif preferred_country:
         review.append(Reason("REVIEW_LOCATION_PREFERRED_MARKET", "The posting is in a preferred market but eligibility is not established."))
+    elif europe:
+        review.append(Reason("REVIEW_LOCATION_EUROPE", "The posting is in Europe or explicitly targets Europe/EU remote work, so authorization needs review."))
     elif relocation:
         review.append(Reason("REVIEW_RELOCATION_POSSIBLE", "The posting indicates that relocation may be possible."))
     elif not location:
@@ -383,9 +530,22 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
         "technologies": technologies,
         "experience": [item.text for item in experience],
         "optional_experience": [item.text for item in optional],
+        "experience_evidence": [
+            {
+                "experience_min_years": item.minimum,
+                "experience_max_years": item.maximum,
+                "experience_text": item.text,
+                "preferred": item.preferred,
+                "approximate": item.approximate,
+                "source": "description",
+            }
+            for item in experience
+        ],
         "source_quality": [classify_source_quality(
             _value(row, "canonical_url"), _value(row, "source_provider") or _value(row, "provider")
         )],
+        "normalized_country": [geography.country] if geography.country else [],
+        "location_region": [geography.region],
     }
     return FilterDecision(
         status=status,
@@ -422,10 +582,20 @@ def persist_result(connection: sqlite3.Connection, job_id: int, policy_version: 
     )
 
 
-def filter_stored_jobs(connection: sqlite3.Connection, policy_version: str = DEFAULT_POLICY_VERSION, rebuild: bool = False, limit: int | None = None, verbose: bool = False) -> dict:
+def filter_stored_jobs(connection: sqlite3.Connection, policy_version: str = DEFAULT_POLICY_VERSION, rebuild: bool = False, limit: int | None = None, verbose: bool = False, job_ids: list[int] | tuple[int, ...] | None = None) -> dict:
     """Evaluate pending jobs (or all jobs on rebuild) and persist results."""
-    where = "" if rebuild else "WHERE NOT EXISTS (SELECT 1 FROM job_filter_results f WHERE f.job_id=j.job_id AND f.policy_version=?)"
-    parameters: list[object] = [] if rebuild else [policy_version]
+    clauses = []
+    parameters: list[object] = []
+    if not rebuild:
+        clauses.append("NOT EXISTS (SELECT 1 FROM job_filter_results f WHERE f.job_id=j.job_id AND f.policy_version=?)")
+        parameters.append(policy_version)
+    if job_ids is not None:
+        if not job_ids:
+            return {"evaluated": 0, "counts": Counter(), "reasons": {"REJECT": Counter(), "REVIEW": Counter()}}
+        placeholders = ",".join("?" for _ in job_ids)
+        clauses.append(f"j.job_id IN ({placeholders})")
+        parameters.extend(job_ids)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     query = f"""SELECT j.*, c.canonical_name AS company_name,
                        (SELECT s.provider FROM job_sources s WHERE s.job_id=j.job_id ORDER BY s.job_source_id LIMIT 1) AS source_provider
                 FROM jobs j LEFT JOIN companies c ON c.company_id=j.company_id
@@ -468,6 +638,8 @@ def show_results(connection: sqlite3.Connection, statuses: tuple[str, ...], poli
         f"""SELECT j.job_id, j.title, c.canonical_name AS company, j.location_text,
                    j.published_at, j.canonical_url,
                    (SELECT s.provider FROM job_sources s WHERE s.job_id=j.job_id ORDER BY s.job_source_id LIMIT 1) provider,
+                   (SELECT s.source_type FROM job_sources s WHERE s.job_id=j.job_id ORDER BY s.job_source_id LIMIT 1) source_type,
+                   (SELECT s.employer_relationship FROM job_sources s WHERE s.job_id=j.job_id ORDER BY s.job_source_id LIMIT 1) employer_relationship,
                    f.status, f.reasons_json, f.matched_terms_json
             FROM job_filter_results f JOIN jobs j ON j.job_id=f.job_id
             LEFT JOIN companies c ON c.company_id=j.company_id
@@ -481,11 +653,15 @@ def show_results(connection: sqlite3.Connection, statuses: tuple[str, ...], poli
     for row in rows:
         terms = json.loads(row["matched_terms_json"])
         reasons = json.loads(row["reasons_json"])
+        stored_location = row["location_text"] or ""
+        display_location = stored_location if is_safe_location_value(stored_location) else ""
         print(f"job_id: {row['job_id']}")
         print(f"title: {row['title'] or ''}")
         print(f"company: {row['company'] or ''}")
-        print(f"location: {row['location_text'] or ''}")
+        print(f"location: {display_location}")
         print(f"provider: {row['provider'] or ''}")
+        print(f"source type: {row['source_type'] or 'UNKNOWN'}")
+        print(f"employer relationship: {row['employer_relationship'] or 'UNKNOWN'}")
         print(f"source quality: {', '.join(terms.get('source_quality', ['UNKNOWN']))}")
         print(f"published_at: {row['published_at'] or ''}")
         print(f"matched technologies: {', '.join(terms.get('technologies', []))}")

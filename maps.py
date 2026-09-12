@@ -26,6 +26,24 @@ from os.path import isfile
 import sys
 
 
+def run_maps_discovery(
+    query_file="./queries.txt", limit=1, threads=1, output_folder="./CSV_FILES",
+    browser_wait=15, scroll_minutes=1, windowed=False, low_resource=False,
+    verbose=True,
+):
+    """Run the existing Maps pipeline incrementally and return its counters."""
+    queries = FastSearchAlgo.load_query_file(file_name=str(query_file))
+    if not queries:
+        raise ValueError(f"No usable search queries found in {query_file}")
+    algo = FastSearchAlgo(
+        headless=not windowed, wait_time=browser_wait, output_path=str(output_folder),
+        workers=min(threads, len(queries)), result_range=limit, scroll_minutes=scroll_minutes,
+        verbose=verbose, output_format="CSV", incremental=True,
+        low_resource=low_resource,
+    )
+    return algo.fast_search_algorithm(queries)
+
+
 class GMapsScraper:
     """Translate CLI settings into one configured, concurrent Maps scrape."""
 
@@ -163,7 +181,7 @@ class GMapsScraper:
             low_resource=self._args.low_resource,
         )
 
-        algo_obj.fast_search_algorithm(queries_list)
+        return algo_obj.fast_search_algorithm(queries_list)
 
 
 if __name__ == '__main__':
