@@ -19,6 +19,7 @@ from job_search.filtering import (
     extract_experience,
     persist_result,
 )
+from job_search.network import NetworkPauseExceeded, NetworkProtectionRelay
 from job_search.providers import (
     ParsedJob, classify_source_context, fetch_job, is_safe_company_name,
     infer_trusted_company, is_safe_location_value, is_valid_job_title,
@@ -462,7 +463,7 @@ def repair_review_jobs(
     limit=None, job_ids=None, timeout=15, browser_fallback=False,
     windowed=False, verbose=False, refilter=False, fetcher=fetch_job,
     driver_factory=None, browser_fetcher=_browser_fetch, final_pass=False,
-    include_finalized=False,
+    include_finalized=False, network_relay=None,
 ):
     """Repair selected REVIEW jobs and return counters for the CLI/tests."""
     rows = _selected_reviews(
@@ -472,14 +473,26 @@ def repair_review_jobs(
         "selected": len(rows), "attempted": 0, "repaired": 0,
         "no_change": 0, "failed": 0, "blocked": 0,
         "fields": Counter(), "refilter": Counter(), "experience_evidence": 0,
+        "network_failed": 0,
     }
+    relay = network_relay or NetworkProtectionRelay(enabled=False)
     driver = None
     try:
         for row in rows:
             summary["attempted"] += 1
             attempted_at = _now()
+            network_interrupted = False
             try:
-                parsed = fetcher(row["canonical_url"], timeout=timeout)
+                parsed = relay.protect(
+                    lambda: fetcher(row["canonical_url"], timeout=timeout),
+                    context=f"completion job {row['job_id']}",
+                )
+            except NetworkPauseExceeded as error:
+                parsed = ParsedJob(row["canonical_url"], row["source_provider"] or "generic")
+                parsed.fetch_status = "FAILED"
+                parsed.fetch_error = f"NETWORK/{error.error_type}: {error}"
+                summary["network_failed"] += 1
+                network_interrupted = True
             except Exception as error:
                 parsed = ParsedJob(row["canonical_url"], row["source_provider"] or "generic")
                 parsed.fetch_status = "FAILED"
@@ -495,14 +508,28 @@ def repair_review_jobs(
 
             fields = _candidate_fields(row, parsed)
             needs_browser = parsed.fetch_status == "FAILED" or not fields
-            if needs_browser and browser_fallback:
+            if needs_browser and browser_fallback and not network_interrupted:
                 try:
                     if driver is None:
                         if driver_factory is None:
                             from utils.google_search_discovery import create_chrome_driver
                             driver_factory = create_chrome_driver
-                        driver = driver_factory(windowed=windowed)
-                    browser_result = browser_fetcher(row["canonical_url"], timeout, driver)
+                        driver = relay.protect(
+                            lambda: driver_factory(windowed=windowed),
+                            context="completion browser startup",
+                        )
+                    browser_result = relay.protect(
+                        lambda: browser_fetcher(
+                            row["canonical_url"], timeout, driver
+                        ),
+                        context=f"completion browser job {row['job_id']}",
+                    )
+                except NetworkPauseExceeded as error:
+                    parsed.fetch_status = "FAILED"
+                    parsed.fetch_error = f"NETWORK/{error.error_type}: {error}"
+                    summary["network_failed"] += 1
+                    network_interrupted = True
+                    browser_result = None
                 except Exception:
                     browser_result = None
                 if browser_result is not None:
@@ -663,6 +690,9 @@ def build_parser():
     parser.add_argument("--limit", type=int)
     parser.add_argument("--job-id", type=int, action="append", dest="job_ids")
     parser.add_argument("--timeout", type=float, default=15)
+    parser.add_argument("--network-max-pause", type=float, default=600)
+    parser.add_argument("--network-probe-interval", type=float, default=10)
+    parser.add_argument("--disable-network-protection", action="store_true")
     parser.add_argument("--browser-fallback", action="store_true")
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -688,6 +718,10 @@ def main(argv=None):
         raise SystemExit("--limit must be at least 1")
     if args.timeout <= 0:
         raise SystemExit("--timeout must be greater than zero")
+    if args.network_max_pause < 0:
+        raise SystemExit("--network-max-pause must be zero or greater")
+    if args.network_probe_interval <= 0:
+        raise SystemExit("--network-probe-interval must be greater than zero")
     if args.windowed and not args.browser_fallback:
         raise SystemExit("--windowed requires --browser-fallback")
     if args.cleanup_invalid and not args.job_ids:
@@ -709,6 +743,11 @@ def main(argv=None):
                 args.timeout, args.browser_fallback, args.windowed, args.verbose,
                 args.refilter or args.final_pass, final_pass=args.final_pass,
                 include_finalized=args.include_finalized,
+                network_relay=NetworkProtectionRelay(
+                    enabled=not args.disable_network_protection,
+                    probe_interval=args.network_probe_interval,
+                    max_pause_seconds=args.network_max_pause,
+                ),
             )
         decisions = []
         if args.final_pass:

@@ -13,6 +13,8 @@ from urllib.request import (
     build_opener,
 )
 
+from job_search.network import NetworkPauseExceeded, classify_network_error
+
 
 GOOGLE_REDIRECT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -144,7 +146,7 @@ def _request_without_redirects(url, method, timeout, open_request):
 
 
 def resolve_google_result_url(
-    url, timeout=3.0, cache=None, open_request=None,
+    url, timeout=3.0, cache=None, open_request=None, raise_network_errors=False,
 ):
     """Resolve one Google result URL without following redirect chains.
 
@@ -221,6 +223,8 @@ def resolve_google_result_url(
                     target, resolution_method="http", http_resolution=target,
                 )
     except (OSError, URLError) as error:
+        if raise_network_errors and classify_network_error(error):
+            raise
         reason = (
             "GOOGLE_GOTO_TIMEOUT"
             if _is_timeout_error(error)
@@ -298,7 +302,7 @@ def _browser_verification_required(driver):
 
 def resolve_google_goto_in_browser(
     driver, goto_url, anchor=None, timeout=4.0, cache=None,
-    http_resolution="", click_action=None,
+    http_resolution="", click_action=None, raise_network_errors=False,
 ):
     """Resolve one opaque ``/goto`` by modifier-clicking its result anchor."""
     raw_url = (goto_url or "").strip()
@@ -391,12 +395,16 @@ def resolve_google_goto_in_browser(
             raw_url, "GOOGLE_GOTO_STALE_RESULT", "click",
             http_resolution, "GOOGLE_GOTO_STALE_RESULT",
         )
-    except TimeoutException:
+    except TimeoutException as error:
+        if raise_network_errors and classify_network_error(error):
+            raise
         result = GoogleUrlResolution(
             raw_url, "GOOGLE_GOTO_CLICK_TIMEOUT", "click",
             http_resolution, "GOOGLE_GOTO_CLICK_TIMEOUT",
         )
-    except Exception:
+    except Exception as error:
+        if raise_network_errors and classify_network_error(error):
+            raise
         result = GoogleUrlResolution(
             raw_url, "GOOGLE_GOTO_CLICK_FAILED", "click",
             http_resolution, "GOOGLE_GOTO_CLICK_FAILED",
@@ -473,7 +481,7 @@ def extract_organic_results(
     driver, limit, verbose=False, accept_result: Optional[Callable] = None,
     include_incomplete=False, include_diagnostics=False,
     resolution_timeout=3.0, resolution_cache=None, open_request=None,
-    source_query="", browser_resolve_goto=False,
+    source_query="", browser_resolve_goto=False, network_relay=None,
 ):
     """Return visible ``title``/``url`` pairs, optionally filtered by a callback."""
     results = []
@@ -502,11 +510,14 @@ def extract_organic_results(
             snippet = _visible_result_text(
                 container, ("div.VwiC3b", "div.IsZvec")
             )
-            resolution = resolve_google_result_url(
-                raw_url,
-                timeout=resolution_timeout,
-                cache=resolution_cache,
+            resolve_http = lambda: resolve_google_result_url(
+                raw_url, timeout=resolution_timeout, cache=resolution_cache,
                 open_request=open_request,
+                raise_network_errors=network_relay is not None,
+            )
+            resolution = (
+                network_relay.protect(resolve_http, context="Google /goto HTTP resolution")
+                if network_relay is not None else resolve_http()
             )
             if (
                 browser_resolve_goto
@@ -529,11 +540,16 @@ def extract_organic_results(
                     )
                     resolution_cache[raw_url] = resolution
                 else:
-                    resolution = resolve_google_goto_in_browser(
+                    resolve_browser = lambda: resolve_google_goto_in_browser(
                         driver, raw_url, anchor=click_anchor,
                         timeout=min(5.0, max(3.0, resolution_timeout)),
-                        cache=resolution_cache,
-                        http_resolution=http_outcome,
+                        cache=resolution_cache, http_resolution=http_outcome,
+                        raise_network_errors=network_relay is not None,
+                    )
+                    resolution = (
+                        network_relay.protect(
+                            resolve_browser, context="Google /goto browser resolution"
+                        ) if network_relay is not None else resolve_browser()
                     )
             url = resolution.url
             if (not title or not url) and not include_incomplete:
@@ -584,6 +600,8 @@ def extract_organic_results(
             if resolution.failure_reason == "GOOGLE_GOTO_VERIFICATION_REQUIRED":
                 break
         except Exception as error:
+            if isinstance(error, NetworkPauseExceeded):
+                raise
             if verbose:
                 print(f"[-] Skipping unreadable result: {type(error).__name__}: {error}")
     return results

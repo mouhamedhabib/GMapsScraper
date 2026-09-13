@@ -82,6 +82,7 @@ class ParsedJob:
     fetch_status: str = "NOT_FETCHED"
     fetch_error: str = ""
     evidence_sources: dict[str, str] = field(default_factory=dict)
+    has_structured_job_posting: bool = False
 
 
 @dataclass(frozen=True)
@@ -183,7 +184,10 @@ def _looks_like_unknown_job_host(domain):
     return first_label in {"apply", "career", "careers", "job", "jobs"}
 
 
-def generic_listing_reason(title, url, description=""):
+def generic_listing_reason(
+    title, url, description="", *, page_fetched=False,
+    has_structured_job_posting=False,
+):
     """Return a stable reason for strong generic collection-page signals.
 
     Provider-specific posting URLs are deliberately exempt: this classifier is
@@ -191,11 +195,25 @@ def generic_listing_reason(title, url, description=""):
     """
     if detect_provider(url) != "generic":
         return ""
+    # A fetched individual JobPosting is stronger than collection wording in a
+    # title or a shallow /jobs/<slug> URL. Supported ATS posting identity is
+    # handled by the provider exemption above.
+    if has_structured_job_posting:
+        return ""
     parsed = urlsplit(url)
     domain = (parsed.hostname or "").casefold().removeprefix("www.")
     path = unquote(parsed.path).casefold().rstrip("/")
     cleaned_title = " ".join((title or "").split())
     cleaned_description = " ".join((description or "").split())
+
+    path_parts = [part for part in path.split("/") if part]
+    shallow_jobs_path = len(path_parts) == 2 and path_parts[0] == "jobs"
+    remoterocketship_role_collection = (
+        domain == "remoterocketship.com" and shallow_jobs_path
+    )
+    job_category_path = bool(re.search(
+        r"/(?:jobs?|careers?)/(?:category|categories)(?:/|$)", path,
+    ))
 
     known_listing_path = (
         (domain == "wearedevelopers.com" and re.search(r"/jobs/ls(?:/|$)", path))
@@ -221,13 +239,27 @@ def generic_listing_reason(title, url, description=""):
             re.I,
         ),
     ))
+    role_collection_title = bool(re.fullmatch(
+        r".+\bjobs(?:\s+(?:in|near)\s+[^|]+)?(?:\s*[|–—-]\s*[^|]+)?",
+        cleaned_title,
+        re.I,
+    ))
     multiple_jobs = bool(re.search(
         r"\b(?:browse|explore)\s+\d+\s+(?:fresh\s+)?jobs\b|"
         r"\b\d+\s+missions? et offres? d['’]emploi\b|"
         r"\b(?:browse|explore|search)\s+(?:our\s+)?(?:open\s+)?(?:jobs|roles|vacancies)\b",
         cleaned_description, re.I,
     ))
-    return GENERIC_LISTING_REASON if known_listing_path or title_signal or multiple_jobs else ""
+    fetched_role_collection = (
+        page_fetched and role_collection_title and shallow_jobs_path
+    )
+    stable_platform_collection = (
+        remoterocketship_role_collection and role_collection_title
+    )
+    return GENERIC_LISTING_REASON if any((
+        known_listing_path, job_category_path, title_signal, multiple_jobs,
+        fetched_role_collection, stable_platform_collection,
+    )) else ""
 
 
 def classify_job_result(title, url):
@@ -838,6 +870,7 @@ def parse_job_html(url, html, provider=None):
 
     job = next(_iter_json_ld(soup), {})
     if job:
+        result.has_structured_job_posting = True
         organization = job.get("hiringOrganization") or {}
         json_title = _plain_text(job.get("title"))
         if not result.title and is_valid_job_title(json_title, canonical):
@@ -874,6 +907,8 @@ def parse_job_html(url, html, provider=None):
             result.remote_policy = "REMOTE"
         result.status = "OPEN"
     microdata = _microdata_job(soup)
+    if microdata:
+        result.has_structured_job_posting = True
     for field in ("title", "description", "company_name", "location_text", "country", "city", "region", "published_at", "employment_type"):
         if not getattr(result, field) and microdata.get(field):
             source = {

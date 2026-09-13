@@ -1,6 +1,6 @@
 """Versioned SQLite schema for the job-search layer."""
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS companies (
@@ -197,4 +197,103 @@ CREATE TABLE IF NOT EXISTS workflow_run_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_workflow_run_jobs_state
     ON workflow_run_jobs(run_id, discovery_state);
+"""
+
+MIGRATION_10 = """
+ALTER TABLE workflow_runs ADD COLUMN network_pauses INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflow_runs ADD COLUMN network_pause_seconds REAL NOT NULL DEFAULT 0;
+ALTER TABLE workflow_runs ADD COLUMN network_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflow_runs ADD COLUMN network_recoveries INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workflow_runs ADD COLUMN last_network_failure TEXT;
+ALTER TABLE workflow_runs ADD COLUMN last_successful_probe TEXT;
+
+CREATE TABLE IF NOT EXISTS workflow_run_queries (
+    workflow_run_query_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    source_query TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    status TEXT NOT NULL CHECK (status IN (
+        'PLANNED', 'RUNNING', 'COMPLETED', 'EXHAUSTED',
+        'BLOCKED_VERIFICATION', 'NETWORK_INTERRUPTED', 'FAILED',
+        'FAILED_RETRYABLE'
+    )),
+    pages_inspected INTEGER NOT NULL DEFAULT 0,
+    results_inspected INTEGER NOT NULL DEFAULT 0,
+    new_jobs INTEGER NOT NULL DEFAULT 0,
+    error_type TEXT,
+    error_message TEXT,
+    network_failure_count INTEGER NOT NULL DEFAULT 0,
+    recovered_network_failures INTEGER NOT NULL DEFAULT 0,
+    page_start_offset INTEGER NOT NULL DEFAULT 0,
+    network_pause_count INTEGER NOT NULL DEFAULT 0,
+    last_network_failure TEXT,
+    last_successful_probe TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id, source_query)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_run_queries_status
+    ON workflow_run_queries(run_id, status);
+"""
+
+MIGRATION_11 = """
+-- Nullable analytics columns deliberately distinguish pre-v11 unavailable
+-- evidence from a measured zero in newer workflow runs.
+ALTER TABLE workflow_run_queries ADD COLUMN query_category TEXT;
+ALTER TABLE workflow_run_queries ADD COLUMN job_candidates INTEGER;
+ALTER TABLE workflow_run_queries ADD COLUMN known_jobs INTEGER;
+ALTER TABLE workflow_run_queries ADD COLUMN rejected_noise INTEGER;
+ALTER TABLE workflow_run_queries ADD COLUMN resolution_failures INTEGER;
+ALTER TABLE workflow_run_queries ADD COLUMN browser_resolutions INTEGER;
+ALTER TABLE workflow_run_queries ADD COLUMN http_job_fetches INTEGER;
+ALTER TABLE workflow_run_queries ADD COLUMN duration_seconds REAL;
+
+CREATE TABLE workflow_run_job_queries (
+    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    source_query TEXT NOT NULL,
+    discovery_state TEXT NOT NULL CHECK (discovery_state IN ('NEW', 'KNOWN')),
+    is_primary_new_source INTEGER NOT NULL DEFAULT 0
+        CHECK (is_primary_new_source IN (0, 1)),
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, job_id, source_query),
+    FOREIGN KEY (run_id, source_query)
+        REFERENCES workflow_run_queries(run_id, source_query) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX idx_workflow_run_job_queries_primary_new
+    ON workflow_run_job_queries(run_id, job_id)
+    WHERE is_primary_new_source = 1;
+CREATE INDEX idx_workflow_run_job_queries_query
+    ON workflow_run_job_queries(run_id, source_query);
+"""
+
+MIGRATION_12 = """
+CREATE TABLE job_qualifications (
+    qualification_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    qualification_status TEXT NOT NULL
+        CHECK (qualification_status IN ('QUALIFIED', 'REVIEW', 'DISQUALIFIED')),
+    activity_status TEXT NOT NULL
+        CHECK (activity_status IN ('ACTIVE', 'INACTIVE', 'UNKNOWN')),
+    employer_status TEXT NOT NULL
+        CHECK (employer_status IN ('CONFIRMED', 'UNKNOWN')),
+    application_channel TEXT NOT NULL CHECK (application_channel IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    application_url TEXT,
+    reason_codes_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    input_evidence_hash TEXT NOT NULL,
+    qualified_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_qualifications_status
+    ON job_qualifications(policy_version, qualification_status);
 """

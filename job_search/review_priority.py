@@ -18,6 +18,7 @@ from job_search.storage import DEFAULT_DATABASE, connect_database
 
 
 PRIORITIES = ("HIGH", "MEDIUM", "LOW")
+OBSERVATION_STATUSES = ("NEW", "UPDATED", "KNOWN")
 MODERATE_REVIEW_REASONS = frozenset({
     "REVIEW_EXPERIENCE_3_YEARS",
     "REVIEW_EXPERIENCE_PREFERRED",
@@ -197,9 +198,34 @@ def priority_sort_key(item: ReviewPriority) -> tuple:
 def load_review_priorities(
     connection: sqlite3.Connection, policy_version: str = DEFAULT_POLICY_VERSION,
     job_ids: Sequence[int] | None = None,
+    run_id: str | None = None, observation_status: str | None = None,
 ) -> list[ReviewPriority]:
     """Compute priorities from current stored evidence without persisting them."""
+    if observation_status is not None and run_id is None:
+        raise ValueError("observation_status requires run_id")
+    if observation_status not in (None, *OBSERVATION_STATUSES):
+        raise ValueError(f"invalid observation_status: {observation_status}")
+    if run_id is not None:
+        run_exists = connection.execute(
+            "SELECT 1 FROM workflow_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if run_exists is None:
+            raise ValueError(f"workflow run not found: {run_id}")
+
     parameters: list[object] = [policy_version]
+    scope_clause = ""
+    if run_id is not None:
+        state_clause = ""
+        if observation_status is not None:
+            state_clause = " AND wrj.discovery_state=?"
+        scope_clause = (
+            " AND EXISTS (SELECT 1 FROM workflow_run_jobs wrj"
+            " WHERE wrj.run_id=? AND wrj.job_id=j.job_id"
+            f"{state_clause})"
+        )
+        parameters.append(run_id)
+        if observation_status is not None:
+            parameters.append(observation_status)
     job_clause = ""
     if job_ids is not None:
         if not job_ids:
@@ -230,8 +256,8 @@ def load_review_priorities(
                    candidate.job_source_id
                LIMIT 1
            )
-           WHERE f.policy_version=? AND f.status='REVIEW'""" + job_clause +
-        " ORDER BY j.job_id",
+           WHERE f.policy_version=? AND f.status='REVIEW'"""
+        + scope_clause + job_clause + " ORDER BY j.job_id",
         parameters,
     ).fetchall()
     results = [item for row in rows if (item := prioritize_review_row(row))]
@@ -263,6 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--database", default=str(DEFAULT_DATABASE))
     parser.add_argument("--policy-version", default=DEFAULT_POLICY_VERSION)
+    parser.add_argument("--run-id")
+    parser.add_argument(
+        "--observation-status", choices=OBSERVATION_STATUSES,
+        help="limit a workflow run to jobs with this observation status",
+    )
     parser.add_argument("--show-high", action="store_true")
     parser.add_argument("--show-medium", action="store_true")
     parser.add_argument("--show-low", action="store_true")
@@ -270,7 +301,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.observation_status and not args.run_id:
+        parser.error("--observation-status requires --run-id")
     selected = {
         priority for enabled, priority in (
             (args.show_high, "HIGH"),
@@ -282,7 +316,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         selected = set(PRIORITIES)
     connection = connect_database(args.database)
     try:
-        results = load_review_priorities(connection, args.policy_version)
+        try:
+            results = load_review_priorities(
+                connection, args.policy_version, run_id=args.run_id,
+                observation_status=args.observation_status,
+            )
+        except ValueError as error:
+            parser.error(str(error))
     finally:
         connection.close()
     for priority in PRIORITIES:

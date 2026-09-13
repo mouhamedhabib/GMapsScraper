@@ -7,6 +7,12 @@ import re
 from time import monotonic, sleep
 from urllib.parse import urlsplit
 
+from job_search.network import (
+    NetworkPauseExceeded,
+    NetworkProtectionRelay,
+    TargetSiteNetworkError,
+    classify_network_error,
+)
 from job_search.providers import (
     JobResultClassification,
     classify_job_result,
@@ -20,6 +26,7 @@ from job_search.storage import (
     connect_database,
     find_existing_job,
     record_job_rediscovery,
+    utc_now,
     upsert_job,
 )
 from utils.google_search_client import (
@@ -88,7 +95,7 @@ def _job_identity(provider, canonical):
 
 def read_current_search_results(
     driver, query, limit, timeout, verbose=False, diagnose_results=False,
-    resolution_cache=None,
+    resolution_cache=None, network_relay=None,
 ):
     """Read unfiltered organic results so rejected/noise totals stay accurate."""
     from selenium.common.exceptions import TimeoutException
@@ -115,6 +122,7 @@ def read_current_search_results(
         resolution_cache=resolution_cache,
         source_query=query,
         browser_resolve_goto=True,
+        network_relay=network_relay,
     )
     for row in rows:
         row["source_query"] = query
@@ -124,6 +132,7 @@ def read_current_search_results(
 def search_query(
     driver, query, limit, timeout, verbose=False, start=0,
     diagnose_results=False, resolution_cache=None, recent_days=None,
+    network_relay=None,
 ):
     from urllib.parse import quote_plus
 
@@ -138,6 +147,7 @@ def search_query(
         driver, query, limit, timeout, verbose,
         diagnose_results=diagnose_results,
         resolution_cache=resolution_cache,
+        network_relay=network_relay,
     )
 
 
@@ -163,7 +173,98 @@ def empty_stats():
         # Exact membership for orchestration. Existing callers may ignore this.
         "job_states": {},
         "stopped": False,
+        "network_failure_count": 0,
+        "recovered_network_failures": 0,
+        "query_execution": True,
     }
+
+
+def _plan_queries(connection, run_id, queries):
+    if connection is None or not run_id:
+        return
+    now = utc_now()
+    with connection:
+        for query in queries:
+            connection.execute(
+                """INSERT OR IGNORE INTO workflow_run_queries
+                   (run_id, source_query, status, created_at, updated_at)
+                   VALUES (?, ?, 'PLANNED', ?, ?)""",
+                (run_id, query, now, now),
+            )
+
+
+def _persist_query(connection, run_id, query_stats, status, error_type=None,
+                   error_message=None, relay=None):
+    if connection is None or not run_id:
+        return
+    now = utc_now()
+    started_at = query_stats.get("started_at")
+    finished_at = None if status in {"PLANNED", "RUNNING"} else now
+    with connection:
+        connection.execute(
+            """UPDATE workflow_run_queries SET
+                   started_at=COALESCE(started_at, ?), finished_at=?, status=?,
+                   pages_inspected=?, results_inspected=?, new_jobs=?,
+                   query_category=?, job_candidates=?, known_jobs=?,
+                   rejected_noise=?, resolution_failures=?, browser_resolutions=?,
+                   http_job_fetches=?, duration_seconds=?,
+                   error_type=?, error_message=?, network_failure_count=?,
+                   recovered_network_failures=?, page_start_offset=?,
+                   network_pause_count=?, last_network_failure=?,
+                   last_successful_probe=?, updated_at=?
+               WHERE run_id=? AND source_query=?""",
+            (
+                started_at, finished_at, status, query_stats["pages"],
+                query_stats["inspected"], query_stats["new"],
+                query_stats.get("category"), query_stats.get("candidates"),
+                query_stats.get("known"), query_stats.get("rejected"),
+                query_stats.get("resolution_failures"),
+                query_stats.get("browser_resolutions"),
+                query_stats.get("http_job_fetches"),
+                query_stats.get("duration_seconds"), error_type,
+                str(error_message)[:1000] if error_message else None,
+                query_stats.get("stored_network_failures", 0)
+                + (relay.network_failures - query_stats.get("relay_failures_start", 0))
+                if relay else query_stats["network_failure_count"],
+                query_stats.get("stored_network_recoveries", 0)
+                + (relay.network_recoveries - query_stats.get("relay_recoveries_start", 0))
+                if relay else query_stats["recovered_network_failures"],
+                query_stats.get("page_start", 0),
+                query_stats.get("stored_network_pauses", 0)
+                + (relay.network_pauses - query_stats.get("relay_pauses_start", 0))
+                if relay else 0,
+                relay.last_network_failure if relay else None,
+                relay.last_successful_probe if relay else None,
+                now, run_id,
+                query_stats["query"],
+            ),
+        )
+
+
+def _record_run_query_observation(
+    connection, run_id, job_id, source_query, was_new,
+):
+    """Persist exact run/query provenance without duplicating NEW attribution."""
+    if connection is None or not run_id:
+        return
+    now = utc_now()
+    with connection:
+        connection.execute(
+            """INSERT INTO workflow_run_job_queries
+               (run_id, job_id, source_query, discovery_state,
+                is_primary_new_source, observed_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(run_id, job_id, source_query) DO UPDATE SET
+                 discovery_state=CASE
+                   WHEN workflow_run_job_queries.discovery_state='NEW' THEN 'NEW'
+                   ELSE excluded.discovery_state END,
+                 is_primary_new_source=MAX(
+                   workflow_run_job_queries.is_primary_new_source,
+                   excluded.is_primary_new_source
+                 )""",
+            (run_id, job_id, source_query, "NEW" if was_new else "KNOWN",
+             int(was_new), now),
+        )
 
 
 def record_rejection(
@@ -227,11 +328,27 @@ def discover_jobs(
     input_function=None,
     diagnose_results=False,
     recent_days=None,
+    workflow_run_id=None,
+    selected_queries=None,
+    network_retries=2,
+    network_backoffs=(2, 5),
+    connectivity_probe_enabled=True,
+    connectivity_probe_function=None,
+    network_relay=None,
+    query_checkpoints=None,
+    network_failure_window=4,
+    network_pause_threshold=3,
+    network_resume_successes=3,
+    network_probe_interval=10,
+    network_probe_max_interval=30,
+    network_max_pause_seconds=600,
+    network_probe_timeout=3,
 ):
     """Find at most ``limit`` new jobs per query, with a bounded page scan."""
-    queries = load_queries(Path(query_file))
+    queries = list(selected_queries) if selected_queries is not None else load_queries(Path(query_file))
     stats = empty_stats()
     connection = None if diagnose_results else connect_database(database)
+    _plan_queries(connection, workflow_run_id, queries)
     if not queries or (limit == 0 and not diagnose_results):
         if connection is not None:
             connection.close()
@@ -241,11 +358,56 @@ def discover_jobs(
     fetcher = fetcher or fetch_job
     resolution_cache = {}
     run_jobs = {}
+    relay = network_relay or NetworkProtectionRelay(
+        enabled=connectivity_probe_enabled,
+        failure_window=network_failure_window,
+        pause_after_failures=network_pause_threshold,
+        resume_successes=network_resume_successes,
+        probe_interval=network_probe_interval,
+        probe_max_interval=network_probe_max_interval,
+        max_pause_seconds=network_max_pause_seconds,
+        probe_timeout=network_probe_timeout,
+        **({"probe_function": connectivity_probe_function}
+           if connectivity_probe_function else {}),
+    )
+    checkpoints = query_checkpoints or {}
     try:
         try:
-            driver = (driver_factory or create_chrome_driver)(windowed=windowed)
+            driver = relay.protect(
+                lambda: (driver_factory or create_chrome_driver)(windowed=windowed),
+                context="browser startup",
+            )
+        except NetworkPauseExceeded as error:
+            for query in queries:
+                query_stats = {
+                    "query": query, "pages": 0, "inspected": 0, "new": 0,
+                    "network_failure_count": relay.network_failures,
+                    "recovered_network_failures": relay.network_recoveries,
+                    "started_at": utc_now(), "page_start": 0,
+                }
+                _persist_query(
+                    connection, workflow_run_id, query_stats,
+                    "NETWORK_INTERRUPTED", error.error_type, error, relay,
+                )
+                stats["query_stats"].append({**query_stats, "status": "NETWORK_INTERRUPTED"})
+            return stats
         except Exception as error:
             print(f"[-] Browser unavailable: {type(error).__name__}: {error}")
+            error_type = classify_network_error(error)
+            status = "NETWORK_INTERRUPTED" if error_type else "FAILED"
+            for query in queries:
+                query_stats = {
+                    "query": query, "pages": 0, "inspected": 0, "new": 0,
+                    "network_failure_count": int(bool(error_type)),
+                    "recovered_network_failures": 0, "started_at": utc_now(),
+                    "page_start": 0,
+                }
+                _persist_query(
+                    connection, workflow_run_id, query_stats, status,
+                    error_type or type(error).__name__, error, relay,
+                )
+                stats["query_stats"].append({**query_stats, "status": status})
+            stats["network_failure_count"] += int(bool(error_type))
             return stats
 
         if diagnose_results:
@@ -255,8 +417,8 @@ def discover_jobs(
             print(f"unwrap helper module: {getsourcefile(unwrap_google_result_url)}")
             print(f"redirect resolver module: {getsourcefile(resolve_google_result_url)}")
 
-        selected_queries = queries[:1] if diagnose_results else queries
-        for query_index, query in enumerate(selected_queries):
+        active_queries = queries[:1] if diagnose_results else queries
+        for query_index, query in enumerate(active_queries):
             started = monotonic()
             stats["queries"] += 1
             category = classify_query(query)
@@ -277,8 +439,42 @@ def discover_jobs(
                 "browser_resolutions": 0,
                 "http_job_fetches": 0,
                 "known_job_early_skips": 0,
+                "network_failure_count": 0,
+                "recovered_network_failures": 0,
+                "status": "RUNNING",
+                "started_at": utc_now(),
+                "relay_failures_start": relay.network_failures,
+                "relay_recoveries_start": relay.network_recoveries,
+                "relay_pauses_start": relay.network_pauses,
             }
-            page_start = 0
+            checkpoint = checkpoints.get(query, {})
+            page_start = int(checkpoint.get("page_start_offset", 0))
+            query_stats["page_start"] = page_start
+            query_stats["pages"] = int(checkpoint.get("pages_inspected", 0))
+            query_stats["inspected"] = int(checkpoint.get("results_inspected", 0))
+            query_stats["new"] = int(checkpoint.get("new_jobs", 0))
+            for stats_key, column in (
+                ("candidates", "job_candidates"),
+                ("known", "known_jobs"),
+                ("rejected", "rejected_noise"),
+                ("resolution_failures", "resolution_failures"),
+                ("browser_resolutions", "browser_resolutions"),
+                ("http_job_fetches", "http_job_fetches"),
+            ):
+                query_stats[stats_key] = int(checkpoint.get(column) or 0)
+            previous_duration = float(checkpoint.get("duration_seconds") or 0.0)
+            query_stats["stored_network_failures"] = int(
+                checkpoint.get("network_failure_count", 0)
+            )
+            query_stats["stored_network_recoveries"] = int(
+                checkpoint.get("recovered_network_failures", 0)
+            )
+            query_stats["stored_network_pauses"] = int(
+                checkpoint.get("network_pause_count", 0)
+            )
+            _persist_query(
+                connection, workflow_run_id, query_stats, "RUNNING", relay=relay
+            )
             query_inspection_cap = (
                 min(10, max(1, limit))
                 if diagnose_results
@@ -296,17 +492,33 @@ def discover_jobs(
                     10, query_inspection_cap - query_stats["inspected"]
                 )
                 try:
-                    rows, marker = search_query(
-                        driver, query, page_limit, timeout,
-                        verbose=verbose, start=page_start,
-                        diagnose_results=diagnose_results,
-                        resolution_cache=resolution_cache,
-                        recent_days=recent_days,
+                    rows, marker = relay.protect(
+                        lambda: search_query(
+                            driver, query, page_limit, timeout,
+                            verbose=verbose, start=page_start,
+                            diagnose_results=diagnose_results,
+                            resolution_cache=resolution_cache,
+                            recent_days=recent_days,
+                            network_relay=relay,
+                        ), context=f"query: {query}", page_start=page_start,
                     )
                     query_stats["pages"] += 1
                     stats["pages"] += 1
+                    query_stats["page_start"] = page_start
+                except NetworkPauseExceeded as error:
+                    query_stats["status"] = "NETWORK_INTERRUPTED"
+                    _persist_query(
+                        connection, workflow_run_id, query_stats,
+                        "NETWORK_INTERRUPTED", error.error_type, error, relay,
+                    )
+                    break
                 except Exception as error:
                     print(f"[-] Search page failed ({query}): {type(error).__name__}: {error}")
+                    query_stats["status"] = "FAILED"
+                    _persist_query(
+                        connection, workflow_run_id, query_stats, "FAILED",
+                        type(error).__name__, error, relay,
+                    )
                     break
 
                 if marker:
@@ -323,6 +535,11 @@ def discover_jobs(
                             f"requires --windowed. {suffix}"
                         )
                         stats["stopped"] = True
+                        query_stats["status"] = "BLOCKED_VERIFICATION"
+                        _persist_query(
+                            connection, workflow_run_id, query_stats,
+                            "BLOCKED_VERIFICATION", "GOOGLE_VERIFICATION", marker,
+                        )
                         break
                     rows, should_stop = wait_for_manual_verification(
                         driver, query, page_limit, timeout, Path(database), [],
@@ -334,10 +551,17 @@ def discover_jobs(
                         result_reader=lambda *args, **kwargs: read_current_search_results(
                             *args, **kwargs, diagnose_results=diagnose_results,
                             resolution_cache=resolution_cache,
+                            network_relay=relay,
                         ),
                     )
                     if should_stop:
                         stats["stopped"] = True
+                        query_stats["status"] = "BLOCKED_VERIFICATION"
+                        _persist_query(
+                            connection, workflow_run_id, query_stats,
+                            "BLOCKED_VERIFICATION", "GOOGLE_VERIFICATION",
+                            "manual verification not completed",
+                        )
                         break
 
                 if not rows:
@@ -397,6 +621,12 @@ def discover_jobs(
                             "in a normal Search tab, then retry."
                         )
                         stats["stopped"] = True
+                        query_stats["status"] = "BLOCKED_VERIFICATION"
+                        _persist_query(
+                            connection, workflow_run_id, query_stats,
+                            "BLOCKED_VERIFICATION", resolution_error,
+                            "verification while resolving Google result",
+                        )
                         record_rejection(
                             stats, classification, title, raw_url, verbose=verbose,
                             query_stats=query_stats,
@@ -434,14 +664,42 @@ def discover_jobs(
                         stats["known"] += 1
                         stats["known_job_early_skips"] += 1
                         stats["job_states"].setdefault(known["job_id"], "KNOWN")
+                        _record_run_query_observation(
+                            connection, workflow_run_id, known["job_id"], query, False
+                        )
                         continue
                     query_stats["http_job_fetches"] += 1
                     stats["http_job_fetches"] += 1
-                    parsed = fetcher(canonical, timeout=timeout)
+                    try:
+                        parsed = relay.protect(
+                            lambda: fetcher(canonical, timeout=timeout),
+                            context=f"job fetch: {canonical}",
+                        )
+                    except NetworkPauseExceeded as error:
+                        query_stats["status"] = "NETWORK_INTERRUPTED"
+                        _persist_query(
+                            connection, workflow_run_id, query_stats,
+                            "NETWORK_INTERRUPTED", error.error_type, error, relay,
+                        )
+                        break
+                    except Exception as error:
+                        record_rejection(
+                            stats,
+                            JobResultClassification(
+                                False, canonical, provider, "JOB_FETCH_FAILED"
+                            ),
+                            title, raw_url, verbose=verbose,
+                            query_stats=query_stats,
+                        )
+                        if verbose:
+                            print(f"[-] Job page failed: {type(error).__name__}: {error}")
+                        continue
                     if not parsed.title:
                         parsed.title = title.strip()
                     post_fetch_listing = generic_listing_reason(
-                        parsed.title, canonical, parsed.description
+                        parsed.title, canonical, parsed.description,
+                        page_fetched=True,
+                        has_structured_job_posting=parsed.has_structured_job_posting,
                     )
                     if post_fetch_listing:
                         record_rejection(
@@ -459,6 +717,9 @@ def discover_jobs(
                         connection, parsed, query,
                         source_evidence=_source_evidence(row),
                         query_category=category,
+                    )
+                    _record_run_query_observation(
+                        connection, workflow_run_id, job_id, query, was_new
                     )
                     run_jobs[identity] = job_id
                     if was_new:
@@ -482,6 +743,12 @@ def discover_jobs(
                     query_stats["exhausted"] = True
                     break
                 page_start += 10
+                query_stats["page_start"] = page_start
+
+                if query_stats["status"] in {
+                    "NETWORK_INTERRUPTED", "FAILED", "BLOCKED_VERIFICATION",
+                }:
+                    break
 
             if (
                 not diagnose_results
@@ -493,7 +760,17 @@ def discover_jobs(
                     f"[!] Inspection cap reached for query after "
                     f"{query_inspection_cap} results: {query}"
                 )
-            query_stats["duration_seconds"] = round(monotonic() - started, 3)
+            query_stats["duration_seconds"] = round(
+                previous_duration + monotonic() - started, 3
+            )
+            if query_stats["status"] == "RUNNING":
+                query_stats["status"] = (
+                    "EXHAUSTED" if query_stats["exhausted"] else "COMPLETED"
+                )
+            _persist_query(
+                connection, workflow_run_id, query_stats, query_stats["status"],
+                relay=relay,
+            )
             stats["query_stats"].append(query_stats)
             if stats["stopped"]:
                 break
@@ -502,9 +779,14 @@ def discover_jobs(
                     f"[+] Query stored {query_stats['new']} new jobs after "
                     f"inspecting {query_stats['inspected']} results"
                 )
-            if query_index + 1 < len(selected_queries) and delay:
+            if query_index + 1 < len(active_queries) and delay:
                 sleep(delay)
     finally:
+        snapshot = relay.snapshot()
+        stats["network_failure_count"] = snapshot.network_failures
+        stats["recovered_network_failures"] = snapshot.network_recoveries
+        stats["network_pauses"] = snapshot.network_pauses
+        stats["network_pause_seconds"] = snapshot.network_pause_seconds
         if driver is not None:
             try:
                 driver.quit()
@@ -573,6 +855,9 @@ def parse_arguments(argv=None):
                         help="Maximum NEW jobs stored per query")
     parser.add_argument("--delay", type=float, default=3)
     parser.add_argument("--timeout", type=float, default=15)
+    parser.add_argument("--network-max-pause", type=float, default=600)
+    parser.add_argument("--network-probe-interval", type=float, default=10)
+    parser.add_argument("--disable-network-protection", action="store_true")
     parser.add_argument(
         "--recent-days", type=int,
         help=(
@@ -594,6 +879,10 @@ def parse_arguments(argv=None):
         parser.error("--delay must be zero or greater")
     if arguments.timeout <= 0:
         parser.error("--timeout must be greater than zero")
+    if arguments.network_max_pause < 0:
+        parser.error("--network-max-pause must be zero or greater")
+    if arguments.network_probe_interval <= 0:
+        parser.error("--network-probe-interval must be greater than zero")
     if arguments.recent_days is not None and arguments.recent_days < 1:
         parser.error("--recent-days must be at least 1")
     if not arguments.query_file.is_file():
@@ -613,6 +902,9 @@ def main():
         verbose=arguments.verbose,
         diagnose_results=arguments.diagnose_results,
         recent_days=arguments.recent_days,
+        connectivity_probe_enabled=not arguments.disable_network_protection,
+        network_max_pause_seconds=arguments.network_max_pause,
+        network_probe_interval=arguments.network_probe_interval,
     )
     print_summary(stats, arguments.database, arguments.diagnose_results)
 

@@ -1,12 +1,16 @@
 """Offline tests for deterministic REVIEW prioritization."""
 
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from job_search.review_priority import load_review_priorities, priority_sort_key
+from job_search.review_priority import (
+    load_review_priorities, main, priority_sort_key,
+)
 from job_search.storage import connect_database
 
 
@@ -71,6 +75,34 @@ class ReviewPriorityTests(TestCase):
 
     def priorities(self):
         return load_review_priorities(self.connection, "v1.1")
+
+    def add_run(self, run_id, memberships):
+        now = "2026-09-13T07:00:33+00:00"
+        self.connection.execute(
+            """INSERT INTO workflow_runs
+               (run_id, started_at, finished_at, status, mode, maps_enabled,
+                job_discovery_enabled, completion_enabled, filter_enabled,
+                priority_enabled, created_at)
+               VALUES (?, ?, ?, 'SUCCESS', 'JOBS_ONLY', 0, 1, 1, 1, 1, ?)""",
+            (run_id, now, now, now),
+        )
+        self.connection.executemany(
+            """INSERT INTO workflow_run_jobs
+               (run_id, job_id, discovery_state, created_at)
+               VALUES (?, ?, ?, ?)""",
+            [(run_id, job_id, state, now) for job_id, state in memberships],
+        )
+        self.connection.commit()
+
+    def run_cli(self, *arguments):
+        output = StringIO()
+        with redirect_stdout(output):
+            exit_code = main([
+                "--database", str(self.database), "--policy-version", "v1.1",
+                *arguments,
+            ])
+        self.assertEqual(exit_code, 0)
+        return output.getvalue()
 
     def test_job_84_shaped_case_is_high(self):
         self.add_job(84, title="Java Developer (Infrastructure)", company="Ajax Systems",
@@ -167,3 +199,111 @@ class ReviewPriorityTests(TestCase):
             priority_sort_key(replace(base, job_id=10)),
             priority_sort_key(replace(base, job_id=11)),
         )
+
+    def test_no_run_id_preserves_database_wide_behavior(self):
+        self.add_job(20)
+        self.add_job(21)
+        self.add_run("run-one", [(20, "NEW")])
+
+        self.assertEqual(
+            [item.job_id for item in load_review_priorities(self.connection, "v1.1")],
+            [20, 21],
+        )
+
+    def test_run_id_isolates_exact_run_membership(self):
+        for job_id in (30, 31, 32):
+            self.add_job(job_id)
+        self.add_run("run-one", [(30, "NEW")])
+        self.add_run("run-two", [(31, "KNOWN")])
+
+        results = load_review_priorities(
+            self.connection, "v1.1", run_id="run-one"
+        )
+
+        self.assertEqual([item.job_id for item in results], [30])
+
+    def assert_status_filter(self, status, expected_job_id):
+        for job_id in (40, 41, 42):
+            self.add_job(job_id)
+        self.add_run(
+            "status-run", [(40, "NEW"), (41, "UPDATED"), (42, "KNOWN")]
+        )
+
+        results = load_review_priorities(
+            self.connection, "v1.1", run_id="status-run",
+            observation_status=status,
+        )
+        output = self.run_cli(
+            "--run-id", "status-run", "--observation-status", status
+        )
+
+        self.assertEqual([item.job_id for item in results], [expected_job_id])
+        self.assertEqual(
+            [line for line in output.splitlines() if line.startswith("job_id:")],
+            [f"job_id: {expected_job_id}"],
+        )
+
+    def test_new_observation_status_filter(self):
+        self.assert_status_filter("NEW", 40)
+
+    def test_updated_observation_status_filter(self):
+        self.assert_status_filter("UPDATED", 41)
+
+    def test_known_observation_status_filter(self):
+        self.assert_status_filter("KNOWN", 42)
+
+    def test_priority_display_flags_work_with_run_scope(self):
+        self.add_job(
+            50, reasons=("REVIEW_LOCATION_EUROPE", "PASS_RELEVANT_ROLE",
+                         "PASS_FRESH_JOB"),
+        )
+        self.add_job(
+            51, location="", description="", relationship="RECRUITER",
+            reasons=("REVIEW_LOCATION_UNKNOWN", "REVIEW_DESCRIPTION_MISSING",
+                     "PASS_RELEVANT_ROLE"),
+        )
+        self.add_job(
+            52, location="", description="", provider="", source_type="",
+            relationship="", reasons=("REVIEW_ROLE_UNCLEAR",
+                                       "REVIEW_LOCATION_UNKNOWN",
+                                       "REVIEW_DESCRIPTION_MISSING"),
+        )
+        self.add_run(
+            "priority-run", [(50, "NEW"), (51, "UPDATED"), (52, "KNOWN")]
+        )
+
+        for flag, expected_job_id in (
+            ("--show-high", 50),
+            ("--show-medium", 51),
+            ("--show-low", 52),
+        ):
+            with self.subTest(flag=flag):
+                output = self.run_cli("--run-id", "priority-run", flag)
+                self.assertIn("HIGH: 1\nMEDIUM: 1\nLOW: 1", output)
+                self.assertEqual(
+                    [line for line in output.splitlines() if line.startswith("job_id:")],
+                    [f"job_id: {expected_job_id}"],
+                )
+
+    def test_nonexistent_run_id_fails_clearly(self):
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+            main([
+                "--database", str(self.database), "--policy-version", "v1.1",
+                "--run-id", "missing-run",
+            ])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("workflow run not found: missing-run", errors.getvalue())
+
+    def test_repeated_run_scoped_execution_is_read_only_and_idempotent(self):
+        self.add_job(60)
+        self.add_run("repeat-run", [(60, "NEW")])
+        before = "\n".join(self.connection.iterdump())
+
+        first = self.run_cli("--run-id", "repeat-run", "--show-high")
+        second = self.run_cli("--run-id", "repeat-run", "--show-high")
+        after = "\n".join(self.connection.iterdump())
+
+        self.assertEqual(first, second)
+        self.assertEqual(before, after)

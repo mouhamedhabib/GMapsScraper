@@ -442,6 +442,61 @@ them ineligible for later automatic repair retries:
   --final-pass --verbose
 ```
 
+### Query performance analytics
+
+Query analytics are read-only and use exact workflow-run membership and
+run-scoped query provenance:
+
+```bash
+.venv/bin/python -m job_search.query_performance \
+  --database data/job_search.db --recent-runs 10
+.venv/bin/python -m job_search.query_performance \
+  --database data/job_search.db --run-id RUN_ID --show-review
+```
+
+The default window is the 10 most recent `SUCCESS` or `PARTIAL` runs. `DROP`
+requires at least 2 runs and 20 inspected results, zero new jobs, plus at least
+80% rejected noise or 50% resolution failures. `KEEP` requires at least 2 runs,
+10 inspected results, 2 new jobs, 5% candidate yield, a shortlisted downstream
+outcome, and noise/failure rates below the drop limits. Everything ambiguous or
+undersampled is `REVIEW`. Historical metrics not persisted by older schema
+versions print as `unavailable`, never as an invented zero.
+
+### Job qualification
+
+Qualification is a deterministic, persisted verification layer for PASS and
+HIGH-priority REVIEW jobs. MEDIUM reviews require explicit inclusion; hard-filter
+REJECT jobs are never selected. It verifies posting identity/activity, employer
+evidence, normalized location evidence, source relationship, and the strongest
+safe application destination without using CV/profile data:
+
+```bash
+.venv/bin/python -m job_search.qualification \
+  --database data/job_search.db --policy-version v1.1 --run-id RUN_ID
+
+.venv/bin/python -m job_search.qualification \
+  --database data/job_search.db --policy-version v1.1 \
+  --job-id 326 --include-medium --timeout 15 --verbose
+```
+
+Qualification reads stored evidence first and makes at most one bounded HTTP
+verification request when activity or the application channel remains unknown.
+Browser fallback is disabled unless `--browser-fallback` is supplied. HTTP
+404/410 or an explicit closed/removed state is inactive; 403, CAPTCHA,
+Cloudflare, timeout, and temporary network failures remain unknown.
+
+Source relationships can then be resolved from stored ATS tenant evidence with
+no network requests. The resolver requires normalized exact agreement between
+the Greenhouse, Lever, or Ashby tenant and the stored company, preserves known
+DIRECT/RECRUITER/AGGREGATOR relationships, and records mutations in the existing
+repair provenance:
+
+```bash
+.venv/bin/python -m job_search.relationship_resolution \
+  --database data/job_search.db \
+  --job-id 81 --job-id 142 --job-id 245 --job-id 248 --verbose
+```
+
 ### Docker
 
 The job command can run in Docker with:

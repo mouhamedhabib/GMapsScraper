@@ -107,6 +107,24 @@ class DailyWorkflowTests(TestCase):
         self.assertEqual([item["title"] for item in report["shortlist"]], ["Backend Engineer"])
         self.assertNotIn(historical, [item["job_id"] for item in report["shortlist"]])
 
+    def test_query_location_mismatch_never_enters_shortlist(self):
+        def discovery(**kwargs):
+            connection = connect_database(kwargs["database"])
+            try:
+                candidate = parsed("https://example.test/jobs/india")
+                candidate.location_text = "Bangalore, India"
+                candidate.remote_policy = "ONSITE"
+                candidate.description = "Backend engineer building Python APIs. " * 8
+                job_id, _ = upsert_job(connection, candidate, "backend engineer France")
+            finally:
+                connection.close()
+            return {"new": 1, "known": 0, "job_states": {job_id: "NEW"}}
+
+        report = run_workflow(self.options, discovery_runner=discovery)
+        self.assertEqual(report["filter_counts"], {"PASS": 0, "REVIEW": 0, "REJECT": 1})
+        self.assertEqual(report["query_intent_guard"]["mismatches_rejected"], 1)
+        self.assertEqual(report["shortlist"], [])
+
     def test_default_shortlist_excludes_medium_review(self):
         self.options.hard_filter = False
 

@@ -18,6 +18,7 @@ from job_search.providers import (
     detect_provider,
     extract_source_job_id,
     fetch_job,
+    generic_listing_reason,
     is_job_result,
     parse_job_html,
 )
@@ -105,6 +106,14 @@ class JobUrlTests(TestCase):
                 result = classify_job_result(title, url)
                 self.assertFalse(result.accepted)
                 self.assertEqual(result.rejection_reason, GENERIC_LISTING_REASON)
+
+    def test_remoterocketship_role_collection_is_not_an_individual_job(self):
+        result = classify_job_result(
+            "Remote Software Engineer Jobs",
+            "https://www.remoterocketship.com/jobs/software-engineer",
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.rejection_reason, GENERIC_LISTING_REASON)
 
     def test_generic_individual_job_path_remains_eligible(self):
         result = classify_job_result(
@@ -315,6 +324,25 @@ class ParserTests(TestCase):
         self.assertEqual(parsed.description, "Build Java APIs")
         self.assertEqual(parsed.employment_type, "FULL_TIME")
 
+    def test_json_ld_job_posting_overrides_weak_collection_shape(self):
+        html = '''<script type="application/ld+json">{
+          "@type":"JobPosting", "title":"Backend Developer Jobs",
+          "description":"Build APIs for Acme.",
+          "hiringOrganization":{"name":"Acme"}
+        }</script>'''
+        parsed = parse_job_html(
+            "https://careers.example.test/jobs/backend-developer", html,
+        )
+        self.assertTrue(parsed.has_structured_job_posting)
+        self.assertEqual(
+            generic_listing_reason(
+                parsed.title, parsed.canonical_url, parsed.description,
+                page_fetched=True,
+                has_structured_job_posting=parsed.has_structured_job_posting,
+            ),
+            "",
+        )
+
     def test_generic_microdata_and_h1_fallback_safely(self):
         microdata = '''<main itemscope itemtype="https://schema.org/JobPosting">
           <h1 itemprop="title">Python Developer</h1>
@@ -513,6 +541,37 @@ class QueryAndDiscoveryTests(TestCase):
             connection = connect_database(database)
             self.addCleanup(connection.close)
             self.assertEqual(connection.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
+
+    def test_structured_job_posting_survives_weak_listing_heuristic(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "jobs.db"
+            query_file = root / "queries.txt"
+            query_file.write_text("backend developer\n", encoding="utf-8")
+            url = "https://careers.example.test/jobs/backend-developer"
+            row = {"title": "Backend Developer Jobs", "url": url}
+            fetched = ParsedJob(
+                canonical_url=url, provider="generic",
+                title="Backend Developer Jobs",
+                description="Build APIs for Acme.",
+                fetch_status="FETCHED",
+                has_structured_job_posting=True,
+            )
+            driver = Mock()
+            with patch(
+                "job_search.discovery.search_query", return_value=([row], ""),
+            ), patch(
+                "job_search.discovery.has_next_search_page", return_value=False,
+            ):
+                stats = discover_jobs(
+                    query_file, database, limit=1, delay=0,
+                    driver_factory=lambda **_: driver,
+                    fetcher=lambda candidate, timeout: fetched,
+                )
+            self.assertEqual(stats["new"], 1)
+            self.assertEqual(
+                stats["rejection_reasons"][GENERIC_LISTING_REASON], 0,
+            )
 
     def test_captcha_uses_shared_manual_callback(self):
         with TemporaryDirectory() as directory:

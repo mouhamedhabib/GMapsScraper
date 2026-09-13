@@ -23,6 +23,7 @@ from job_search.providers import (
     is_safe_location_value,
 )
 from job_search.geography import normalize_geography
+from job_search.query_intent import evaluate_query_location
 from job_search.storage import DEFAULT_DATABASE, connect_database, utc_now
 
 
@@ -357,7 +358,9 @@ def _date(value: str) -> datetime | None:
         return None
 
 
-def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
+def evaluate_job(
+    row: Mapping, now: datetime | None = None, source_queries: tuple[str, ...] = (),
+) -> FilterDecision:
     """Evaluate one stored job using deterministic policy-v1.1 rules."""
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     title = _value(row, "title")
@@ -380,7 +383,10 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
     review: list[Reason] = []
     passed: list[Reason] = []
 
-    listing = generic_listing_reason(title, _value(row, "canonical_url"), description)
+    listing = generic_listing_reason(
+        title, _value(row, "canonical_url"), description, page_fetched=True,
+        has_structured_job_posting=_value(row, "status") == "OPEN",
+    )
     if listing:
         hard.append(Reason(GENERIC_LISTING_REASON, "The stored URL/title represents a collection of jobs, not an individual posting."))
 
@@ -394,6 +400,20 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
         row, title=title, description=description,
         location_text=location_text, location=location,
     )
+    query_location = evaluate_query_location(
+        source_queries, geography, row, remote_policy=remote_policy,
+        worldwide_eligible=worldwide,
+    )
+    if query_location.state == "MISMATCH":
+        hard.append(Reason(
+            "REJECT_QUERY_LOCATION_MISMATCH",
+            "The known job geography contradicts every geographic discovery query.",
+        ))
+    elif query_location.state == "UNKNOWN":
+        review.append(Reason(
+            "REVIEW_QUERY_LOCATION_UNKNOWN",
+            "The discovery query has geographic intent, but compatible job geography or remote eligibility is not established.",
+        ))
     tunisian_location = geography.region == "TUNISIA"
     if (explicitly_foreign_auth or (no_sponsorship and not tunisian_location)) and not sponsorship_available:
         hard.append(Reason("REJECT_WORK_AUTHORIZATION", "The posting explicitly requires existing work authorization or offers no sponsorship."))
@@ -456,7 +476,7 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
         review.append(Reason("REVIEW_LOCATION_EUROPE", "The posting is in Europe or explicitly targets Europe/EU remote work, so authorization needs review."))
     elif relocation:
         review.append(Reason("REVIEW_RELOCATION_POSSIBLE", "The posting indicates that relocation may be possible."))
-    elif not location:
+    elif not location and query_location.state != "UNKNOWN":
         review.append(Reason("REVIEW_LOCATION_UNKNOWN", "No usable location was stored for this posting."))
 
     stack_reject = None
@@ -510,6 +530,7 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
         "REJECT_STALE_JOB": 4,
         "REJECT_LOCATION_US_ONLY": 5,
         "REJECT_LOCATION_CANADA_ONLY": 5,
+        "REJECT_QUERY_LOCATION_MISMATCH": 6,
         GENERIC_LISTING_REASON: -1,
     }
     hard.sort(key=lambda reason: precedence.get(reason.code, 99))
@@ -546,6 +567,14 @@ def evaluate_job(row: Mapping, now: datetime | None = None) -> FilterDecision:
         )],
         "normalized_country": [geography.country] if geography.country else [],
         "location_region": [geography.region],
+        "source_queries": [intent.source_query for intent in query_location.intents],
+        "query_intents": [intent.as_dict() for intent in query_location.intents],
+        "job_geography": [{"country": geography.country, "region": geography.region}],
+        "query_location_match": [query_location.state],
+        "matched_source_query": (
+            [query_location.matched_source_query]
+            if query_location.matched_source_query else []
+        ),
     }
     return FilterDecision(
         status=status,
@@ -604,18 +633,41 @@ def filter_stored_jobs(connection: sqlite3.Connection, policy_version: str = DEF
         query += " LIMIT ?"
         parameters.append(limit)
     rows = connection.execute(query, parameters).fetchall()
+    queries_by_job: dict[int, list[str]] = {}
+    if rows:
+        row_ids = [int(row["job_id"]) for row in rows]
+        query_placeholders = ",".join("?" for _ in row_ids)
+        for source_query in connection.execute(
+            f"""SELECT job_id, source_query FROM job_source_queries
+                WHERE job_id IN ({query_placeholders})
+                ORDER BY job_id, job_source_query_id""",
+            row_ids,
+        ):
+            queries_by_job.setdefault(int(source_query["job_id"]), []).append(
+                source_query["source_query"]
+            )
     counts = Counter()
     reason_counts = {"REJECT": Counter(), "REVIEW": Counter()}
     evaluated_at = utc_now()
     with connection:
         for row in rows:
-            decision = evaluate_job(row)
+            decision = evaluate_job(
+                row, source_queries=tuple(queries_by_job.get(int(row["job_id"]), ()))
+            )
             persist_result(connection, row["job_id"], policy_version, decision, evaluated_at)
             counts[decision.status] += 1
             if decision.status in reason_counts:
                 reason_counts[decision.status][decision.primary_reason] += 1
             if verbose:
                 print(f'{row["job_id"]}: {decision.status} {decision.primary_reason} - {row["title"] or "(untitled)"}')
+                state = decision.matched_terms.get("query_location_match", ["NEUTRAL"])[0]
+                if state != "NEUTRAL":
+                    matched = decision.matched_terms.get("matched_source_query", [])
+                    print(
+                        f"  query_location_match={state}; "
+                        f"job_geography={decision.matched_terms['job_geography'][0]}; "
+                        f"matched_source_query={matched[0] if matched else 'none'}"
+                    )
     return {"evaluated": len(rows), "counts": counts, "reasons": reason_counts}
 
 
@@ -665,6 +717,8 @@ def show_results(connection: sqlite3.Connection, statuses: tuple[str, ...], poli
         print(f"source quality: {', '.join(terms.get('source_quality', ['UNKNOWN']))}")
         print(f"published_at: {row['published_at'] or ''}")
         print(f"matched technologies: {', '.join(terms.get('technologies', []))}")
+        print(f"query location match: {', '.join(terms.get('query_location_match', ['NEUTRAL']))}")
+        print(f"matched source query: {', '.join(terms.get('matched_source_query', [])) or 'none'}")
         print(f"filter reasons: {', '.join(item['code'] for item in reasons)}")
         print(f"job URL: {row['canonical_url']}")
         print()

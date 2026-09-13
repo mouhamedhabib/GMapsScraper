@@ -473,6 +473,30 @@ class RuleTests(TestCase):
                 self.assertEqual(result.status, "REJECT")
                 self.assertEqual(result.primary_reason, "GENERIC_JOB_LISTING_PAGE")
 
+    def test_shallow_role_jobs_title_is_a_collection_after_fetch(self):
+        cases = (
+            ("Remote Software Engineer Jobs", "software-engineer"),
+            ("Backend Developer Jobs", "backend-developer"),
+        )
+        for title, slug in cases:
+            with self.subTest(title=title):
+                result = evaluate_job(job(
+                    title, "", location="",
+                    canonical_url=f"https://careers.example.test/jobs/{slug}",
+                ), NOW)
+                self.assertEqual(result.status, "REJECT")
+                self.assertEqual(
+                    result.primary_reason, "GENERIC_JOB_LISTING_PAGE",
+                )
+
+    def test_stored_structured_posting_status_overrides_weak_listing_shape(self):
+        result = evaluate_job(job(
+            "Backend Developer Jobs", "Build APIs for Acme.",
+            canonical_url="https://careers.example.test/jobs/backend-developer",
+            status="OPEN",
+        ), NOW)
+        self.assertNotEqual(result.primary_reason, "GENERIC_JOB_LISTING_PAGE")
+
     def test_live_transformation_consulting_titles_are_rejected(self):
         titles = (
             "Consultant(e) Débutant(e) en projets de transformation métier et IT, secteur Assurance (H/F) 1",

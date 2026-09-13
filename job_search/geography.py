@@ -45,14 +45,16 @@ CITY_COUNTRIES = {
     "seattle": "United States", "new york": "United States",
     "san francisco": "United States", "austin": "United States",
     "boston": "United States", "sliema": "Malta", "iasi": "Romania",
-    "breda": "Netherlands", "paris": "France", "brussels": "Belgium",
+    "breda": "Netherlands", "amsterdam": "Netherlands",
+    "paris": "France", "brussels": "Belgium",
     "brussel": "Belgium", "tunis": "Tunisia",
     "chennai": "India",
 }
 CITY_NAMES = {
     "seattle": "Seattle", "new york": "New York", "san francisco": "San Francisco",
     "austin": "Austin", "boston": "Boston", "sliema": "Sliema", "iasi": "Iași",
-    "breda": "Breda", "paris": "Paris", "brussels": "Brussels",
+    "breda": "Breda", "amsterdam": "Amsterdam",
+    "paris": "Paris", "brussels": "Brussels",
     "brussel": "Brussel", "tunis": "Tunis", "chennai": "Chennai",
 }
 
@@ -77,7 +79,13 @@ def _fold(value: str) -> str:
     return " ".join(re.findall(r"[a-z]+", folded))
 
 
-def _country_in_text(value: str, allow_codes: bool = False) -> str:
+def normalize_country(value: str, allow_codes: bool = False) -> str:
+    """Return a canonical country found as a complete token in ``value``.
+
+    Short ISO-style aliases are opt-in because values such as ``in`` and ``us``
+    are ordinary words in unstructured prose. Structured country/location
+    fields and the query-intent parser can opt in when appropriate.
+    """
     folded = _fold(value)
     if not folded:
         return ""
@@ -89,6 +97,11 @@ def _country_in_text(value: str, allow_codes: bool = False) -> str:
         if re.search(rf"(?:^|\s){re.escape(alias)}(?:$|\s)", folded):
             return COUNTRY_ALIASES[alias]
     return ""
+
+
+def _country_in_text(value: str, allow_codes: bool = False) -> str:
+    """Backward-compatible private alias for older callers."""
+    return normalize_country(value, allow_codes=allow_codes)
 
 
 def infer_title_location(title: str = "") -> CanonicalLocationEvidence | None:

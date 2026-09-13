@@ -20,9 +20,11 @@ from uuid import uuid4
 
 from job_search.discovery import DEFAULT_QUERY_FILE, discover_jobs
 from job_search.filtering import DEFAULT_POLICY_VERSION, filter_stored_jobs
+from job_search.network import NetworkProtectionRelay, classify_network_error
 from job_search.repair_reviews import repair_review_jobs
 from job_search.review_priority import PRIORITIES, load_review_priorities
 from job_search.storage import DEFAULT_DATABASE, connect_database, utc_now
+from utils.google_search_discovery import load_queries
 
 
 DEFAULT_CONFIG = Path("config/daily_workflow.json")
@@ -53,6 +55,15 @@ class WorkflowOptions:
     include_medium: bool = False
     verbose: bool = False
     mode: str = "DEFAULT"
+    network_protection_enabled: bool = True
+    network_failure_window: int = 4
+    network_pause_threshold: int = 3
+    network_resume_successes: int = 3
+    network_probe_interval: float = 10
+    network_probe_max_interval: float = 30
+    network_max_pause_seconds: float = 600
+    network_probe_timeout: float = 3
+    resume_run_id: str | None = None
 
 
 def _json_value(value: Any) -> Any:
@@ -88,6 +99,101 @@ def _create_run(connection: sqlite3.Connection, run_id: str, options: WorkflowOp
             ),
         )
     return started_at
+
+
+def _plan_workflow_queries(connection, run_id, query_file):
+    queries = load_queries(Path(query_file))
+    now = utc_now()
+    with connection:
+        for query in queries:
+            connection.execute(
+                """INSERT OR IGNORE INTO workflow_run_queries
+                   (run_id, source_query, status, created_at, updated_at)
+                   VALUES (?, ?, 'PLANNED', ?, ?)""",
+                (run_id, query, now, now),
+            )
+    return queries
+
+
+def _query_coverage(connection, run_id):
+    rows = connection.execute(
+        """SELECT status, network_failure_count, recovered_network_failures
+           FROM workflow_run_queries WHERE run_id=?""", (run_id,),
+    ).fetchall()
+    counts = Counter(row["status"] for row in rows)
+    acceptable = counts["COMPLETED"] + counts["EXHAUSTED"]
+    planned = len(rows)
+    interrupted = counts["NETWORK_INTERRUPTED"] + counts["FAILED_RETRYABLE"]
+    incomplete = planned - acceptable
+    return {
+        "queries_planned": planned,
+        "queries_completed": acceptable,
+        "queries_interrupted": interrupted,
+        "queries_verification_blocked": counts["BLOCKED_VERIFICATION"],
+        "queries_failed": counts["FAILED"],
+        "search_coverage_complete": incomplete == 0,
+        "network_failure_count": sum(row["network_failure_count"] for row in rows),
+        "recovered_network_failures": sum(
+            row["recovered_network_failures"] for row in rows
+        ),
+        "unrecovered_network_failures": interrupted,
+    }
+
+
+def _resume_run(connection, run_id):
+    row = connection.execute(
+        "SELECT started_at FROM workflow_runs WHERE run_id=?", (run_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"workflow run not found: {run_id}")
+    with connection:
+        connection.execute(
+            """UPDATE workflow_runs SET status='RUNNING', finished_at=NULL,
+                      error_summary=NULL WHERE run_id=?""", (run_id,),
+        )
+    retryable = connection.execute(
+            """SELECT source_query, page_start_offset, pages_inspected,
+                      results_inspected, new_jobs, query_category, job_candidates,
+                      known_jobs, rejected_noise, resolution_failures,
+                      browser_resolutions, http_job_fetches, duration_seconds,
+                      network_failure_count,
+                      recovered_network_failures, network_pause_count
+               FROM workflow_run_queries
+               WHERE run_id=? AND status IN ('NETWORK_INTERRUPTED', 'FAILED_RETRYABLE')
+               ORDER BY workflow_run_query_id""", (run_id,),
+        ).fetchall()
+    queries = [item["source_query"] for item in retryable]
+    checkpoints = {item["source_query"]: dict(item) for item in retryable}
+    return row["started_at"], queries, checkpoints
+
+
+def _network_totals(connection, run_id):
+    row = connection.execute(
+        """SELECT network_pauses, network_pause_seconds, network_failures,
+                  network_recoveries, last_network_failure, last_successful_probe
+           FROM workflow_runs WHERE run_id=?""", (run_id,),
+    ).fetchone()
+    return dict(row) if row else {
+        "network_pauses": 0, "network_pause_seconds": 0.0,
+        "network_failures": 0, "network_recoveries": 0,
+        "last_network_failure": None, "last_successful_probe": None,
+    }
+
+
+def _store_network_totals(connection, run_id, totals):
+    with connection:
+        connection.execute(
+            """UPDATE workflow_runs SET network_pauses=?, network_pause_seconds=?,
+                      network_failures=?, network_recoveries=?,
+                      last_network_failure=?, last_successful_probe=?
+               WHERE run_id=?""",
+            (
+                totals["network_pauses"], totals["network_pause_seconds"],
+                totals["network_failures"], totals["network_recoveries"],
+                totals.get("last_network_failure"),
+                totals.get("last_successful_probe"), run_id,
+            ),
+        )
 
 
 def _finish_run(
@@ -142,7 +248,7 @@ def _decision_rows(
                   COALESCE(s.provider, '') AS provider,
                   COALESCE(s.source_type, 'UNKNOWN') AS source_type,
                   COALESCE(s.employer_relationship, 'UNKNOWN') AS employer_relationship,
-                  f.reasons_json, j.canonical_url AS job_url
+                  f.reasons_json, f.matched_terms_json, j.canonical_url AS job_url
            FROM workflow_run_jobs w
            JOIN jobs j ON j.job_id=w.job_id
            LEFT JOIN companies c ON c.company_id=j.company_id
@@ -164,10 +270,22 @@ def build_report(
     maps_stats: dict | None = None, discovery_stats: dict | None = None,
     completion_stats: dict | None = None,
     priority_items: Sequence | None = None,
+    network_stats: dict | None = None,
 ) -> dict:
     """Build a report using only jobs explicitly attached as NEW to this run."""
     rows = _decision_rows(connection, run_id, DEFAULT_POLICY_VERSION)
     filter_counts = Counter(row["decision"] for row in rows if row["decision"])
+    query_guard_counts = Counter()
+    for row in rows:
+        try:
+            terms = json.loads(row["matched_terms_json"] or "{}")
+            state = (terms.get("query_location_match") or ["NEUTRAL"])[0]
+        except (TypeError, json.JSONDecodeError, IndexError):
+            state = "NEUTRAL"
+        if state == "MISMATCH":
+            query_guard_counts["mismatches_rejected"] += 1
+        elif state == "UNKNOWN":
+            query_guard_counts["unknown_reviews"] += 1
     new_ids = [row["job_id"] for row in rows]
     priorities = list(priority_items) if priority_items is not None else (
         load_review_priorities(connection, DEFAULT_POLICY_VERSION, job_ids=new_ids)
@@ -205,6 +323,7 @@ def build_report(
             "SELECT discovery_state FROM workflow_run_jobs WHERE run_id=?", (run_id,)
         )
     )
+    coverage = _query_coverage(connection, run_id)
     return _json_value({
         "run": {
             "run_id": run_id, "started_at": started_at,
@@ -220,10 +339,23 @@ def build_report(
         "job_discovery": {
             "new": membership["NEW"], "known": membership["KNOWN"],
             "updated": membership["UPDATED"],
+            **coverage,
             "pipeline": discovery_stats or {},
+        },
+        "search_coverage": coverage,
+        "network": network_stats or {
+            "state": "HEALTHY", "network_pauses": 0,
+            "network_pause_seconds": 0.0,
+            "network_failures": coverage["network_failure_count"],
+            "network_recoveries": coverage["recovered_network_failures"],
+            "queries_network_interrupted": coverage["queries_interrupted"],
         },
         "completion": completion_stats or {},
         "filter_counts": {name: filter_counts[name] for name in ("PASS", "REVIEW", "REJECT")},
+        "query_intent_guard": {
+            "mismatches_rejected": query_guard_counts["mismatches_rejected"],
+            "unknown_reviews": query_guard_counts["unknown_reviews"],
+        },
         "priority_counts": {name: priority_counts[name] for name in PRIORITIES},
         "shortlist": shortlist,
     })
@@ -272,9 +404,10 @@ def run_workflow(
     discovery_runner: Callable[..., dict] = discover_jobs,
     completion_runner: Callable[..., dict] = repair_review_jobs,
     filter_runner: Callable[..., dict] = filter_stored_jobs,
+    network_relay: NetworkProtectionRelay | None = None,
 ) -> dict:
     """Execute one persistent workflow run; phase failures degrade to PARTIAL."""
-    run_id = _run_id()
+    run_id = options.resume_run_id or _run_id()
     errors: list[str] = []
     maps_stats: dict = {"new": 0}
     discovery_stats: dict = {}
@@ -290,7 +423,35 @@ def run_workflow(
             "shortlist": [],
         }
 
-    started_at = _create_run(connection, run_id, options)
+    try:
+        if options.resume_run_id:
+            started_at, resume_queries, query_checkpoints = _resume_run(connection, run_id)
+        else:
+            started_at = _create_run(connection, run_id, options)
+            resume_queries = None
+            query_checkpoints = None
+            if options.job_discovery:
+                _plan_workflow_queries(connection, run_id, options.job_query_file)
+    except (OSError, ValueError) as error:
+        connection.close()
+        return {
+            "run": {"run_id": run_id, "status": "FAILED", "mode": options.mode,
+                    "errors": [f"RESUME: {type(error).__name__}: {error}"]},
+            "company_discovery": maps_stats, "job_discovery": {},
+            "completion": {}, "filter_counts": {}, "priority_counts": {},
+            "shortlist": [],
+        }
+    relay = network_relay or NetworkProtectionRelay(
+        enabled=options.network_protection_enabled,
+        failure_window=options.network_failure_window,
+        pause_after_failures=options.network_pause_threshold,
+        resume_successes=options.network_resume_successes,
+        probe_interval=options.network_probe_interval,
+        probe_max_interval=options.network_probe_max_interval,
+        max_pause_seconds=options.network_max_pause_seconds,
+        probe_timeout=options.network_probe_timeout,
+    )
+    previous_network = _network_totals(connection, run_id)
     try:
         if options.run_maps:
             try:
@@ -298,7 +459,9 @@ def run_workflow(
             except KeyboardInterrupt:
                 raise
             except Exception as error:
-                errors.append(f"MAPS_DISCOVERY: {type(error).__name__}: {error}")
+                network_type = classify_network_error(error)
+                label = f"NETWORK/{network_type}" if network_type else type(error).__name__
+                errors.append(f"MAPS_DISCOVERY: {label}: {error}")
 
         if options.job_discovery:
             try:
@@ -307,7 +470,31 @@ def run_workflow(
                     limit=options.job_limit, delay=options.delay,
                     timeout=options.timeout, windowed=options.windowed,
                     verbose=options.verbose, recent_days=options.recent_days,
+                    workflow_run_id=run_id, selected_queries=resume_queries,
+                    network_relay=relay, query_checkpoints=query_checkpoints,
                 ) or {}
+                if not discovery_stats.get("query_execution"):
+                    # Compatibility for injected/legacy runners: a normal return
+                    # means all queries handed to that runner completed.
+                    invoked = resume_queries
+                    with connection:
+                        if invoked is None:
+                            connection.execute(
+                                """UPDATE workflow_run_queries
+                                   SET status='COMPLETED', finished_at=?, updated_at=?
+                                   WHERE run_id=? AND status IN ('PLANNED', 'RUNNING')""",
+                                (utc_now(), utc_now(), run_id),
+                            )
+                        else:
+                            for query in invoked:
+                                connection.execute(
+                                    """UPDATE workflow_run_queries
+                                       SET status='COMPLETED', finished_at=?, updated_at=?
+                                       WHERE run_id=? AND source_query=?
+                                         AND status IN ('NETWORK_INTERRUPTED', 'FAILED_RETRYABLE',
+                                                        'PLANNED', 'RUNNING')""",
+                                    (utc_now(), utc_now(), run_id, query),
+                                )
                 states = {
                     int(job_id): state
                     for job_id, state in discovery_stats.get("job_states", {}).items()
@@ -318,11 +505,19 @@ def run_workflow(
             except Exception as error:
                 errors.append(f"JOB_DISCOVERY: {type(error).__name__}: {error}")
 
+            coverage = _query_coverage(connection, run_id)
+            if not coverage["search_coverage_complete"]:
+                errors.append(
+                    "JOB_DISCOVERY_COVERAGE: "
+                    f"{coverage['queries_completed']}/{coverage['queries_planned']} "
+                    "queries completed"
+                )
+
         new_ids = _run_job_ids(connection, run_id)
         updated_ids = _run_job_ids(connection, run_id, "UPDATED")
         work_ids = new_ids + updated_ids
 
-        # Completion operates on REVIEW rows, so establish the current v1.1
+        # Completion operates on REVIEW rows, so establish the current policy
         # decision for newly discovered jobs before asking the existing
         # completion module to select from that bounded set.
         if options.hard_filter:
@@ -341,6 +536,7 @@ def run_workflow(
                     limit=options.completion_limit, job_ids=work_ids,
                     timeout=options.timeout, windowed=options.windowed,
                     verbose=options.verbose, refilter=False,
+                    network_relay=relay,
                 ) or {}
                 if completion_stats.get("failed") or completion_stats.get("blocked"):
                     errors.append(
@@ -375,9 +571,31 @@ def run_workflow(
         status = "PARTIAL" if errors else "SUCCESS"
         finished_at = _finish_run(connection, run_id, status, errors)
         try:
+            snapshot = asdict(relay.snapshot())
+            for name in (
+                "network_pauses", "network_pause_seconds", "network_failures",
+                "network_recoveries",
+            ):
+                snapshot[name] += previous_network[name]
+            snapshot["network_pause_seconds"] = round(
+                snapshot["network_pause_seconds"], 3
+            )
+            if not snapshot.get("last_network_failure"):
+                snapshot["last_network_failure"] = previous_network.get(
+                    "last_network_failure"
+                )
+            if not snapshot.get("last_successful_probe"):
+                snapshot["last_successful_probe"] = previous_network.get(
+                    "last_successful_probe"
+                )
+            _store_network_totals(connection, run_id, snapshot)
+            snapshot["queries_network_interrupted"] = _query_coverage(
+                connection, run_id
+            )["queries_interrupted"]
             report = build_report(
                 connection, run_id, options, status, started_at, finished_at, errors,
                 maps_stats, discovery_stats, completion_stats, priority_items,
+                snapshot,
             )
         except Exception as error:
             errors.append(f"DAILY_REPORT: {type(error).__name__}: {error}")
@@ -453,6 +671,17 @@ def options_from_args(args) -> WorkflowOptions:
         run_maps=bool(_option(args, config, "run_maps", False)),
         full_refilter=args.full_refilter, include_medium=args.include_medium,
         verbose=args.verbose,
+        network_protection_enabled=bool(_option(
+            args, config, "network_protection_enabled", True
+        )),
+        network_failure_window=int(_option(args, config, "network_failure_window", 4)),
+        network_pause_threshold=int(_option(args, config, "network_pause_threshold", 3)),
+        network_resume_successes=int(_option(args, config, "network_resume_successes", 3)),
+        network_probe_interval=float(_option(args, config, "network_probe_interval", 10)),
+        network_probe_max_interval=float(_option(args, config, "network_probe_max_interval", 30)),
+        network_max_pause_seconds=float(_option(args, config, "network_max_pause_seconds", 600)),
+        network_probe_timeout=float(_option(args, config, "network_probe_timeout", 3)),
+        resume_run_id=args.resume,
     )
     if args.with_maps:
         options.run_maps = True
@@ -512,6 +741,29 @@ def print_terminal_summary(report: dict) -> None:
     print(f"Status: {run.get('status', '-')}")
     print(f"New companies: {report.get('company_discovery', {}).get('new', 0)}")
     print(f"New jobs: {discovery.get('new', 0)}")
+    coverage = report.get("search_coverage", discovery)
+    print("Search coverage:")
+    print(f"  Queries planned: {coverage.get('queries_planned', 0)}")
+    print(f"  Completed: {coverage.get('queries_completed', 0)}")
+    print(f"  Network interrupted: {coverage.get('queries_interrupted', 0)}")
+    print(
+        "  Verification blocked: "
+        f"{coverage.get('queries_verification_blocked', 0)}"
+    )
+    print(
+        "  Coverage complete: "
+        f"{'yes' if coverage.get('search_coverage_complete', False) else 'no'}"
+    )
+    network = report.get("network", {})
+    print("Network:")
+    print(f"  Pauses: {network.get('network_pauses', 0)}")
+    print(f"  Total paused: {network.get('network_pause_seconds', 0):g}s")
+    print(f"  Failures: {network.get('network_failures', 0)}")
+    print(f"  Recovered: {network.get('network_recoveries', 0)}")
+    print(
+        "  Unrecovered queries: "
+        f"{network.get('queries_network_interrupted', 0)}"
+    )
     print("Filter results for NEW jobs:")
     for name in ("PASS", "REVIEW", "REJECT"):
         print(f"  {name}: {report.get('filter_counts', {}).get(name, 0)}")
@@ -533,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--maps-only", action="store_true")
     modes.add_argument("--report-only", action="store_true")
     parser.add_argument("--run-id", help="Run to display with --report-only")
+    parser.add_argument("--resume", metavar="RUN_ID", help="Resume retryable queries")
     parser.add_argument("--with-maps", action="store_true")
     parser.add_argument("--skip-maps", action="store_true")
     parser.add_argument("--skip-discovery", action="store_true")
@@ -546,6 +799,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recent-days", type=int)
     parser.add_argument("--delay", type=float)
     parser.add_argument("--timeout", type=float)
+    parser.add_argument("--network-max-pause", dest="network_max_pause_seconds", type=float)
+    parser.add_argument("--network-probe-interval", type=float)
+    parser.add_argument(
+        "--network-protection", action=argparse.BooleanOptionalAction, default=None,
+        dest="network_protection_enabled",
+    )
+    parser.add_argument(
+        "--disable-network-protection", action="store_false",
+        dest="network_protection_enabled",
+    )
     parser.add_argument("--completion-limit", type=int)
     parser.add_argument("--maps-limit", type=int)
     parser.add_argument("--maps-threads", type=int)
@@ -567,6 +830,22 @@ def _validate_values(parser: argparse.ArgumentParser, options: WorkflowOptions) 
         parser.error("--delay must be zero or greater")
     if options.timeout <= 0:
         parser.error("--timeout must be greater than zero")
+    if options.network_max_pause_seconds < 0:
+        parser.error("--network-max-pause must be zero or greater")
+    try:
+        NetworkProtectionRelay(
+            enabled=options.network_protection_enabled,
+            failure_window=options.network_failure_window,
+            pause_after_failures=options.network_pause_threshold,
+            resume_successes=options.network_resume_successes,
+            probe_interval=options.network_probe_interval,
+            probe_max_interval=options.network_probe_max_interval,
+            max_pause_seconds=options.network_max_pause_seconds,
+            probe_timeout=options.network_probe_timeout,
+            output=lambda message: None,
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
 
 def main(argv: Sequence[str] | None = None) -> int:

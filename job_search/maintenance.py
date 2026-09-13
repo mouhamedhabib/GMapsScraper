@@ -79,7 +79,11 @@ def repair_incomplete_generic_jobs(
     now = utc_now()
     try:
         for row in rows:
-            if generic_listing_reason(row["title"], row["canonical_url"], row["description"]):
+            if generic_listing_reason(
+                row["title"], row["canonical_url"], row["description"],
+                page_fetched=True,
+                has_structured_job_posting=row["status"] == "OPEN",
+            ):
                 summary["listings"] += 1
                 if verbose:
                     print(f'{row["job_id"]}: listing page; left unchanged')
