@@ -81,6 +81,7 @@ class RelayWorkflowIntegrationTests(TestCase):
         self.query_file.write_text("backend developer France\n", encoding="utf-8")
         self.options = WorkflowOptions(
             database=self.database, report_dir=self.root / "reports",
+            export_dir=self.root / "exports",
             job_query_file=self.query_file, job_limit=1, delay=0, timeout=1,
             completion=False, windowed=False,
         )

@@ -73,6 +73,33 @@ class PatternScrapperTests(TestCase):
         self.assertEqual(result["site_email"], ["info@lexa.tn"])
 
     @patch("utils.web_site_scraper.WebDriverWait", ImmediateWait)
+    def test_empty_suggested_extensions_inspect_homepage_only(self):
+        website = "https://lexa.tn/"
+        driver = FakeNavigationDriver({
+            website: '<a href="mailto:info@lexa.tn">Contact</a>',
+        })
+        scraper = PatternScrapper(verbose=False)
+
+        result = scraper.find_patterns(driver, website, [])
+
+        self.assertEqual(driver.visited, [website])
+        self.assertEqual(result["site_email"], "info@lexa.tn")
+
+    def test_missing_website_skips_navigation(self):
+        class NavigationMustNotRun:
+            @property
+            def current_window_handle(self):
+                raise AssertionError("website navigation was attempted")
+
+        scraper = PatternScrapper(verbose=False)
+        for website in ("", "   ", None, "Not Available"):
+            with self.subTest(website=website):
+                result = scraper.find_patterns(
+                    NavigationMustNotRun(), website, ["contact"],
+                )
+                self.assertEqual(result["site_email"], "Not Available")
+
+    @patch("utils.web_site_scraper.WebDriverWait", ImmediateWait)
     def test_dns_failure_skips_remaining_candidate_paths(self):
         urls = ["http://dead.test/", "http://dead.test/contact", "http://dead.test/about"]
         driver = FakeNavigationDriver({

@@ -19,6 +19,7 @@ from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 from job_search.discovery import DEFAULT_QUERY_FILE, discover_jobs
+from job_search.csv_exports import DEFAULT_EXPORT_DIRECTORY, export_jobs_run
 from job_search.filtering import DEFAULT_POLICY_VERSION, filter_stored_jobs
 from job_search.network import NetworkProtectionRelay, classify_network_error
 from job_search.repair_reviews import repair_review_jobs
@@ -35,6 +36,7 @@ DEFAULT_REPORT_DIR = Path("data/reports")
 class WorkflowOptions:
     database: Path = DEFAULT_DATABASE
     report_dir: Path = DEFAULT_REPORT_DIR
+    export_dir: Path = DEFAULT_EXPORT_DIRECTORY
     job_query_file: Path = DEFAULT_QUERY_FILE
     maps_query_file: Path = Path("queries.txt")
     maps_output_folder: Path = Path("CSV_FILES")
@@ -221,8 +223,13 @@ def _attach_jobs(
                    (run_id, job_id, discovery_state, created_at)
                    VALUES (?, ?, ?, ?)
                    ON CONFLICT(run_id, job_id) DO UPDATE SET discovery_state=
-                     CASE WHEN workflow_run_jobs.discovery_state='NEW' THEN 'NEW'
-                          ELSE excluded.discovery_state END""",
+                     CASE
+                       WHEN workflow_run_jobs.discovery_state='NEW'
+                         OR excluded.discovery_state='NEW' THEN 'NEW'
+                       WHEN workflow_run_jobs.discovery_state='UPDATED'
+                         OR excluded.discovery_state='UPDATED' THEN 'UPDATED'
+                       ELSE 'KNOWN'
+                     END""",
                 (run_id, int(job_id), state, now),
             )
 
@@ -394,6 +401,7 @@ def _maps_runner(options: WorkflowOptions) -> dict:
         threads=options.maps_threads, output_folder=options.maps_output_folder,
         browser_wait=max(1, int(options.timeout)), windowed=options.windowed,
         low_resource=True, verbose=options.verbose,
+        export_directory=options.export_dir,
     )
 
 
@@ -412,6 +420,7 @@ def run_workflow(
     maps_stats: dict = {"new": 0}
     discovery_stats: dict = {}
     completion_stats: dict = {}
+    jobs_export: dict = {}
     try:
         connection = connect_database(options.database)
     except Exception as error:
@@ -425,13 +434,20 @@ def run_workflow(
 
     try:
         if options.resume_run_id:
-            started_at, resume_queries, query_checkpoints = _resume_run(connection, run_id)
+            started_at, execution_queries, query_checkpoints = _resume_run(
+                connection, run_id
+            )
         else:
             started_at = _create_run(connection, run_id, options)
-            resume_queries = None
+            # Execute the exact immutable snapshot that was planned.  Passing
+            # ``None`` here made discovery load the file a second time and
+            # detached execution from the plan recorded for this run.
+            execution_queries = []
             query_checkpoints = None
             if options.job_discovery:
-                _plan_workflow_queries(connection, run_id, options.job_query_file)
+                execution_queries = _plan_workflow_queries(
+                    connection, run_id, options.job_query_file
+                )
     except (OSError, ValueError) as error:
         connection.close()
         return {
@@ -470,13 +486,13 @@ def run_workflow(
                     limit=options.job_limit, delay=options.delay,
                     timeout=options.timeout, windowed=options.windowed,
                     verbose=options.verbose, recent_days=options.recent_days,
-                    workflow_run_id=run_id, selected_queries=resume_queries,
+                    workflow_run_id=run_id, selected_queries=execution_queries,
                     network_relay=relay, query_checkpoints=query_checkpoints,
                 ) or {}
                 if not discovery_stats.get("query_execution"):
                     # Compatibility for injected/legacy runners: a normal return
                     # means all queries handed to that runner completed.
-                    invoked = resume_queries
+                    invoked = execution_queries
                     with connection:
                         if invoked is None:
                             connection.execute(
@@ -592,11 +608,32 @@ def run_workflow(
             snapshot["queries_network_interrupted"] = _query_coverage(
                 connection, run_id
             )["queries_interrupted"]
+            if status in {"SUCCESS", "PARTIAL"}:
+                try:
+                    jobs_export = export_jobs_run(
+                        connection, run_id, options.export_dir
+                    )
+                except Exception as error:
+                    errors.append(
+                        f"JOBS_CSV_EXPORT: {type(error).__name__}: {error}"
+                    )
+                    status = "PARTIAL"
+                    finished_at = _finish_run(
+                        connection, run_id, status, errors
+                    )
             report = build_report(
                 connection, run_id, options, status, started_at, finished_at, errors,
                 maps_stats, discovery_stats, completion_stats, priority_items,
                 snapshot,
             )
+            report["exports"] = {
+                "jobs": _json_value(jobs_export),
+                "maps": _json_value({
+                    "timestamped": maps_stats.get("csv_path", ""),
+                    "latest": maps_stats.get("csv_latest", ""),
+                    "rows": maps_stats.get("csv_rows", 0),
+                }) if options.run_maps else {},
+            }
         except Exception as error:
             errors.append(f"DAILY_REPORT: {type(error).__name__}: {error}")
             status = "PARTIAL"
@@ -611,6 +648,7 @@ def run_workflow(
                 "job_discovery": discovery_stats,
                 "completion": completion_stats, "filter_counts": {},
                 "priority_counts": {}, "shortlist": [],
+                "exports": {"jobs": _json_value(jobs_export), "maps": {}},
             })
         try:
             report_path = publish_report(options.report_dir, report, update_latest=True)
@@ -657,6 +695,9 @@ def options_from_args(args) -> WorkflowOptions:
     options = WorkflowOptions(
         database=Path(_option(args, config, "database", DEFAULT_DATABASE)),
         report_dir=Path(_option(args, config, "report_dir", DEFAULT_REPORT_DIR)),
+        export_dir=Path(_option(
+            args, config, "export_dir", DEFAULT_EXPORT_DIRECTORY
+        )),
         job_query_file=Path(_option(args, config, "job_query_file", DEFAULT_QUERY_FILE)),
         maps_query_file=Path(_option(args, config, "maps_query_file", "queries.txt")),
         maps_output_folder=Path(_option(args, config, "maps_output_folder", "CSV_FILES")),
@@ -771,6 +812,18 @@ def print_terminal_summary(report: dict) -> None:
     for name in PRIORITIES:
         print(f"  {name}: {report.get('priority_counts', {}).get(name, 0)}")
     print(f"Shortlist: {len(report.get('shortlist', []))}")
+    exports = report.get("exports", {})
+    jobs_export = exports.get("jobs", {})
+    maps_export = exports.get("maps", {})
+    print("Jobs CSV:")
+    print(f"  {jobs_export.get('timestamped') or 'not generated'}")
+    print("Latest:")
+    print(f"  {jobs_export.get('latest') or 'not generated'}")
+    print("Maps CSV:")
+    print(f"  {maps_export.get('timestamped') or 'not generated'}")
+    if maps_export:
+        print("Latest:")
+        print(f"  {maps_export.get('latest') or 'not generated'}")
     if report.get("report_path"):
         print(f"Report: {report['report_path']}")
     for error in run.get("errors", []):
@@ -792,6 +845,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--database", type=Path)
     parser.add_argument("--report-dir", type=Path)
+    parser.add_argument("--export-dir", type=Path)
     parser.add_argument("--job-query-file", type=Path)
     parser.add_argument("--maps-query-file", type=Path)
     parser.add_argument("--maps-output-folder", type=Path)

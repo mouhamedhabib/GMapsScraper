@@ -343,7 +343,7 @@ class PatternScrapper:
         patterns_data = {"site_email": "", "facebook_links": "", "twitter_links": "", "instagram_links": "",
                          "youtube_links": "", "linkedin_links": ""}
 
-        if site_url == unavailable or suggested_ext == []:
+        if not str(site_url or "").strip() or site_url == unavailable:
             for key in patterns_data.keys():
                 patterns_data[key] = unavailable
             return patterns_data

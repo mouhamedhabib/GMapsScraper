@@ -2,6 +2,7 @@
   "job_query_file": "google_queries.txt",
   "maps_query_file": "queries.txt",
   "maps_output_folder": "CSV_FILES",
+  "export_dir": "CSV_FILES/exports",
   "job_limit": 3,
   "recent_days": 14,
   "delay": 3,

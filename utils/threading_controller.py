@@ -38,6 +38,7 @@ class FastSearchAlgo:
                  scroll_minutes: int = 1,
                  incremental: bool = False,
                  low_resource: bool = False,
+                 shadow_observer=None,
                  ) -> None:
         if workers < 1:
             raise ValueError("workers must be >= 1")
@@ -61,6 +62,7 @@ class FastSearchAlgo:
         self._output_format = output_format
         self._incremental = incremental
         self._low_resource = low_resource
+        self._shadow_observer = shadow_observer
         self._known_companies = (
             KnownCompanies.from_directory(output_path) if incremental else None
         )
@@ -73,7 +75,21 @@ class FastSearchAlgo:
             "browser_instances_recreated": 0,
             "temporary_tabs_opened": 0,
             "temporary_tabs_closed": 0,
+            "search_results_found": 0,
+            "place_urls_extracted": 0,
+            "search_page_urls_rejected": 0,
+            "individual_place_urls_accepted": 0,
+            "detail_pages_opened": 0,
+            "companies_persisted": 0,
+            "maps_readiness_retries": 0,
+            "maps_verification_prompts": 0,
+            "maps_search_not_ready": 0,
+            "maps_no_results_confirmed": 0,
+            "maps_queries_completed": 0,
+            "maps_queries_blocked": 0,
         }
+        self._run_rows = []
+        self._query_states = []
 
         self._workers = workers
         self._query_list = list()
@@ -130,7 +146,19 @@ class FastSearchAlgo:
             f"{self._resource_summary['temporary_tabs_opened']}/"
             f"{self._resource_summary['temporary_tabs_closed']}"
         )
-        return dict(self._summary)
+        for name in (
+            "search_results_found", "place_urls_extracted",
+            "search_page_urls_rejected", "individual_place_urls_accepted",
+            "detail_pages_opened", "companies_persisted",
+            "maps_readiness_retries", "maps_verification_prompts",
+            "maps_search_not_ready", "maps_no_results_confirmed",
+            "maps_queries_completed", "maps_queries_blocked",
+        ):
+            print(f"{name}: {self._resource_summary[name]}")
+        return {
+            **self._summary, **self._resource_summary,
+            "query_states": [dict(item) for item in self._query_states],
+        }
 
     def _start_scrapper_threads(self, thread_id: int, query_list_range: int) -> None:
         maps_obj = GoogleMaps(unavailable_text=self._unavailable_text, headless=self._headless,
@@ -146,6 +174,8 @@ class FastSearchAlgo:
                               summary=self._summary,
                               summary_lock=self._summary_lock,
                               low_resource=self._low_resource,
+                              record_sink=self._record_run_row,
+                              shadow_observer=self._shadow_observer,
                               )
 
         # Round-robin partitioning across workers so no queries are dropped when
@@ -167,9 +197,35 @@ class FastSearchAlgo:
             with self._summary_lock:
                 for key, value in metrics.items():
                     self._resource_summary[key] += value
+                self._query_states.extend(
+                    getattr(maps_obj, "query_states", lambda: [])()
+                )
 
     @staticmethod
     def load_query_file(file_name: str):
         """Return non-empty, stripped query lines from a UTF-8 text file."""
         with open(file_name, "r", encoding="utf-8") as query_file:
             return [line.strip() for line in query_file if line.strip()]
+
+    def _record_run_row(self, row: dict) -> None:
+        with self._summary_lock:
+            self._run_rows.append(dict(row))
+
+    def run_records(self) -> list[dict]:
+        """Return this invocation's unique, durably written rows in stable order."""
+        with self._summary_lock:
+            rows = [dict(row) for row in self._run_rows]
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                str(row.get("map_link") or ""),
+                str(row.get("title") or "").casefold(),
+                str(row.get("source_query") or "").casefold(),
+            ),
+        )
+        unique = []
+        identities = KnownCompanies()
+        for row in rows:
+            if identities.check_and_add(row):
+                unique.append(row)
+        return unique

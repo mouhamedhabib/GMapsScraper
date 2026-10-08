@@ -12,7 +12,11 @@ import sqlite3
 from typing import Mapping, Sequence
 
 from job_search.filtering import DEFAULT_POLICY_VERSION
+from job_search.activity_resolution import ACTIVITY_POLICY_VERSION
+from job_search.application_destination import APPLICATION_POLICY_VERSION
+from job_search.employer_resolution import EMPLOYER_POLICY_VERSION
 from job_search.geography import normalize_geography
+from job_search.location_eligibility import LOCATION_ELIGIBILITY_POLICY_VERSION
 from job_search.network import NetworkPauseExceeded, NetworkProtectionRelay
 from job_search.normalization import normalize_job_url
 from job_search.providers import (
@@ -193,7 +197,23 @@ def _input_payload(row: Mapping, sources: Sequence[Mapping]) -> dict:
             "job_id", "canonical_url", "title", "company", "location_text",
             "country", "region", "city", "remote_policy", "job_status",
             "content_hash", "filter_status", "reasons_json", "matched_terms_json",
-            "detected_remote_policy",
+            "detected_remote_policy", "location_evidence_policy",
+            "location_eligibility_status", "resolved_work_model",
+            "resolved_remote_scope", "required_country", "required_region",
+            "required_city", "residency_requirement",
+            "work_authorization_requirement", "work_authorization_jurisdiction",
+            "visa_sponsorship", "relocation_support", "location_evidence_json",
+            "activity_evidence_policy", "resolved_activity_status",
+            "activity_authoritative_url", "activity_source_type",
+            "activity_provider", "activity_http_status",
+            "activity_evidence_method", "activity_raw_evidence_summary",
+            "activity_evidence_json",
+            "employer_evidence_policy", "resolved_employer_status",
+            "resolved_actual_employer", "employer_evidence_method",
+            "employer_raw_evidence_json",
+            "application_evidence_policy", "resolved_application_status",
+            "resolved_application_channel", "resolved_application_url",
+            "application_evidence_method", "application_evidence_json",
         )},
         "sources": [dict(source) for source in sources],
     }
@@ -248,8 +268,28 @@ def _evaluate(
             has_structured_job_posting=parsed.has_structured_job_posting,
         )
         listing = listing or fetched_listing
+    resolved_activity = _value(row, "resolved_activity_status").upper()
+    if resolved_activity in {"ACTIVE", "INACTIVE"}:
+        activity = resolved_activity
+        activity_evidence = f"resolved_activity:{_value(row, 'activity_evidence_method')}"
     employer, employer_evidence = _employer_status(row, sources, parsed)
+    resolved_employer = _value(row, "resolved_employer_status").upper()
+    if resolved_employer in {"CONFIRMED", "UNKNOWN", "CONFLICT"}:
+        employer = resolved_employer
+        employer_evidence = {
+            "status": resolved_employer,
+            "actual_employer": _value(row, "resolved_actual_employer"),
+            "method": _value(row, "employer_evidence_method"),
+            "evidence": json.loads(_value(row, "employer_raw_evidence_json") or "[]"),
+        }
     channel, application_url, selected_source = _application_destination(sources, parsed)
+    resolved_application = _value(row, "resolved_application_status").upper()
+    if resolved_application in {"CONFIRMED", "UNKNOWN", "CONFLICT", "UNAVAILABLE"}:
+        if resolved_application == "CONFIRMED":
+            channel = _value(row, "resolved_application_channel").upper() or "UNKNOWN"
+            application_url = _value(row, "resolved_application_url")
+        else:
+            channel, application_url = "UNKNOWN", ""
 
     geography = normalize_geography(
         _value(row, "location_text"), _value(row, "city"),
@@ -259,13 +299,18 @@ def _evaluate(
     normalized_region = geography.region or _value(row, "region")
     normalized_city = _value(row, "city")
     remote_status = (
+        _value(row, "resolved_work_model")
+        if _value(row, "location_eligibility_status") in {"KNOWN", "PARTIAL"}
+        else ""
+    ) or (
         _value(row, "remote_policy")
         or _value(row, "detected_remote_policy") or "UNKNOWN"
     )
     location_present = any(_value(row, name) for name in (
         "location_text", "country", "region", "city", "remote_policy",
     ))
-    location_eligible = any(code in codes for code in (
+    location_evidence_status = _value(row, "location_eligibility_status").upper()
+    location_eligible = location_evidence_status == "KNOWN" or any(code in codes for code in (
         "PASS_LOCATION_TUNISIA", "PASS_REMOTE_WORLDWIDE",
     ))
     query_mismatch = "REJECT_QUERY_LOCATION_MISMATCH" in codes
@@ -284,10 +329,16 @@ def _evaluate(
         reasons.append("QUALIFIED_ROLE_CONFIRMED")
     if employer == "CONFIRMED":
         reasons.append("QUALIFIED_EMPLOYER_CONFIRMED")
+    elif employer == "CONFLICT":
+        reasons.append("REVIEW_EMPLOYER_CONFLICT")
     else:
         reasons.append("REVIEW_EMPLOYER_UNKNOWN")
     if application_url and channel != "UNKNOWN":
         reasons.append("QUALIFIED_APPLICATION_URL")
+    elif resolved_application == "CONFLICT":
+        reasons.append("REVIEW_APPLICATION_DESTINATION_CONFLICT")
+    elif resolved_application == "UNAVAILABLE":
+        reasons.append("REVIEW_APPLICATION_DESTINATION_UNAVAILABLE")
     else:
         reasons.append("REVIEW_APPLICATION_CHANNEL_UNKNOWN")
     if location_present:
@@ -310,7 +361,24 @@ def _evaluate(
         status = "REVIEW"
     evidence = {
         "activity_evidence": activity_evidence,
+        "resolved_activity": {
+            "status": resolved_activity or "NOT_RESOLVED",
+            "authoritative_url": _value(row, "activity_authoritative_url"),
+            "source_type": _value(row, "activity_source_type") or "UNKNOWN",
+            "provider": _value(row, "activity_provider"),
+            "http_status": row["activity_http_status"],
+            "method": _value(row, "activity_evidence_method"),
+            "raw_evidence_summary": _value(row, "activity_raw_evidence_summary"),
+            "evidence": json.loads(_value(row, "activity_evidence_json") or "{}"),
+        },
         "employer_evidence": employer_evidence,
+        "resolved_application": {
+            "status": resolved_application or "NOT_RESOLVED",
+            "channel": _value(row, "resolved_application_channel") or "UNKNOWN",
+            "url": _value(row, "resolved_application_url"),
+            "method": _value(row, "application_evidence_method"),
+            "evidence": json.loads(_value(row, "application_evidence_json") or "[]"),
+        },
         "filter_status": _value(row, "filter_status"),
         "filter_reason_codes": list(codes),
         "location": {
@@ -318,6 +386,17 @@ def _evaluate(
             "region": normalized_region, "city": normalized_city,
             "remote_status": remote_status,
             "eligibility": "CONFIRMED" if location_eligible else "UNKNOWN",
+            "resolved_evidence_status": location_evidence_status or "NOT_RESOLVED",
+            "resolved_evidence": json.loads(_value(row, "location_evidence_json") or "[]"),
+            "remote_scope": _value(row, "resolved_remote_scope") or "UNKNOWN",
+            "required_country": _value(row, "required_country"),
+            "required_region": _value(row, "required_region"),
+            "required_city": _value(row, "required_city"),
+            "residency_requirement": _value(row, "residency_requirement") or "NOT_STATED",
+            "work_authorization_requirement": _value(row, "work_authorization_requirement") or "NOT_STATED",
+            "work_authorization_jurisdiction": _value(row, "work_authorization_jurisdiction"),
+            "visa_sponsorship": _value(row, "visa_sponsorship") or "NOT_STATED",
+            "relocation_support": _value(row, "relocation_support") or "NOT_STATED",
         },
         "posting_identity": "LISTING" if listing else "INDIVIDUAL",
         "sources": [dict(source) for source in sources],
@@ -378,11 +457,52 @@ def _select_rows(
                   COALESCE(c.canonical_name, '') AS company,
                   f.status AS filter_status, f.reasons_json, f.matched_terms_json,
                   f.detected_remote_policy,
+                  COALESCE(le.policy_version, '') AS location_evidence_policy,
+                  COALESCE(le.location_eligibility_status, '') AS location_eligibility_status,
+                  COALESCE(le.work_model, '') AS resolved_work_model,
+                  COALESCE(le.remote_scope, '') AS resolved_remote_scope,
+                  COALESCE(le.required_country, '') AS required_country,
+                  COALESCE(le.required_region, '') AS required_region,
+                  COALESCE(le.required_city, '') AS required_city,
+                  COALESCE(le.residency_requirement, '') AS residency_requirement,
+                  COALESCE(le.work_authorization_requirement, '') AS work_authorization_requirement,
+                  COALESCE(le.work_authorization_jurisdiction, '') AS work_authorization_jurisdiction,
+                  COALESCE(le.visa_sponsorship, '') AS visa_sponsorship,
+                  COALESCE(le.relocation_support, '') AS relocation_support,
+                  COALESCE(le.evidence_json, '') AS location_evidence_json,
+                  COALESCE(ae.policy_version, '') AS activity_evidence_policy,
+                  COALESCE(ae.activity_status, '') AS resolved_activity_status,
+                  COALESCE(ae.authoritative_url, '') AS activity_authoritative_url,
+                  COALESCE(ae.source_type, '') AS activity_source_type,
+                  COALESCE(ae.provider, '') AS activity_provider,
+                  ae.http_status AS activity_http_status,
+                  COALESCE(ae.evidence_method, '') AS activity_evidence_method,
+                  COALESCE(ae.raw_evidence_summary, '') AS activity_raw_evidence_summary,
+                  COALESCE(ae.evidence_json, '') AS activity_evidence_json,
+                  COALESCE(ee.policy_version, '') AS employer_evidence_policy,
+                  COALESCE(ee.employer_status, '') AS resolved_employer_status,
+                  COALESCE(ee.actual_employer, '') AS resolved_actual_employer,
+                  COALESCE(ee.evidence_method, '') AS employer_evidence_method,
+                  COALESCE(ee.raw_evidence_json, '') AS employer_raw_evidence_json,
+                  COALESCE(ad.policy_version, '') AS application_evidence_policy,
+                  COALESCE(ad.application_status, '') AS resolved_application_status,
+                  COALESCE(ad.application_channel, '') AS resolved_application_channel,
+                  COALESCE(ad.application_url, '') AS resolved_application_url,
+                  COALESCE(ad.evidence_method, '') AS application_evidence_method,
+                  COALESCE(ad.evidence_json, '') AS application_evidence_json,
                   COALESCE(s.provider, '') AS provider,
                   COALESCE(s.source_type, 'UNKNOWN') AS source_type,
                   COALESCE(s.employer_relationship, 'UNKNOWN') AS employer_relationship
            FROM jobs j JOIN job_filter_results f ON f.job_id=j.job_id
            LEFT JOIN companies c ON c.company_id=j.company_id
+           LEFT JOIN job_location_eligibility le
+             ON le.job_id=j.job_id AND le.policy_version='""" + LOCATION_ELIGIBILITY_POLICY_VERSION + """'
+           LEFT JOIN job_activity_evidence ae
+             ON ae.job_id=j.job_id AND ae.policy_version='""" + ACTIVITY_POLICY_VERSION + """'
+           LEFT JOIN job_employer_evidence ee
+             ON ee.job_id=j.job_id AND ee.policy_version='""" + EMPLOYER_POLICY_VERSION + """'
+           LEFT JOIN job_application_destinations ad
+             ON ad.job_id=j.job_id AND ad.policy_version='""" + APPLICATION_POLICY_VERSION + """'
            LEFT JOIN job_sources s ON s.job_source_id=(
              SELECT candidate.job_source_id FROM job_sources candidate
              WHERE candidate.job_id=j.job_id ORDER BY candidate.job_source_id LIMIT 1)
@@ -478,8 +598,13 @@ def qualify_jobs(
                 continue
 
             activity, _ = _stored_activity(row, sources)
+            if _value(row, "resolved_activity_status").upper() in {"ACTIVE", "INACTIVE"}:
+                activity = _value(row, "resolved_activity_status").upper()
             channel, _, _ = _application_destination(sources)
-            needs_fetch = activity == "UNKNOWN" or channel == "UNKNOWN"
+            has_application_resolution = bool(_value(row, "application_evidence_policy"))
+            needs_fetch = activity == "UNKNOWN" or (
+                channel == "UNKNOWN" and not has_application_resolution
+            )
             parsed = None
             verification_error = ""
             if needs_fetch:

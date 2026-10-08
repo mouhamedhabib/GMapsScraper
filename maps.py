@@ -23,25 +23,55 @@ from utils.threading_controller import FastSearchAlgo
 from argparse import ArgumentParser
 from os import R_OK, access
 from os.path import isfile
+from pathlib import Path
 import sys
+
+from job_search.csv_exports import DEFAULT_EXPORT_DIRECTORY, export_maps_rows
+from company_registry.shadow import (
+    DEFAULT_REPORT_DIRECTORY,
+    DEFAULT_SHADOW_DATABASE,
+    open_shadow_observer,
+)
 
 
 def run_maps_discovery(
     query_file="./queries.txt", limit=1, threads=1, output_folder="./CSV_FILES",
     browser_wait=15, scroll_minutes=1, windowed=False, low_resource=False,
     verbose=True,
+    export_directory=DEFAULT_EXPORT_DIRECTORY,
+    company_registry_shadow=False,
+    shadow_database=DEFAULT_SHADOW_DATABASE,
+    shadow_report_directory=DEFAULT_REPORT_DIRECTORY,
 ):
     """Run the existing Maps pipeline incrementally and return its counters."""
     queries = FastSearchAlgo.load_query_file(file_name=str(query_file))
     if not queries:
         raise ValueError(f"No usable search queries found in {query_file}")
+    shadow = open_shadow_observer(
+        company_registry_shadow, source_system="GOOGLE_MAPS",
+        database=Path(shadow_database), report_directory=Path(shadow_report_directory),
+    )
     algo = FastSearchAlgo(
         headless=not windowed, wait_time=browser_wait, output_path=str(output_folder),
         workers=min(threads, len(queries)), result_range=limit, scroll_minutes=scroll_minutes,
         verbose=verbose, output_format="CSV", incremental=True,
-        low_resource=low_resource,
+        low_resource=low_resource, shadow_observer=shadow,
     )
-    return algo.fast_search_algorithm(queries)
+    try:
+        stats = algo.fast_search_algorithm(queries)
+    finally:
+        if shadow is not None:
+            shadow.close()
+    exported = export_maps_rows(
+        getattr(algo, "run_records", lambda: [])(),
+        export_directory=export_directory,
+    )
+    stats.update({
+        "csv_path": str(exported["timestamped"]),
+        "csv_latest": str(exported["latest"]),
+        "csv_rows": exported["rows"],
+    })
+    return stats
 
 
 class GMapsScraper:
@@ -50,6 +80,7 @@ class GMapsScraper:
     def __init__(self):
         self._args = None
         self._parser = None
+        self._run_records = []
 
     def arg_parser(self):
         """Parse scraper options and store the resulting command-line namespace."""
@@ -76,7 +107,7 @@ class GMapsScraper:
                             default=15)
         parser.add_argument('-se', '--suggested-ext',
                             help='Suggested URL extensions to try (can be specified multiple times)', action='append',
-                            default=[])
+                            default=None)
         parser.add_argument('-wb', '--windowed-browser',
                             help='Disable headless mode', action='store_false',
                             default=True)
@@ -84,6 +115,10 @@ class GMapsScraper:
         parser.add_argument('-o', '--output-folder',
                             help='Output folder to store CSV details (default: ./CSV_FILES)',
                             type=str, default='./CSV_FILES')
+        parser.add_argument(
+            '--export-dir', type=str, default=str(DEFAULT_EXPORT_DIRECTORY),
+            help='Timestamped CSV export directory',
+        )
 
         parser.add_argument('-of', '--output-format',
                             help='Output format to store scraped data. '
@@ -99,6 +134,18 @@ class GMapsScraper:
                 'Use one worker and resource-conscious Chrome settings; '
                 'legacy -w behavior is unchanged without this flag'
             ),
+        )
+        parser.add_argument(
+            '--company-registry-shadow', action='store_true',
+            help='Record passive registry comparisons; legacy decisions remain authoritative',
+        )
+        parser.add_argument(
+            '--shadow-database', type=str, default=str(DEFAULT_SHADOW_DATABASE),
+            help='Initialized isolated company-registry shadow database',
+        )
+        parser.add_argument(
+            '--shadow-report-dir', type=str, default=str(DEFAULT_REPORT_DIRECTORY),
+            help='Directory for passive shadow comparison reports',
         )
 
         # Custom commands for additional help
@@ -166,6 +213,11 @@ class GMapsScraper:
             threads_limit = min(threads_limit, 1)
         limit_results = self._args.limit
 
+        shadow = open_shadow_observer(
+            self._args.company_registry_shadow, source_system="GOOGLE_MAPS",
+            database=Path(self._args.shadow_database),
+            report_directory=Path(self._args.shadow_report_dir),
+        )
         algo_obj = FastSearchAlgo(
             unavailable_text=self._args.unavailable_text,
             headless=self._args.windowed_browser,
@@ -179,12 +231,31 @@ class GMapsScraper:
             output_format=self._args.output_format,
             incremental=self._args.incremental,
             low_resource=self._args.low_resource,
+            shadow_observer=shadow,
         )
 
-        return algo_obj.fast_search_algorithm(queries_list)
+        try:
+            stats = algo_obj.fast_search_algorithm(queries_list)
+        finally:
+            if shadow is not None:
+                shadow.close()
+        self._run_records = getattr(algo_obj, "run_records", lambda: [])()
+        return stats
+
+    def export_maps_csv(self):
+        return export_maps_rows(
+            self._run_records, export_directory=self._args.export_dir,
+        )
 
 
-if __name__ == '__main__':
+def main():
     App = GMapsScraper()
     App.arg_parser()
     App.scrape_maps_data()
+    exported = App.export_maps_csv()
+    print(f"Maps CSV: {exported['timestamped']}")
+    print(f"Latest: {exported['latest']}")
+
+
+if __name__ == '__main__':
+    main()

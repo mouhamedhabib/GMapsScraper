@@ -565,6 +565,7 @@ def discover_companies(
     input_function=None,
     rebuild=False,
     incremental=False,
+    shadow_observer=None,
 ):
     """Run all queries, merge unique domains, and checkpoint after each query."""
     query_file = Path(query_file)
@@ -632,6 +633,14 @@ def discover_companies(
                             break
 
                     if not incremental:
+                        if shadow_observer is not None:
+                            for row in rows:
+                                try:
+                                    shadow_observer.observe(
+                                        dict(row), duplicate_kind="", query=query,
+                                    )
+                                except BaseException:
+                                    pass
                         discoveries = merge_accepted_discoveries(discoveries, rows)
                         atomic_write_discoveries(output_path, discoveries)
                         query_stats["inspected"] += len(rows)
@@ -649,6 +658,14 @@ def discover_companies(
                         query_stats["inspected"] += 1
                         duplicate_kind = known_companies.duplicate_kind(row)
                         if duplicate_kind:
+                            if shadow_observer is not None:
+                                try:
+                                    shadow_observer.observe(
+                                        dict(row), duplicate_kind=duplicate_kind,
+                                        query=query,
+                                    )
+                                except BaseException:
+                                    pass
                             query_stats[duplicate_kind] += 1
                             continue
                         if query_stats["new"] >= limit:
@@ -657,6 +674,14 @@ def discover_companies(
                         accepted_row["added_at"] = discovery_timestamp()
                         updated = merge_discoveries(discoveries, [accepted_row])
                         if len(updated) == len(discoveries):
+                            if shadow_observer is not None:
+                                try:
+                                    shadow_observer.observe(
+                                        dict(row), duplicate_kind="same_run",
+                                        query=query,
+                                    )
+                                except BaseException:
+                                    pass
                             query_stats["same_run"] += 1
                             known_companies.add(row)
                             continue
@@ -665,6 +690,14 @@ def discover_companies(
                         atomic_write_discoveries(output_path, updated)
                         discoveries = updated
                         known_companies.add(row)
+                        if shadow_observer is not None:
+                            try:
+                                shadow_observer.observe(
+                                    dict(row), duplicate_kind="", query=query,
+                                    observed_at=accepted_row["added_at"],
+                                )
+                            except BaseException:
+                                pass
                         query_stats["new"] += 1
                     if query_stats["new"] >= limit:
                         break
@@ -723,6 +756,18 @@ def parse_arguments():
         action="store_true",
         help="Ignore existing discoveries and rebuild the output from this run",
     )
+    parser.add_argument(
+        "--company-registry-shadow", action="store_true",
+        help="Record passive registry comparisons; CSV decisions remain authoritative",
+    )
+    parser.add_argument(
+        "--shadow-database", type=Path,
+        default=Path("data/company_registry_shadow.db"),
+    )
+    parser.add_argument(
+        "--shadow-report-dir", type=Path,
+        default=Path("data/reports/company_registry_shadow"),
+    )
     arguments = parser.parse_args()
     if arguments.limit < 0:
         parser.error("--limit must be zero or greater")
@@ -737,17 +782,28 @@ def parse_arguments():
 
 def main():
     arguments = parse_arguments()
-    discoveries = discover_companies(
-        query_file=arguments.query_file,
-        output_path=arguments.output,
-        limit=arguments.limit,
-        delay=arguments.delay,
-        timeout=arguments.timeout,
-        windowed=arguments.windowed,
-        verbose=arguments.verbose,
-        rebuild=arguments.rebuild,
-        incremental=arguments.incremental,
+    from company_registry.shadow import open_shadow_observer
+    shadow = open_shadow_observer(
+        arguments.company_registry_shadow, source_system="GOOGLE_SEARCH",
+        database=arguments.shadow_database,
+        report_directory=arguments.shadow_report_dir,
     )
+    try:
+        discoveries = discover_companies(
+            query_file=arguments.query_file,
+            output_path=arguments.output,
+            limit=arguments.limit,
+            delay=arguments.delay,
+            timeout=arguments.timeout,
+            windowed=arguments.windowed,
+            verbose=arguments.verbose,
+            rebuild=arguments.rebuild,
+            incremental=arguments.incremental,
+            shadow_observer=shadow,
+        )
+    finally:
+        if shadow is not None:
+            shadow.close()
     print(f"Unique company domains: {len(discoveries)}")
     print(f"Output: {arguments.output}")
 

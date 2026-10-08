@@ -1,6 +1,6 @@
 """Versioned SQLite schema for the job-search layer."""
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 23
 
 MIGRATION_1 = """
 CREATE TABLE IF NOT EXISTS companies (
@@ -296,4 +296,418 @@ CREATE TABLE job_qualifications (
 
 CREATE INDEX idx_job_qualifications_status
     ON job_qualifications(policy_version, qualification_status);
+"""
+
+MIGRATION_13 = """
+CREATE TABLE job_location_eligibility (
+    location_evidence_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    work_model TEXT NOT NULL
+        CHECK (work_model IN ('ONSITE', 'HYBRID', 'REMOTE', 'UNKNOWN')),
+    remote_scope TEXT NOT NULL CHECK (remote_scope IN (
+        'WORLDWIDE', 'EUROPE', 'EU', 'EEA', 'COUNTRY', 'REGION', 'CITY', 'UNKNOWN'
+    )),
+    required_country TEXT,
+    required_region TEXT,
+    required_city TEXT,
+    residency_requirement TEXT NOT NULL
+        CHECK (residency_requirement IN ('REQUIRED', 'NOT_STATED', 'UNKNOWN')),
+    work_authorization_requirement TEXT NOT NULL
+        CHECK (work_authorization_requirement IN ('REQUIRED', 'NOT_STATED', 'UNKNOWN')),
+    work_authorization_jurisdiction TEXT,
+    visa_sponsorship TEXT NOT NULL
+        CHECK (visa_sponsorship IN ('AVAILABLE', 'NOT_AVAILABLE', 'NOT_STATED', 'UNKNOWN')),
+    relocation_support TEXT NOT NULL
+        CHECK (relocation_support IN ('AVAILABLE', 'NOT_AVAILABLE', 'NOT_STATED', 'UNKNOWN')),
+    location_eligibility_status TEXT NOT NULL
+        CHECK (location_eligibility_status IN ('KNOWN', 'PARTIAL', 'UNKNOWN')),
+    evidence_json TEXT NOT NULL,
+    input_evidence_hash TEXT NOT NULL,
+    fetch_status TEXT NOT NULL,
+    fetch_error TEXT,
+    resolved_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_location_eligibility_status
+    ON job_location_eligibility(policy_version, location_eligibility_status);
+"""
+
+MIGRATION_14 = """
+CREATE TABLE job_activity_evidence (
+    activity_evidence_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    activity_status TEXT NOT NULL
+        CHECK (activity_status IN ('ACTIVE', 'INACTIVE', 'UNKNOWN')),
+    authoritative_url TEXT,
+    source_type TEXT NOT NULL CHECK (source_type IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    provider TEXT NOT NULL,
+    http_status INTEGER,
+    evidence_method TEXT NOT NULL,
+    raw_evidence_summary TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    fetch_status TEXT NOT NULL,
+    fetch_error TEXT,
+    input_fingerprint TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_activity_evidence_status
+    ON job_activity_evidence(policy_version, activity_status);
+"""
+
+MIGRATION_15 = """
+ALTER TABLE job_qualifications RENAME TO job_qualifications_v14;
+
+CREATE TABLE job_qualifications (
+    qualification_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    qualification_status TEXT NOT NULL
+        CHECK (qualification_status IN ('QUALIFIED', 'REVIEW', 'DISQUALIFIED')),
+    activity_status TEXT NOT NULL
+        CHECK (activity_status IN ('ACTIVE', 'INACTIVE', 'UNKNOWN')),
+    employer_status TEXT NOT NULL
+        CHECK (employer_status IN ('CONFIRMED', 'UNKNOWN', 'CONFLICT')),
+    application_channel TEXT NOT NULL CHECK (application_channel IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    application_url TEXT,
+    reason_codes_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    input_evidence_hash TEXT NOT NULL,
+    qualified_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+INSERT INTO job_qualifications
+SELECT * FROM job_qualifications_v14;
+DROP TABLE job_qualifications_v14;
+CREATE INDEX idx_job_qualifications_status
+    ON job_qualifications(policy_version, qualification_status);
+
+CREATE TABLE job_employer_evidence (
+    employer_evidence_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    employer_status TEXT NOT NULL
+        CHECK (employer_status IN ('CONFIRMED', 'UNKNOWN', 'CONFLICT')),
+    actual_employer TEXT,
+    source_type TEXT NOT NULL CHECK (source_type IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    employer_relationship TEXT NOT NULL CHECK (employer_relationship IN (
+        'DIRECT', 'RECRUITER', 'AGGREGATOR', 'UNKNOWN'
+    )),
+    provider TEXT NOT NULL,
+    authoritative_url TEXT,
+    evidence_method TEXT NOT NULL,
+    raw_evidence_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    fetch_result TEXT NOT NULL,
+    fetch_error TEXT,
+    resolved_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_employer_evidence_status
+    ON job_employer_evidence(policy_version, employer_status);
+"""
+
+MIGRATION_16 = """
+CREATE TABLE job_application_destinations (
+    application_destination_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    application_status TEXT NOT NULL CHECK (application_status IN (
+        'CONFIRMED', 'UNKNOWN', 'CONFLICT', 'UNAVAILABLE'
+    )),
+    application_channel TEXT NOT NULL CHECK (application_channel IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    application_url TEXT,
+    provider TEXT NOT NULL,
+    source_type TEXT NOT NULL CHECK (source_type IN (
+        'ATS', 'COMPANY_SITE', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    employer_relationship TEXT NOT NULL CHECK (employer_relationship IN (
+        'DIRECT', 'RECRUITER', 'AGGREGATOR', 'UNKNOWN'
+    )),
+    authoritative_source_url TEXT,
+    http_status INTEGER,
+    evidence_method TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    fetch_result TEXT NOT NULL,
+    fetch_error TEXT,
+    resolved_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_application_destinations_status
+    ON job_application_destinations(policy_version, application_status);
+"""
+
+MIGRATION_17 = """
+CREATE TABLE job_contact_strategies (
+    contact_strategy_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    primary_role TEXT NOT NULL,
+    secondary_roles_json TEXT NOT NULL,
+    avoid_roles_json TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK (confidence IN ('HIGH', 'MEDIUM', 'LOW')),
+    rationale TEXT NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_contact_strategies_confidence
+    ON job_contact_strategies(policy_version, confidence);
+"""
+
+MIGRATION_18 = """
+CREATE TABLE job_contact_candidates (
+    contact_candidate_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    person_key TEXT NOT NULL,
+    person_name TEXT NOT NULL,
+    current_title TEXT NOT NULL,
+    company TEXT NOT NULL,
+    target_role_category TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    source_type TEXT NOT NULL CHECK (source_type IN (
+        'JOB_POSTING', 'OFFICIAL_COMPANY', 'LINKEDIN', 'GITHUB', 'OTHER_PROFESSIONAL'
+    )),
+    relationship_to_job TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK (confidence IN ('HIGH', 'MEDIUM', 'LOW')),
+    selection_status TEXT NOT NULL CHECK (selection_status IN (
+        'SELECTED_PRIMARY', 'SELECTED_BACKUP', 'REJECTED_ROLE_MISMATCH',
+        'REJECTED_COMPANY_MISMATCH', 'REJECTED_FORMER_EMPLOYEE',
+        'REJECTED_LOW_CONFIDENCE'
+    )),
+    reason_codes_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    discovery_query TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version, person_key)
+);
+
+CREATE INDEX idx_job_contact_candidates_status
+    ON job_contact_candidates(job_id, policy_version, selection_status);
+
+CREATE TABLE job_selected_contacts (
+    selected_contact_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    discovery_status TEXT NOT NULL CHECK (discovery_status IN (
+        'CONTACTS_SELECTED', 'NO_CONFIDENT_CONTACT'
+    )),
+    primary_contact_candidate_id INTEGER REFERENCES job_contact_candidates(contact_candidate_id),
+    backup_contact_candidate_id INTEGER REFERENCES job_contact_candidates(contact_candidate_id),
+    search_queries_used INTEGER NOT NULL,
+    people_inspected INTEGER NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+"""
+
+MIGRATION_19 = """
+ALTER TABLE job_selected_contacts
+    ADD COLUMN first_party_pages_inspected INTEGER NOT NULL DEFAULT 0;
+"""
+
+MIGRATION_20 = """
+CREATE TABLE job_company_websites (
+    company_website_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('CONFIRMED', 'UNKNOWN', 'CONFLICT', 'UNAVAILABLE')),
+    company_name TEXT NOT NULL,
+    website_url TEXT,
+    canonical_domain TEXT,
+    source_url TEXT,
+    original_candidate_url TEXT,
+    final_url TEXT,
+    redirect_chain_json TEXT NOT NULL,
+    evidence_method TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    http_status INTEGER,
+    fetch_result TEXT NOT NULL,
+    fetch_error TEXT,
+    network_used INTEGER NOT NULL CHECK (network_used IN (0, 1)),
+    input_fingerprint TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_company_websites_status
+    ON job_company_websites(policy_version, status);
+"""
+
+MIGRATION_21 = """
+CREATE TABLE job_contact_outcomes (
+    contact_outcome_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'EMAIL_DISCOVERY_READY', 'APPLY_ONLY', 'CONTACT_REVIEW'
+    )),
+    primary_contact_candidate_id INTEGER,
+    backup_contact_candidate_id INTEGER,
+    application_status TEXT NOT NULL CHECK (application_status IN (
+        'CONFIRMED', 'UNKNOWN', 'CONFLICT', 'UNAVAILABLE'
+    )),
+    application_channel TEXT NOT NULL CHECK (application_channel IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    reason_codes_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_contact_outcomes_outcome
+    ON job_contact_outcomes(policy_version, outcome);
+"""
+
+MIGRATION_22 = """
+CREATE TABLE job_application_actions (
+    application_action_id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    policy_version TEXT NOT NULL,
+    application_identity TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'READY_TO_APPLY', 'APPLYING', 'APPLIED', 'FAILED', 'SKIPPED',
+        'WITHDRAWN', 'CLOSED_BEFORE_APPLY'
+    )),
+    duplicate_status TEXT NOT NULL CHECK (duplicate_status IN (
+        'NO_DUPLICATE', 'ALREADY_APPLIED', 'POSSIBLE_DUPLICATE', 'IDENTITY_CONFLICT'
+    )),
+    application_channel TEXT NOT NULL CHECK (application_channel IN (
+        'DIRECT_COMPANY', 'ATS', 'RECRUITER', 'JOB_PLATFORM', 'UNKNOWN'
+    )),
+    application_url TEXT NOT NULL,
+    canonical_application_url TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    provider_job_id TEXT,
+    contact_outcome TEXT NOT NULL CHECK (contact_outcome IN (
+        'EMAIL_DISCOVERY_READY', 'APPLY_ONLY', 'CONTACT_REVIEW'
+    )),
+    qualification_status TEXT NOT NULL CHECK (qualification_status IN (
+        'QUALIFIED', 'REVIEW', 'DISQUALIFIED'
+    )),
+    reason_codes_json TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    ready_at TEXT,
+    applied_at TEXT,
+    withdrawn_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, policy_version)
+);
+
+CREATE INDEX idx_job_application_actions_identity
+    ON job_application_actions(policy_version, application_identity);
+CREATE INDEX idx_job_application_actions_state
+    ON job_application_actions(policy_version, state, duplicate_status);
+CREATE INDEX idx_job_application_actions_url
+    ON job_application_actions(policy_version, canonical_application_url);
+CREATE INDEX idx_job_application_actions_provider_job
+    ON job_application_actions(policy_version, provider, provider_job_id);
+
+CREATE TABLE job_application_events (
+    application_event_id INTEGER PRIMARY KEY,
+    application_action_id INTEGER NOT NULL
+        REFERENCES job_application_actions(application_action_id) ON DELETE CASCADE,
+    job_id INTEGER NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    old_state TEXT,
+    new_state TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_job_application_events_action
+    ON job_application_events(application_action_id, application_event_id);
+"""
+
+MIGRATION_23 = """
+CREATE TABLE query_strategy_runs (
+    strategy_run_id INTEGER PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    source_run_scope TEXT NOT NULL,
+    input_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    UNIQUE (policy_version, input_fingerprint)
+);
+
+CREATE TABLE query_strategy_recommendations (
+    strategy_recommendation_id INTEGER PRIMARY KEY,
+    strategy_run_id INTEGER NOT NULL
+        REFERENCES query_strategy_runs(strategy_run_id) ON DELETE CASCADE,
+    query TEXT NOT NULL,
+    recommendation TEXT NOT NULL CHECK (recommendation IN (
+        'KEEP', 'EXPAND', 'REVIEW', 'RETIRE_CANDIDATE'
+    )),
+    evidence_maturity TEXT NOT NULL CHECK (evidence_maturity IN (
+        'INSUFFICIENT', 'EARLY', 'MATURE'
+    )),
+    reason_codes_json TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    dimensions_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (strategy_run_id, query)
+);
+
+CREATE TABLE query_strategy_proposals (
+    strategy_proposal_id INTEGER PRIMARY KEY,
+    strategy_run_id INTEGER NOT NULL
+        REFERENCES query_strategy_runs(strategy_run_id) ON DELETE CASCADE,
+    query TEXT NOT NULL,
+    parent_query TEXT NOT NULL,
+    proposal_rank INTEGER NOT NULL,
+    reason_codes_json TEXT NOT NULL,
+    dimensions_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (strategy_run_id, query),
+    UNIQUE (strategy_run_id, proposal_rank)
+);
+
+CREATE INDEX idx_query_strategy_recommendations_result
+    ON query_strategy_recommendations(strategy_run_id, recommendation, evidence_maturity);
 """

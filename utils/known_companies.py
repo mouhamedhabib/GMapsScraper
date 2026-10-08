@@ -12,17 +12,19 @@ except ModuleNotFoundError:  # Support direct execution from the utils directory
 
 
 def identities_for(row):
-    """Return conservative identities found in either raw or master schemas."""
+    """Return identities in authoritative-to-fallback precedence order."""
     maps_identities = maps_identities_for(row)
     domain = website_domain(
         row.get("webpage") or row.get("website") or row.get("source_url")
     )
     name = normalize_name(row.get("title") or row.get("company_name") or row.get("name"))
     phone = normalize_phone(row.get("phone_number") or row.get("phone"))
+    address = normalize_name(row.get("address") or row.get("location"))
     return {
         "place_id": maps_identities["place_id"],
         "place_url": maps_identities["place_url"],
         "domain": domain,
+        "name_address": (name, address) if name and address else None,
         "name_phone": (name, phone) if name and phone else None,
     }
 
@@ -34,6 +36,7 @@ class KnownCompanies:
         self.known_domains = set()
         self.known_place_urls = set()
         self.known_place_ids = set()
+        self.known_name_addresses = set()
         self.known_name_phones = set()
         self._startup_identities = set()
         self._lock = Lock()
@@ -56,6 +59,7 @@ class KnownCompanies:
             {("place_id", value) for value in self.known_place_ids}
             | {("place_url", value) for value in self.known_place_urls}
             | {("domain", value) for value in self.known_domains}
+            | {("name_address", value) for value in self.known_name_addresses}
             | {("name_phone", value) for value in self.known_name_phones}
         )
 
@@ -82,16 +86,24 @@ class KnownCompanies:
             return count
         return count
 
+    def _matching_token_unlocked(self, identities):
+        """Use the strongest identity present; weaker values are fallbacks."""
+        sets = {
+            "place_id": self.known_place_ids,
+            "place_url": self.known_place_urls,
+            "domain": self.known_domains,
+            "name_address": self.known_name_addresses,
+            "name_phone": self.known_name_phones,
+        }
+        for kind in ("place_id", "place_url", "domain", "name_address", "name_phone"):
+            value = identities[kind]
+            if value:
+                token = (kind, value)
+                return token if value in sets[kind] else None
+        return None
+
     def _matches_unlocked(self, identities):
-        return bool(
-            (identities["place_id"] and identities["place_id"] in self.known_place_ids)
-            or (identities["place_url"] and identities["place_url"] in self.known_place_urls)
-            or (identities["domain"] and identities["domain"] in self.known_domains)
-            or (
-                identities["name_phone"]
-                and identities["name_phone"] in self.known_name_phones
-            )
-        )
+        return self._matching_token_unlocked(identities) is not None
 
     def contains(self, row):
         identities = identities_for(row)
@@ -102,10 +114,10 @@ class KnownCompanies:
         """Return ``known``, ``same_run``, or an empty string."""
         identities = identities_for(row)
         with self._lock:
-            matched = self._tokens(identities) & self._identity_tokens()
-            if not matched:
+            matched = self._matching_token_unlocked(identities)
+            if matched is None:
                 return ""
-            return "known" if matched & self._startup_identities else "same_run"
+            return "known" if matched in self._startup_identities else "same_run"
 
     def check_and_add(self, row):
         """Atomically reject a duplicate or reserve a new same-run identity."""
@@ -131,6 +143,8 @@ class KnownCompanies:
                 self.known_place_urls.discard(identities["place_url"])
             if identities["domain"]:
                 self.known_domains.discard(identities["domain"])
+            if identities["name_address"]:
+                self.known_name_addresses.discard(identities["name_address"])
             if identities["name_phone"]:
                 self.known_name_phones.discard(identities["name_phone"])
 
@@ -141,6 +155,8 @@ class KnownCompanies:
             self.known_place_urls.add(identities["place_url"])
         if identities["domain"]:
             self.known_domains.add(identities["domain"])
+        if identities["name_address"]:
+            self.known_name_addresses.add(identities["name_address"])
         if identities["name_phone"]:
             self.known_name_phones.add(identities["name_phone"])
 

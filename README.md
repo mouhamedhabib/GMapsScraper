@@ -389,6 +389,30 @@ Display the latest report without web requests, browser startup, or job writes:
 .venv/bin/python -m job_search.daily_workflow --report-only
 ```
 
+### Automatic run CSV exports
+
+Successful and partial Daily Workflow runs automatically write run-scoped CSVs
+under `CSV_FILES/exports/`. Jobs are selected exclusively through
+`workflow_run_jobs`, ordered by `job_id`, and include `NEW`, `KNOWN`, and
+`UPDATED` observations for that run. A successful run with no observed jobs
+writes a header-only CSV. Failed and diagnostic runs do not publish exports.
+
+Filenames use Africa/Tunis local time and UTF-8 with BOM for Excel compatibility:
+
+- `google_jobs_YYYY-MM-DD_HH-MM-SS.csv` and `google_jobs_latest.csv`
+- `google_maps_YYYY-MM-DD_HH-MM-SS.csv` and `google_maps_latest.csv`
+
+The timestamped file is completed before its corresponding `latest` file is
+atomically replaced. Direct `python -m job_search.discovery` and `python maps.py`
+runs publish the same exports automatically; `--export-dir` overrides the
+default directory.
+
+Maps currently has no persistent run-membership table. Its per-run CSV therefore
+contains only records durably produced by that invocation, captured at the Maps
+writer boundary in deterministic map-link/title/query order. In incremental
+mode, historical companies that are recognized and skipped are not repeated in
+the run CSV.
+
 Use `--report-only --run-id <run_id>` for a specific run. A failed optional
 phase is recorded and the workflow continues safely as PARTIAL; individual
 completion failures are already isolated by the completion module. Ctrl+C marks
@@ -496,6 +520,48 @@ repair provenance:
   --database data/job_search.db \
   --job-id 81 --job-id 142 --job-id 245 --job-id 248 --verbose
 ```
+
+Location eligibility evidence can be resolved independently from job-centric
+English/French posting text and structured job fields. It records work model,
+remote scope, workplace/residency jurisdiction, work-authorization wording,
+visa sponsorship, relocation support, and raw provenance. `NOT_STATED` means
+the posting was silent; it is never treated as a negative statement. The
+resolver never reads or decides candidate eligibility:
+
+```bash
+.venv/bin/python -m job_search.location_eligibility \
+  --database data/job_search.db \
+  --job-id 80 --job-id 81 --job-id 109 --job-id 142 --job-id 248 \
+  --timeout 15 --verbose
+```
+
+Stored evidence is preferred. When location evidence is incomplete, the
+resolver makes at most one protected HTTP request to the existing safe posting
+URL. It neither searches nor crawls, and browser fallback is opt-in with
+`--browser-fallback`. Re-running unchanged evidence reuses the persisted
+fingerprint. A subsequent qualification run consumes only `KNOWN` resolved
+location evidence; `PARTIAL` and `UNKNOWN` remain review-safe.
+
+Activity evidence can then resolve an unknown posting state from the strongest
+persisted authoritative source. Official company sources outrank ATS sources,
+which outrank recruiter, job-platform, and unknown sources. Successful
+job-specific provider state or a loaded authoritative individual posting is
+`ACTIVE`; explicit closure and authoritative HTTP 404/410 are `INACTIVE`.
+Protection pages, timeouts, DNS/connection failures, 5xx responses, ambiguous
+redirects, and listing pages remain `UNKNOWN`:
+
+```bash
+.venv/bin/python -m job_search.activity_resolution \
+  --database data/job_search.db \
+  --job-id 81 --job-id 142 --timeout 15 --verbose
+```
+
+The resolver never searches for another URL. It performs at most one bounded
+HTTP fetch against an existing safe URL, uses the network protection relay, and
+only uses a browser when `--browser-fallback` is explicitly supplied. Results
+and provenance are fingerprinted in `job_activity_evidence`; Qualification
+consumes resolved `ACTIVE` and `INACTIVE` states without changing its other
+requirements.
 
 ### Docker
 

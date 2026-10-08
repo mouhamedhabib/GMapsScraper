@@ -8,7 +8,9 @@ from urllib.parse import urlsplit
 from job_search.schema import (
     MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATION_5, MIGRATION_6,
     MIGRATION_7, MIGRATION_8, MIGRATION_9, MIGRATION_10, MIGRATION_11,
-    MIGRATION_12,
+    MIGRATION_12, MIGRATION_13, MIGRATION_14, MIGRATION_15, MIGRATION_16,
+    MIGRATION_17, MIGRATION_18, MIGRATION_19, MIGRATION_20, MIGRATION_21,
+    MIGRATION_22, MIGRATION_23,
     SCHEMA_VERSION,
 )
 from job_search.providers import classify_source_context
@@ -43,6 +45,17 @@ def initialize_schema(connection):
         (8, MIGRATION_8), (9, MIGRATION_9), (10, MIGRATION_10),
         (11, MIGRATION_11),
         (12, MIGRATION_12),
+        (13, MIGRATION_13),
+        (14, MIGRATION_14),
+        (15, MIGRATION_15),
+        (16, MIGRATION_16),
+        (17, MIGRATION_17),
+        (18, MIGRATION_18),
+        (19, MIGRATION_19),
+        (20, MIGRATION_20),
+        (21, MIGRATION_21),
+        (22, MIGRATION_22),
+        (23, MIGRATION_23),
     )
     for migration_version, script in migrations:
         if version < migration_version:

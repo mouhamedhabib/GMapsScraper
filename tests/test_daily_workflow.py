@@ -7,12 +7,13 @@ from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from job_search.daily_workflow import (
-    WorkflowOptions, load_report_only, publish_report, run_workflow,
+    WorkflowOptions, load_queries, load_report_only, publish_report, run_workflow,
     validate_dry_run,
 )
+from job_search.csv_exports import export_jobs_run
 from job_search.filtering import DEFAULT_POLICY_VERSION, persist_result, FilterDecision, Reason
 from job_search.providers import ParsedJob
 from job_search.storage import connect_database, upsert_job
@@ -42,6 +43,7 @@ class DailyWorkflowTests(TestCase):
         self.queries.write_text("backend engineer remote\n", encoding="utf-8")
         self.options = WorkflowOptions(
             database=self.database, report_dir=self.reports,
+            export_dir=self.root / "exports",
             job_query_file=self.queries, job_limit=1, delay=0,
             timeout=1, windowed=False, completion_limit=2,
             completion=False,
@@ -69,12 +71,72 @@ class DailyWorkflowTests(TestCase):
         )
         self.assertEqual(report["run"]["status"], "SUCCESS")
         self.assertEqual(report["job_discovery"]["new"], 1)
+        self.assertTrue(Path(report["exports"]["jobs"]["timestamped"]).is_file())
+        self.assertEqual(report["exports"]["maps"], {})
         connection = connect_database(self.database)
         try:
             run = connection.execute("SELECT * FROM workflow_runs").fetchone()
             membership = connection.execute("SELECT * FROM workflow_run_jobs").fetchone()
             self.assertEqual(run["status"], "SUCCESS")
             self.assertEqual(membership["discovery_state"], "NEW")
+        finally:
+            connection.close()
+
+    def test_discovery_is_called_once_with_the_once_loaded_query_plan(self):
+        self.queries.write_text("first query\nsecond query\n", encoding="utf-8")
+        discovery = Mock(return_value={})
+
+        with patch(
+            "job_search.daily_workflow.load_queries",
+            wraps=load_queries,
+        ) as loader:
+            report = run_workflow(self.options, discovery_runner=discovery)
+
+        self.assertEqual(report["run"]["status"], "SUCCESS")
+        loader.assert_called_once_with(self.queries)
+        discovery.assert_called_once()
+        self.assertEqual(
+            discovery.call_args.kwargs["selected_queries"],
+            ["first query", "second query"],
+        )
+
+    def test_daily_discovery_and_export_reuse_the_same_run_id(self):
+        discovery_run_ids = []
+        export_run_ids = []
+
+        def discovery(**kwargs):
+            discovery_run_ids.append(kwargs["workflow_run_id"])
+            connection = connect_database(kwargs["database"])
+            try:
+                job_id, _ = upsert_job(
+                    connection, parsed("https://example.test/jobs/same-run"), "query"
+                )
+            finally:
+                connection.close()
+            return {"new": 1, "known": 0, "job_states": {job_id: "NEW"}}
+
+        def audited_export(connection, run_id, export_directory):
+            export_run_ids.append(run_id)
+            membership = connection.execute(
+                "SELECT discovery_state FROM workflow_run_jobs WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+            self.assertEqual([row["discovery_state"] for row in membership], ["NEW"])
+            return export_jobs_run(connection, run_id, export_directory)
+
+        with patch(
+            "job_search.daily_workflow.export_jobs_run", side_effect=audited_export
+        ):
+            report = run_workflow(self.options, discovery_runner=discovery)
+
+        self.assertEqual(discovery_run_ids, [report["run"]["run_id"]])
+        self.assertEqual(export_run_ids, discovery_run_ids)
+        connection = connect_database(self.database)
+        try:
+            self.assertEqual(
+                connection.execute("SELECT count(*) FROM workflow_runs").fetchone()[0],
+                1,
+            )
         finally:
             connection.close()
 
@@ -212,6 +274,7 @@ class DailyWorkflowTests(TestCase):
             completion_runner=one_failed,
         )
         self.assertEqual(report["run"]["status"], "PARTIAL")
+        self.assertTrue(Path(report["exports"]["jobs"]["timestamped"]).is_file())
         self.assertEqual(report["job_discovery"]["new"], 1)
         self.assertTrue((self.reports / "latest.json").exists())
 
@@ -233,6 +296,7 @@ class DailyWorkflowTests(TestCase):
         with patch("job_search.daily_workflow.connect_database", side_effect=sqlite3.Error("no db")):
             report = run_workflow(self.options)
         self.assertEqual(report["run"]["status"], "FAILED")
+        self.assertFalse(self.options.export_dir.exists())
 
     def test_dry_run_does_not_create_database_or_reports(self):
         result = validate_dry_run(self.options)

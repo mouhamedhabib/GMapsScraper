@@ -1,37 +1,6 @@
-# Tunisia
-junior software developer Tunisia
-backend developer Tunisia
-full stack developer Tunisia
-développeur backend junior Tunisia
-développeur full stack junior Tunisia
-
-# France
-junior software developer France
-backend developer France
-full stack developer France
-développeur backend junior France
-développeur full stack junior France
-
-# Belgium
-software developer Belgium
-backend developer Belgium
-
-# Switzerland
-software developer Switzerland
-backend developer Switzerland
-
-# Remote Europe
-junior software engineer remote Europe
-backend developer remote Europe
-full stack developer remote Europe
-
-# Tech
-NestJS developer France
-FastAPI developer France
-Laravel developer France
-React developer France
-
-# ATS
-site:job-boards.greenhouse.io software engineer France
-site:jobs.lever.co backend developer Europe
-site:jobs.ashbyhq.com software engineer Europe
+junior software developer Sfax Tunisia
+backend developer Sfax Tunisia
+full stack developer Sfax Tunisia
+software developer Malta
+backend developer Malta
+full stack developer Malta

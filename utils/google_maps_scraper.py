@@ -36,9 +36,40 @@ from platform import system as platform_system
 from time import time, sleep
 from random import uniform
 from os import makedirs
+from enum import Enum
 import re
-from utils.known_companies import KnownCompanies
+from urllib.parse import parse_qs, urlsplit
+from utils.known_companies import KnownCompanies, identities_for
 from utils.discovery_timestamps import discovery_timestamp
+from job_search.network import (
+    NetworkPauseExceeded, NetworkProtectionRelay, TargetSiteNetworkError,
+    classify_network_error,
+)
+
+
+class MapsReadiness(str, Enum):
+    READY_RESULTS = "READY_RESULTS"
+    NO_RESULTS_CONFIRMED = "NO_RESULTS_CONFIRMED"
+    VERIFICATION_REQUIRED = "VERIFICATION_REQUIRED"
+    CONSENT_REQUIRED = "CONSENT_REQUIRED"
+    SEARCH_PAGE_NOT_READY = "SEARCH_PAGE_NOT_READY"
+    NETWORK_DEGRADED = "NETWORK_DEGRADED"
+    TIMEOUT = "TIMEOUT"
+
+
+class MapsQueryState(str, Enum):
+    COMPLETED = "COMPLETED"
+    NO_RESULTS = "NO_RESULTS"
+    VERIFICATION_ABORTED = "VERIFICATION_ABORTED"
+    NETWORK_INTERRUPTED = "NETWORK_INTERRUPTED"
+    SEARCH_TIMEOUT = "SEARCH_TIMEOUT"
+    FAILED = "FAILED"
+
+
+class MapsManualAbort(RuntimeError):
+    def __init__(self, terminal_state: MapsQueryState):
+        super().__init__(terminal_state.value)
+        self.terminal_state = terminal_state
 
 
 class GoogleMaps:
@@ -124,6 +155,11 @@ class GoogleMaps:
     # hl=en forces the English UI so the aria-label/text-based selectors used below
     # (hours, about, cover photo, price) resolve regardless of the visitor's region.
     _maps_url = "https://www.google.com/maps?hl=en"
+    _result_anchor_selector = (
+        "div[role='feed'] a[href*='/maps/'], "
+        "a[href*='/maps/place/'], "
+        "a.hfpxzc[href*='/maps/']"
+    )
     _finger_print_defender_ext = "./extensions/finger_print_defender.crx"
 
     def __init__(self, unavailable_text: str = "Not Available", output_format: str = "CSV",
@@ -138,6 +174,12 @@ class GoogleMaps:
                  summary: dict = None,
                  summary_lock: Lock = None,
                  low_resource: bool = False,
+                 record_sink=None,
+                 network_relay=None,
+                 input_function=None,
+                 readiness_delays=(5, 10, 15),
+                 sleep_function=None,
+                 shadow_observer=None,
                  ) -> None:
         """
         Initialize the GoogleMaps scraper instance.
@@ -182,11 +224,33 @@ class GoogleMaps:
         )
         self._pending_identity = None
         self._low_resource = low_resource
+        self._record_sink = record_sink
+        self._network_relay = network_relay or NetworkProtectionRelay(enabled=True)
+        self._input_function = input_function or input
+        self._readiness_delays = tuple(readiness_delays)
+        self._sleep_function = sleep_function or sleep
+        self._shadow_observer = shadow_observer
         self._driver = None
         self._browser_instances_created = 0
         self._browser_instances_recreated = 0
         self._maps_tabs_opened = 0
         self._maps_tabs_closed = 0
+        self._collection_counters = {
+            "search_results_found": 0,
+            "place_urls_extracted": 0,
+            "search_page_urls_rejected": 0,
+            "individual_place_urls_accepted": 0,
+            "detail_pages_opened": 0,
+            "companies_persisted": 0,
+            "maps_readiness_retries": 0,
+            "maps_verification_prompts": 0,
+            "maps_search_not_ready": 0,
+            "maps_no_results_confirmed": 0,
+            "maps_queries_completed": 0,
+            "maps_queries_blocked": 0,
+        }
+
+        self._query_states = []
 
         self._web_pattern_scraper = PatternScrapper(wait_time=self._wait_time, verbose=self._verbose)
         if self.__output_format.lower() == "json":
@@ -201,6 +265,17 @@ class GoogleMaps:
 
         # Create a path if not available
         self.is_path_available()
+
+    def _observe_shadow(self, row, duplicate_kind="", query=""):
+        """Submit passive telemetry without ever affecting scraper behavior."""
+        if self._shadow_observer is None:
+            return None
+        try:
+            return self._shadow_observer.observe(
+                dict(row), duplicate_kind=duplicate_kind, query=query,
+            )
+        except BaseException:
+            return None
 
     def is_path_available(self) -> None:
         """
@@ -273,7 +348,6 @@ class GoogleMaps:
         ):
             options.add_argument(argument)
         options.add_experimental_option("prefs", {
-            "profile.managed_default_content_settings.images": 2,
             "profile.default_content_setting_values.notifications": 2,
         })
 
@@ -323,7 +397,12 @@ class GoogleMaps:
                 self._maps_tabs_closed
                 + self._web_pattern_scraper.temporary_tabs_closed
             ),
+            **self._collection_counters,
         }
+
+    def query_states(self) -> list[dict]:
+        """Return terminal state records for queries handled by this worker."""
+        return [dict(item) for item in self._query_states]
 
     def close_extra_tabs(self, driver) -> None:
         """Close every non-Maps handle and restore the Maps window."""
@@ -377,10 +456,15 @@ class GoogleMaps:
         """
 
         if result != "continue":
-            get_link = result.get_attribute("href")
+            get_link = self._result_url(result)
+            if not self.is_individual_place_url(get_link):
+                if self.is_search_page_url(get_link):
+                    self._collection_counters["search_page_urls_rejected"] += 1
+                raise ValueError(f"not an individual Google Maps place URL: {get_link}")
             # Pass the href as an argument so a URL containing quotes can't break the script.
             driver.execute_script('window.open(arguments[0], "_blank");', get_link)
             self._maps_tabs_opened += 1
+            self._collection_counters["detail_pages_opened"] += 1
             driver.switch_to.window(driver.window_handles[-1])
         else:
             get_link = None
@@ -398,6 +482,197 @@ class GoogleMaps:
             get_link = driver.current_url
 
         return lat_lng[0], lat_lng[1], get_link
+
+    @staticmethod
+    def _result_url(result) -> str:
+        if isinstance(result, str):
+            return result.strip()
+        return str(result.get_attribute("href") or "").strip()
+
+    @staticmethod
+    def is_search_page_url(value: str) -> bool:
+        path = urlsplit(str(value or "")).path.casefold()
+        return "/maps/search/" in path
+
+    @staticmethod
+    def is_individual_place_url(value: str) -> bool:
+        """Accept individual place links while rejecting result/search pages."""
+        parsed = urlsplit(str(value or "").strip())
+        path = parsed.path.casefold()
+        if "/maps/search/" in path:
+            return False
+        if "/maps/place/" in path:
+            return True
+        if "/maps" not in path:
+            return False
+        query = parse_qs(parsed.query)
+        return any(query.get(key) for key in ("cid", "place_id", "query_place_id"))
+
+    def _result_anchors(self, driver) -> list:
+        return driver.find_elements(By.CSS_SELECTOR, self._result_anchor_selector)
+
+    @staticmethod
+    def _safe_find_elements(driver, selector: str) -> list:
+        try:
+            return list(driver.find_elements(By.CSS_SELECTOR, selector))
+        except Exception:
+            return []
+
+    def _visible_page_text(self, driver) -> str:
+        bodies = self._safe_find_elements(driver, "body")
+        visible = " ".join(str(getattr(body, "text", "") or "") for body in bodies)
+        if visible.strip():
+            return visible.casefold()
+        # Browser mocks and Chrome error pages do not always expose a body
+        # element. This fallback is used only for explicit, conservative markers.
+        try:
+            return str(driver.page_source or "").casefold()
+        except Exception:
+            return ""
+
+    def classify_maps_readiness(self, driver) -> MapsReadiness:
+        """Classify rendered Maps evidence without equating missing cards to zero results."""
+        current_url = str(getattr(driver, "current_url", "") or "")
+        parsed = urlsplit(current_url)
+        page_text = self._visible_page_text(driver)
+        combined = f"{current_url.casefold()} {page_text}"
+
+        if (
+            parsed.scheme.casefold() == "chrome-error"
+            or "site can't be reached" in page_text
+            or "site cannot be reached" in page_text
+            or classify_network_error(RuntimeError(combined)) is not None
+        ):
+            return MapsReadiness.NETWORK_DEGRADED
+
+        host = (parsed.hostname or "").casefold()
+        if "consent.google." in host or any(marker in page_text for marker in (
+            "before you continue to google", "we use cookies and data",
+            "accept all cookies", "reject all cookies",
+        )):
+            return MapsReadiness.CONSENT_REQUIRED
+
+        if parsed.path.casefold().startswith("/sorry") or any(
+            marker in page_text for marker in (
+                "our systems have detected unusual traffic",
+                "unusual traffic from your computer network",
+                "verify you're not a robot", "verify you are not a robot",
+                "complete the captcha", "recaptcha",
+                "automated queries", "verify it's you",
+                "sign in to continue to google maps",
+            )
+        ):
+            return MapsReadiness.VERIFICATION_REQUIRED
+
+        if any(marker in page_text for marker in (
+            "no results found", "no results for", "google maps can't find",
+            "google maps cannot find", "couldn't find any results",
+            "could not find any results",
+        )):
+            return MapsReadiness.NO_RESULTS_CONFIRMED
+
+        if self.is_individual_place_url(current_url):
+            return MapsReadiness.READY_RESULTS
+
+        anchors = self._safe_find_elements(driver, self._result_anchor_selector)
+        if any(self.is_individual_place_url(self._result_url(anchor)) for anchor in anchors):
+            return MapsReadiness.READY_RESULTS
+        if self._safe_find_elements(driver, "div[role='feed']"):
+            return MapsReadiness.READY_RESULTS
+        return MapsReadiness.SEARCH_PAGE_NOT_READY
+
+    def _prompt_for_manual_maps_action(self, query: str, *, consent: bool) -> bool:
+        if self._headless:
+            label = "consent" if consent else "verification"
+            print(f"[!] Google Maps {label} requires --windowed-browser.")
+            return False
+        if consent:
+            print("[!] Google Maps consent action required.")
+            print("[!] Complete the consent/interstitial in the Chrome window.")
+        else:
+            self._collection_counters["maps_verification_prompts"] += 1
+            print("[!] Google Maps verification required.")
+            print("[!] Solve it manually in the Chrome window.")
+        print("[!] When Maps results are visible, return here and press ENTER.")
+        print("[!] Type q then ENTER to abort safely.")
+        while True:
+            try:
+                choice = self._input_function(
+                    f"Press ENTER to resume {query!r}, or q to quit: "
+                ).strip().casefold()
+            except (EOFError, KeyboardInterrupt):
+                return False
+            if choice == "q":
+                return False
+            if not choice:
+                return True
+            print("[!] Type q to quit, or press ENTER after completing the action.")
+
+    def _reload_after_network_failure(self, driver) -> None:
+        driver.refresh()
+        if self.classify_maps_readiness(driver) == MapsReadiness.NETWORK_DEGRADED:
+            raise ConnectionError("ERR_INTERNET_DISCONNECTED: Maps remains unavailable")
+
+    def wait_for_maps_readiness(self, driver, query: str) -> MapsReadiness:
+        """Wait through bounded not-ready states, resuming only the current query."""
+        retry_index = 0
+        while not self._stop_event.is_set():
+            state = self.classify_maps_readiness(driver)
+            if state in {MapsReadiness.READY_RESULTS, MapsReadiness.NO_RESULTS_CONFIRMED}:
+                return state
+            if state == MapsReadiness.VERIFICATION_REQUIRED:
+                if not self._prompt_for_manual_maps_action(query, consent=False):
+                    self._stop_event.set()
+                    raise MapsManualAbort(MapsQueryState.VERIFICATION_ABORTED)
+                continue
+            if state == MapsReadiness.CONSENT_REQUIRED:
+                if not self._prompt_for_manual_maps_action(query, consent=True):
+                    self._stop_event.set()
+                    raise MapsManualAbort(MapsQueryState.FAILED)
+                continue
+            if state == MapsReadiness.NETWORK_DEGRADED:
+                try:
+                    self._network_relay.protect(
+                        lambda: self._reload_after_network_failure(driver),
+                        context=f"Google Maps query {query}",
+                    )
+                except (NetworkPauseExceeded, TargetSiteNetworkError) as error:
+                    raise MapsManualAbort(MapsQueryState.NETWORK_INTERRUPTED) from error
+                except Exception as error:
+                    if classify_network_error(error):
+                        raise MapsManualAbort(MapsQueryState.NETWORK_INTERRUPTED) from error
+                    raise
+                continue
+
+            self._collection_counters["maps_search_not_ready"] += 1
+            if retry_index >= len(self._readiness_delays):
+                current_url = str(getattr(driver, "current_url", "") or "")
+                if self.is_search_page_url(current_url):
+                    self._collection_counters["search_page_urls_rejected"] += 1
+                return MapsReadiness.TIMEOUT
+            delay = self._readiness_delays[retry_index]
+            retry_index += 1
+            self._collection_counters["maps_readiness_retries"] += 1
+            self._sleep_function(delay)
+        return MapsReadiness.TIMEOUT
+
+    def _collect_place_urls(self, anchors, seen_urls: set[str]) -> list[str]:
+        accepted = []
+        for anchor in anchors:
+            url = self._result_url(anchor)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            self._collection_counters["search_results_found"] += 1
+            self._collection_counters["place_urls_extracted"] += 1
+            if self.is_search_page_url(url):
+                self._collection_counters["search_page_urls_rejected"] += 1
+                continue
+            if not self.is_individual_place_url(url):
+                continue
+            self._collection_counters["individual_place_urls_accepted"] += 1
+            accepted.append(url)
+        return accepted
 
     def get_cover_image(self, driver: WebDriver) -> str:
         """
@@ -666,7 +941,7 @@ class GoogleMaps:
             driver.close()
             self._maps_tabs_closed += 1
             driver.switch_to.window(self._main_handler)
-            self._wait.until(EC.presence_of_element_located((By.CLASS_NAME, "hfpxzc")))
+            self._wait.until(lambda current: self._result_anchors(current))
 
     def scroll_to_the_end_event(self, driver: WebDriver) -> list:
         """
@@ -676,45 +951,71 @@ class GoogleMaps:
         """
 
         try:
-            self._wait.until(EC.presence_of_element_located((By.CLASS_NAME, "hfpxzc")))
+            self._wait.until(
+                lambda current: self._result_anchors(current)
+                or self._safe_find_elements(current, "div[role='feed']")
+                or self.is_individual_place_url(current.current_url)
+            )
         except TimeoutException:
-            results = ["continue"]
-            return results
+            current_url = str(getattr(driver, "current_url", "") or "")
+            if self.is_individual_place_url(current_url):
+                self._collection_counters["search_results_found"] += 1
+                self._collection_counters["place_urls_extracted"] += 1
+                self._collection_counters["individual_place_urls_accepted"] += 1
+                return ["continue"]
+            if self.is_search_page_url(current_url):
+                self._collection_counters["search_page_urls_rejected"] += 1
+            return []
 
         start_time = time()
         scroll_wait = 1
         last_count = 0
         stagnant_rounds = 0
+        seen_urls = set()
+        results = []
         while True:
-            results = driver.find_elements(By.CLASS_NAME, 'hfpxzc')
+            anchors = self._result_anchors(driver)
+            results.extend(self._collect_place_urls(anchors, seen_urls))
             if self._inspection_limit and len(results) >= self._inspection_limit:
                 results = results[:self._inspection_limit]
                 break
 
             # The feed can transiently return no cards while re-rendering.
-            if not results:
+            if not anchors:
                 stagnant_rounds += 1
                 if stagnant_rounds >= 5:
                     break
                 sleep(uniform(0.2, 0.6))
                 continue
 
-            driver.execute_script('arguments[0].scrollIntoView(true);', results[-1])
+            driver.execute_script('arguments[0].scrollIntoView(true);', anchors[-1])
             driver.implicitly_wait(scroll_wait)
 
-            # Google's end-of-list marker, when present.
+            feeds = driver.find_elements(By.CSS_SELECTOR, "div[role='feed']")
+            if feeds:
+                driver.execute_script(
+                    "arguments[0].scrollTop = arguments[0].scrollHeight;", feeds[0]
+                )
+
+            # Prefer the semantic feed text; retain the legacy marker as a
+            # compatibility fallback for older Maps layouts.
+            feed_text = " ".join(
+                str(getattr(feed, "text", "") or "").casefold() for feed in feeds
+            )
+            if "reached the end" in feed_text or "end of the list" in feed_text:
+                break
             end_marker = driver.find_elements(By.CSS_SELECTOR, "span.HlvSq")
             if end_marker and "reached the end" in (end_marker[-1].text or "").lower():
                 break
 
             # Layout-independent stop: the feed stopped producing new results.
-            if len(results) == last_count:
+            if len(seen_urls) == last_count:
                 stagnant_rounds += 1
                 if stagnant_rounds >= 5:
                     break
             else:
                 stagnant_rounds = 0
-                last_count = len(results)
+                last_count = len(seen_urls)
 
             sleep(uniform(0.2, 0.6))
             elapsed_time = time() - start_time
@@ -766,16 +1067,30 @@ class GoogleMaps:
             "webpage": card_website_link,
             "phone_number": card_phone_number,
         }
+        identity_values = identities_for(identity)
+        title_available = str(card_title or "").strip().casefold() not in {
+            "", "n/a", "none", "not available", "null", "unknown",
+        }
+        if not title_available and not any(identity_values.values()):
+            # A timed-out result feed can leave the browser on /maps/search/.
+            # That page is not a company and must never become an export row.
+            self.reset_driver_for_next_run(result, driver)
+            return "noise"
         if self._incremental:
             duplicate_kind = self._known_companies.duplicate_kind(identity)
             if duplicate_kind:
+                self._observe_shadow(identity, duplicate_kind, query)
                 self.reset_driver_for_next_run(result, driver)
                 return duplicate_kind
             # Reserve atomically so another query/thread skips the same company.
             if not self._known_companies.check_and_add(identity):
+                self._observe_shadow(identity, "same_run", query)
                 self.reset_driver_for_next_run(result, driver)
                 return "same_run"
             self._pending_identity = identity
+            self._observe_shadow(identity, "", query)
+        else:
+            self._observe_shadow(identity, "", query)
 
         # get cover image
         self.__pprint_override(query=query, status="Getting cover image", results_indices=results_indices)
@@ -859,15 +1174,41 @@ class GoogleMaps:
         temp_list = [temp_data]
         self.__pprint_override(query=query, status="Dumping data in CSV file", results_indices=results_indices)
         self._file_creator.create(list_of_dict_data=temp_list)
+        self._collection_counters["companies_persisted"] += 1
+        if self._record_sink is not None:
+            self._record_sink(dict(temp_data))
         self._pending_identity = None
         return "new"
 
-    def start_scrapper(self, query: str) -> None:
+    def _finish_query(self, query: str, state: MapsQueryState, stats: dict) -> str:
+        """Record exactly one terminal state for a query and print its outcome."""
+        successful = state in {MapsQueryState.COMPLETED, MapsQueryState.NO_RESULTS}
+        counter = "maps_queries_completed" if successful else "maps_queries_blocked"
+        self._collection_counters[counter] += 1
+        self._query_states.append({"query": query, "state": state.value})
+        if self._incremental:
+            print(f"Query: {query}")
+            print(f"Query state: {state.value}")
+            print(f"Inspected results: {stats['inspected']}")
+            print(f"Already known skipped: {stats['known']}")
+            print(f"Same-run duplicates skipped: {stats['same_run']}")
+            print(f"New companies added: {stats['new']}")
+            if self._summary is not None:
+                with self._summary_lock:
+                    self._summary["queries"] += 1
+                    for key in ("inspected", "known", "same_run", "new"):
+                        self._summary[key] += stats[key]
+        self.__pprint_override(query=query, status=f"Query {state.value}")
+        return state.value
+
+    def start_scrapper(self, query: str) -> str:
         """
         Start the scraping process for a given query.
             :param query: The search query.
         """
 
+        stats = {"inspected": 0, "known": 0, "same_run": 0, "new": 0}
+        terminal_state = MapsQueryState.FAILED
         try:
             if self._verbose:
                 self.__pprint_override(query=query, status="Initializing Browser")
@@ -878,36 +1219,64 @@ class GoogleMaps:
             self.__pprint_override(query=query, status="Loading URL")
 
             if query.lower().strip().startswith("http"):
-                self.load_url(driver, query)
+                self._network_relay.protect(
+                    lambda: self.load_url(driver, query),
+                    context=f"Google Maps query {query}",
+                )
             else:
-                self.load_url(driver, self._maps_url)
+                self._network_relay.protect(
+                    lambda: self.load_url(driver, self._maps_url),
+                    context=f"Google Maps query {query}",
+                )
 
             self.__pprint_override(query=query, status="Searching query")
 
             if not query.lower().strip().startswith("http"):
-                self.search_query(query)
+                self._network_relay.protect(
+                    lambda: self.search_query(query),
+                    context=f"Google Maps query {query}",
+                )
             self._main_handler = driver.current_window_handle
 
             self.__pprint_override(query=query, status="Loading Links from GMAPS")
+
+            readiness = self.wait_for_maps_readiness(driver, query)
+            if readiness == MapsReadiness.NO_RESULTS_CONFIRMED:
+                self._collection_counters["maps_no_results_confirmed"] += 1
+                terminal_state = MapsQueryState.NO_RESULTS
+                return self._finish_query(query, terminal_state, stats)
+            if readiness == MapsReadiness.TIMEOUT:
+                terminal_state = MapsQueryState.SEARCH_TIMEOUT
+                return self._finish_query(query, terminal_state, stats)
 
             # load all the results
             results = self.scroll_to_the_end_event(driver)
 
             result_indices = [len(results), 1]
-            stats = {"inspected": 0, "known": 0, "same_run": 0, "new": 0}
             for result in results:
                 if self._stop_event.is_set():
                     break
                 if self._incremental and self._results_range is not None and stats["new"] >= self._results_range:
                     break
                 try:
-                    stats["inspected"] += 1
+                    if result != "continue":
+                        href = self._result_url(result)
+                        if not self.is_individual_place_url(href):
+                            if self.is_search_page_url(href):
+                                self._collection_counters[
+                                    "search_page_urls_rejected"
+                                ] += 1
+                            continue
                     if self._incremental and result != "continue":
-                        href = result.get_attribute("href") or ""
                         duplicate_kind = self._known_companies.duplicate_kind({"map_link": href})
                         if duplicate_kind:
+                            self._observe_shadow(
+                                {"map_link": href}, duplicate_kind, query,
+                            )
+                            stats["inspected"] += 1
                             stats[duplicate_kind] += 1
                             continue
+                    stats["inspected"] += 1
                     # Scrape and store data
                     outcome = self._scrape_result_and_store(
                         driver=driver, result=result, query=query,
@@ -935,24 +1304,26 @@ class GoogleMaps:
                     self.close_extra_tabs(driver)
                     result_indices[1] += 1
 
-            if self._incremental:
-                print(f"Query: {query}")
-                print(f"Inspected results: {stats['inspected']}")
-                print(f"Already known skipped: {stats['known']}")
-                print(f"Same-run duplicates skipped: {stats['same_run']}")
-                print(f"New companies added: {stats['new']}")
-                if self._summary is not None:
-                    with self._summary_lock:
-                        self._summary["queries"] += 1
-                        for key in ("inspected", "known", "same_run", "new"):
-                            self._summary[key] += stats[key]
-            self.__pprint_override(query=query, status="Query Complete")
+            terminal_state = MapsQueryState.COMPLETED
+        except MapsManualAbort as error:
+            terminal_state = error.terminal_state
         except NoSuchWindowException:
             self.__pprint_override(query=query, status="Browser Closed")
             self.quit_driver()
+            terminal_state = MapsQueryState.FAILED
+        except (NetworkPauseExceeded, TargetSiteNetworkError) as error:
+            self.__pprint_override(
+                query=query, status=f"Network interrupted ({type(error).__name__})"
+            )
+            terminal_state = MapsQueryState.NETWORK_INTERRUPTED
         except Exception as e:
             # Distinguish a genuine mid-run failure from a user-closed browser.
             self.__pprint_override(query=query, status=f"Aborted ({type(e).__name__}: {e})")
+            terminal_state = (
+                MapsQueryState.NETWORK_INTERRUPTED
+                if classify_network_error(e) else MapsQueryState.FAILED
+            )
+        return self._finish_query(query, terminal_state, stats)
 
 if __name__ == '__main__':
     App = GoogleMaps()

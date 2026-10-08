@@ -170,8 +170,12 @@ CLAUDE.md
 /data/*.db-shm
 /data/*.db-wal
 /data/*.db-journal
+/data/reports/*
+/data/
 
 # Local browser installer
 /google-chrome-stable_current_amd64.deb
 
 /queries.txt
+
+/google_queries.txt/

@@ -2,10 +2,12 @@
 
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from time import monotonic, sleep
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from job_search.network import (
     NetworkPauseExceeded,
@@ -29,6 +31,7 @@ from job_search.storage import (
     utc_now,
     upsert_job,
 )
+from job_search.csv_exports import DEFAULT_EXPORT_DIRECTORY, export_jobs_run
 from utils.google_search_client import (
     extract_organic_results,
     resolve_google_result_url,
@@ -244,11 +247,25 @@ def _persist_query(connection, run_id, query_stats, status, error_type=None,
 def _record_run_query_observation(
     connection, run_id, job_id, source_query, was_new,
 ):
-    """Persist exact run/query provenance without duplicating NEW attribution."""
+    """Persist authoritative run membership and exact query provenance."""
     if connection is None or not run_id:
         return
     now = utc_now()
     with connection:
+        connection.execute(
+            """INSERT INTO workflow_run_jobs
+               (run_id, job_id, discovery_state, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(run_id, job_id) DO UPDATE SET discovery_state=
+                 CASE
+                   WHEN workflow_run_jobs.discovery_state='NEW'
+                     OR excluded.discovery_state='NEW' THEN 'NEW'
+                   WHEN workflow_run_jobs.discovery_state='UPDATED'
+                     OR excluded.discovery_state='UPDATED' THEN 'UPDATED'
+                   ELSE 'KNOWN'
+                 END""",
+            (run_id, job_id, "NEW" if was_new else "KNOWN", now),
+        )
         connection.execute(
             """INSERT INTO workflow_run_job_queries
                (run_id, job_id, source_query, discovery_state,
@@ -256,8 +273,12 @@ def _record_run_query_observation(
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(run_id, job_id, source_query) DO UPDATE SET
                  discovery_state=CASE
-                   WHEN workflow_run_job_queries.discovery_state='NEW' THEN 'NEW'
-                   ELSE excluded.discovery_state END,
+                   WHEN workflow_run_job_queries.discovery_state='NEW'
+                     OR excluded.discovery_state='NEW' THEN 'NEW'
+                   WHEN workflow_run_job_queries.discovery_state='UPDATED'
+                     OR excluded.discovery_state='UPDATED' THEN 'UPDATED'
+                   ELSE 'KNOWN'
+                 END,
                  is_primary_new_source=MAX(
                    workflow_run_job_queries.is_primary_new_source,
                    excluded.is_primary_new_source
@@ -866,6 +887,9 @@ def parse_arguments(argv=None):
         ),
     )
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    parser.add_argument(
+        "--export-dir", type=Path, default=DEFAULT_EXPORT_DIRECTORY,
+    )
     parser.add_argument("--windowed", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
@@ -892,6 +916,27 @@ def parse_arguments(argv=None):
 
 def main():
     arguments = parse_arguments()
+    standalone_run_id = None
+    if not arguments.diagnose_results:
+        standalone_run_id = (
+            "direct_"
+            + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_")
+            + uuid4().hex[:8]
+        )
+        connection = connect_database(arguments.database)
+        now = utc_now()
+        try:
+            with connection:
+                connection.execute(
+                    """INSERT INTO workflow_runs
+                       (run_id, started_at, status, mode, maps_enabled,
+                        job_discovery_enabled, completion_enabled,
+                        filter_enabled, priority_enabled, created_at)
+                       VALUES (?, ?, 'RUNNING', 'DIRECT_DISCOVERY', 0, 1, 0, 0, 0, ?)""",
+                    (standalone_run_id, now, now),
+                )
+        finally:
+            connection.close()
     stats = discover_jobs(
         query_file=arguments.query_file,
         database=arguments.database,
@@ -905,8 +950,44 @@ def main():
         connectivity_probe_enabled=not arguments.disable_network_protection,
         network_max_pause_seconds=arguments.network_max_pause,
         network_probe_interval=arguments.network_probe_interval,
+        workflow_run_id=standalone_run_id,
     )
+    exported = None
+    if standalone_run_id is not None:
+        connection = connect_database(arguments.database)
+        try:
+            now = utc_now()
+            states = {
+                int(job_id): state
+                for job_id, state in stats.get("job_states", {}).items()
+            }
+            query_statuses = {
+                item.get("status") for item in stats.get("query_stats", [])
+            }
+            failed = query_statuses & {"FAILED", "NETWORK_INTERRUPTED"}
+            completed = query_statuses & {"COMPLETED", "EXHAUSTED"}
+            if failed and not completed and not states and not stats.get("stopped"):
+                run_status = "FAILED"
+            elif failed or stats.get("stopped"):
+                run_status = "PARTIAL"
+            else:
+                run_status = "SUCCESS"
+            with connection:
+                connection.execute(
+                    """UPDATE workflow_runs SET status=?, finished_at=?
+                       WHERE run_id=?""",
+                    (run_status, now, standalone_run_id),
+                )
+            if run_status in {"SUCCESS", "PARTIAL"}:
+                exported = export_jobs_run(
+                    connection, standalone_run_id, arguments.export_dir
+                )
+        finally:
+            connection.close()
     print_summary(stats, arguments.database, arguments.diagnose_results)
+    if exported:
+        print(f"Jobs CSV: {exported['timestamped']}")
+        print(f"Latest: {exported['latest']}")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ COUNTRY_ALIASES = (
     ("Belgium", ("belgium", "belgique")),
     ("Tunisia", ("tunisia", "tunisie", "tn")),
     ("Ireland", ("ireland", "irlande")),
+    ("Malta", ("malta",)),
     ("France", ("france",)),
     ("Canada", ("canada",)),
 )
@@ -157,6 +158,7 @@ def extract_address_geography(address):
         # not cities. Walk backward to the nearest plausible city component.
         for part in reversed(parts[:country_index]):
             candidate = sub(r"^\s*\d[\d\s-]*\s+", "", part)
+            candidate = sub(r"\s+[A-Z]{2,4}\s+\d{3,6}\s*$", "", candidate).strip()
             candidate = sub(r"\s+\d{3,6}\s*$", "", candidate).strip()
             if not candidate or any(character.isdigit() for character in candidate):
                 continue

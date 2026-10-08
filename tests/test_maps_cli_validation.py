@@ -35,6 +35,7 @@ class MapsCliValidationTests(TestCase):
         self.assertEqual(app._args.threads, 1)
         self.assertEqual(app._args.browser_wait, 15)
         self.assertEqual(app._args.scroll_minutes, 1)
+        self.assertIsNone(app._args.suggested_ext)
 
     def test_zero_and_negative_workers_are_rejected(self):
         for value in ("0", "-2"):
@@ -93,6 +94,30 @@ class MapsCliValidationTests(TestCase):
         self.assertEqual(captured["queries"], ["coffee shops Tunis"])
         self.assertEqual(captured["workers"], 1)
         self.assertEqual(captured["result_range"], 15)
+        self.assertIsNone(captured["suggested_ext"])
+
+    def test_explicit_suggested_extensions_are_forwarded_unchanged(self):
+        captured = {}
+
+        class FakeAlgo:
+            load_query_file = staticmethod(FastSearchAlgo.load_query_file)
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def fast_search_algorithm(self, queries):
+                return {}
+
+        with TemporaryDirectory() as directory:
+            query_file = Path(directory) / "queries.txt"
+            query_file.write_text("software Tunis\n", encoding="utf-8")
+            app = self.parse(
+                "-q", str(query_file), "-se", "contact", "-se", "about",
+            )
+            with patch("maps.FastSearchAlgo", FakeAlgo):
+                app.scrape_maps_data()
+
+        self.assertEqual(captured["suggested_ext"], ["contact", "about"])
 
     def test_valid_incremental_configuration_is_accepted(self):
         with TemporaryDirectory() as directory:

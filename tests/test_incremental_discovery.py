@@ -7,7 +7,7 @@ from threading import Event
 from unittest import TestCase
 from unittest.mock import patch
 
-from utils.google_maps_scraper import GoogleMaps
+from utils.google_maps_scraper import GoogleMaps, MapsReadiness
 from utils.google_search_discovery import DISCOVERY_FIELDS, discover_companies
 from utils.known_companies import KnownCompanies
 
@@ -38,6 +38,24 @@ class KnownCompanyTests(TestCase):
         registry.add({"name": "Acme Labs", "phone": "+216 71 234 567"})
         self.assertTrue(registry.contains({
             "title": "acme labs", "phone_number": "+216 (71) 234-567"
+        }))
+
+    def test_name_and_address_are_conservative_final_fallback(self):
+        registry = KnownCompanies()
+        registry.add({"title": "Neural AI", "address": "San Gwann, Malta"})
+        self.assertTrue(registry.contains({
+            "name": " neural ai ", "location": "san gwann, malta",
+        }))
+
+    def test_place_identity_takes_precedence_over_matching_website(self):
+        registry = KnownCompanies()
+        registry.add({
+            "place_id": "ChIJ-authoritative-one",
+            "website": "https://same-company.test",
+        })
+        self.assertFalse(registry.contains({
+            "place_id": "ChIJ-authoritative-two",
+            "website": "https://same-company.test/about",
         }))
 
     def test_similar_names_with_different_strong_identities_do_not_match(self):
@@ -128,7 +146,13 @@ class MapsIncrementalTests(TestCase):
                 pass
 
             def scroll_to_the_end_event(self, driver):
-                return [FakeResult() for _ in range(27)]
+                return [
+                    FakeResult(f"https://google.com/maps/place/Company-{index}")
+                    for index in range(27)
+                ]
+
+            def wait_for_maps_readiness(self, driver, query):
+                return MapsReadiness.READY_RESULTS
 
             def _scrape_result_and_store(self, driver, result, query, results_indices):
                 return "known" if results_indices[1] <= 12 else "new"
@@ -142,6 +166,58 @@ class MapsIncrementalTests(TestCase):
         self.assertEqual(summary["inspected"], 27)
         self.assertEqual(summary["known"], 12)
         self.assertEqual(summary["new"], 15)
+
+    def test_limit_is_reset_for_each_query(self):
+        class LimitScraper(GoogleMaps):
+            def create_chrome_driver(self):
+                return FakeMapsDriver()
+
+            def load_url(self, driver, url):
+                pass
+
+            def search_query(self, query):
+                pass
+
+            def scroll_to_the_end_event(self, driver):
+                return [
+                    FakeResult(f"https://google.com/maps/place/Company-{index}")
+                    for index in range(2)
+                ]
+
+            def wait_for_maps_readiness(self, driver, query):
+                return MapsReadiness.READY_RESULTS
+
+            def _scrape_result_and_store(self, driver, result, query, results_indices):
+                return "new"
+
+        summary = {"queries": 0, "inspected": 0, "known": 0, "same_run": 0, "new": 0}
+        scraper = LimitScraper(
+            incremental=True, result_range=2, known_companies=KnownCompanies(),
+            summary=summary, stop_event=Event(), verbose=False,
+        )
+        scraper.start_scrapper("first query")
+        scraper.start_scrapper("second query")
+        self.assertEqual(summary["queries"], 2)
+        self.assertEqual(summary["new"], 4)
+
+    def test_search_page_placeholder_is_not_stored_as_company(self):
+        scraper = GoogleMaps(
+            incremental=True, known_companies=KnownCompanies(), verbose=False,
+        )
+        scraper.validate_result_link = lambda result, driver: (
+            "", "", "https://www.google.com/maps/search/software+company+Malta"
+        )
+        scraper.get_title = lambda driver: "Not Available"
+        scraper.get_website_link = lambda driver: "Not Available"
+        scraper.get_phone_number = lambda driver: "Not Available"
+        scraper.reset_driver_for_next_run = lambda result, driver: None
+        scraper._file_creator.create = lambda rows: self.fail("placeholder was stored")
+        self.assertEqual(
+            scraper._scrape_result_and_store(
+                FakeMapsDriver(), "continue", "software company Malta", [1, 1]
+            ),
+            "noise",
+        )
 
 
 class FakeSearchDriver:

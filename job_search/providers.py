@@ -82,6 +82,8 @@ class ParsedJob:
     fetch_status: str = "NOT_FETCHED"
     fetch_error: str = ""
     evidence_sources: dict[str, str] = field(default_factory=dict)
+    employer_evidence: list[dict[str, str]] = field(default_factory=list)
+    company_website_evidence: list[dict[str, str]] = field(default_factory=list)
     has_structured_job_posting: bool = False
 
 
@@ -850,6 +852,8 @@ def parse_job_html(url, html, provider=None):
             else is_safe_location_value(candidate, source, city=field == "city")
             if field in {"location_text", "city"} else True
         )
+        if field == "company_name" and candidate and safe:
+            result.employer_evidence.append({"value": candidate, "source": source})
         if not getattr(result, field) and candidate and safe:
             setattr(result, field, candidate)
             result.evidence_sources[field] = source
@@ -881,11 +885,29 @@ def parse_job_html(url, html, provider=None):
             if result.description:
                 result.evidence_sources["description"] = "jsonld_description"
         company = _plain_text(organization.get("name")) if isinstance(organization, dict) else ""
+        if is_safe_company_name(company, "jsonld_hiringOrganization"):
+            result.employer_evidence.append({
+                "value": company, "source": "jsonld_hiringOrganization",
+            })
         if not result.company_name and is_safe_company_name(company, "jsonld_hiringOrganization"):
             result.company_name = company
             result.evidence_sources["company_name"] = "jsonld_hiringOrganization"
-        if not result.company_url and isinstance(organization, dict):
-            result.company_url = normalize_job_url(organization.get("sameAs") or organization.get("url") or "")
+        if isinstance(organization, dict):
+            for key in ("sameAs", "url"):
+                values = organization.get(key) or ()
+                values = values if isinstance(values, list) else [values]
+                for value in values:
+                    if not isinstance(value, str):
+                        continue
+                    candidate_url = normalize_job_url(value)
+                    if candidate_url:
+                        result.company_website_evidence.append({
+                            "url": candidate_url, "company_name": company,
+                            "source": f"jsonld_hiringOrganization.{key}",
+                        })
+                        if not result.company_url:
+                            result.company_url = candidate_url
+                            result.evidence_sources["company_url"] = f"jsonld_hiringOrganization.{key}"
         json_location, json_country, json_city, json_region = _location(job)
         for field, candidate in (
             ("location_text", json_location), ("country", json_country),
@@ -909,6 +931,11 @@ def parse_job_html(url, html, provider=None):
     microdata = _microdata_job(soup)
     if microdata:
         result.has_structured_job_posting = True
+        company = microdata.get("company_name") or ""
+        if is_safe_company_name(company, "microdata_hiringOrganization"):
+            result.employer_evidence.append({
+                "value": company, "source": "microdata_hiringOrganization",
+            })
     for field in ("title", "description", "company_name", "location_text", "country", "city", "region", "published_at", "employment_type"):
         if not getattr(result, field) and microdata.get(field):
             source = {
@@ -965,6 +992,8 @@ def parse_job_html(url, html, provider=None):
     if provider == "greenhouse":
         company = _plain_text(soup.select_one(".company-name"))
         location = _plain_text(soup.select_one(".location"))
+        if is_safe_company_name(company, "provider_company_field"):
+            result.employer_evidence.append({"value": company, "source": "provider_company_field"})
         if not result.company_name and is_safe_company_name(company, "provider_company_field"):
             result.company_name = company
             result.evidence_sources["company_name"] = "provider_company_field"
@@ -974,6 +1003,8 @@ def parse_job_html(url, html, provider=None):
     elif provider == "lever":
         company = _plain_text(soup.select_one(".main-header-logo"))
         location = _plain_text(soup.select_one(".posting-categories .location"))
+        if is_safe_company_name(company, "provider_company_field"):
+            result.employer_evidence.append({"value": company, "source": "provider_company_field"})
         if not result.company_name and is_safe_company_name(company, "provider_company_field"):
             result.company_name = company
             result.evidence_sources["company_name"] = "provider_company_field"
@@ -1070,6 +1101,75 @@ def parse_job_html(url, html, provider=None):
         if trusted_company:
             result.company_name = trusted_company
             result.evidence_sources["company_name"] = source
+    for element in soup.select('script[type="application/ld+json"]'):
+        try:
+            structured = json.loads(element.string or element.get_text() or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        for item in _json_ld_items(structured):
+            item_type = item.get("@type") or ""
+            types = item_type if isinstance(item_type, list) else [item_type]
+            if not any(str(value).rstrip("/").rsplit("/", 1)[-1] == "Organization" for value in types):
+                continue
+            organization_name = _plain_text(item.get("name"))
+            for key in ("sameAs", "url"):
+                values = item.get(key) or ()
+                values = values if isinstance(values, list) else [values]
+                for value in values:
+                    if not isinstance(value, str):
+                        continue
+                    candidate_url = normalize_job_url(value or "")
+                    if candidate_url:
+                        result.company_website_evidence.append({
+                            "url": candidate_url, "company_name": organization_name,
+                            "source": f"jsonld_organization.{key}",
+                        })
+    for anchor in soup.select("a[href]"):
+        label = _plain_text(anchor.get_text(" ", strip=True))
+        image = anchor.find("img")
+        image_alt = _plain_text(image.get("alt")) if image else ""
+        explicit_label = bool(re.search(
+            r"\b(?:company website|official website|visit (?:our|the) website|"
+            r"about the company|home page)\b", label, re.I,
+        ))
+        company_logo = bool(
+            result.company_name and image_alt
+            and _fold_tokens(result.company_name)[0] in _fold_tokens(image_alt)[0]
+            and "logo" in _fold_tokens(image_alt)[0]
+        )
+        if not (explicit_label or company_logo):
+            continue
+        candidate_url = normalize_job_url(urljoin(canonical, anchor.get("href") or ""))
+        if candidate_url:
+            result.company_website_evidence.append({
+                "url": candidate_url, "company_name": result.company_name,
+                "source": "ats_explicit_employer_link", "label": label,
+            })
+    page_text = _plain_text(soup.get_text(" ", strip=True))
+    domain_statement = re.compile(
+        r"emails? from (?:genuine )?(?P<name>[A-Z][\w&.'’+-]*(?:\s+[A-Z][\w&.'’+-]*){0,4}) "
+        r"recruiters? who are employees? of (?:the )?company.{0,160}?@(?P<domain>[a-z0-9.-]+) domain",
+        re.I,
+    )
+    for match in domain_statement.finditer(page_text):
+        stated_company = match.group("name").strip()
+        if _fold_tokens(stated_company)[0] != _fold_tokens(result.company_name)[0].removesuffix(" llc"):
+            continue
+        domain = match.group("domain").casefold().strip(".")
+        if domain:
+            result.company_website_evidence.append({
+                "url": "https://" + domain, "company_name": result.company_name,
+                "source": "ats_explicit_employer_domain_statement",
+                "label": match.group(0),
+            })
+    deduped_website_evidence = []
+    seen_website_evidence = set()
+    for item in result.company_website_evidence:
+        key = (item.get("url", ""), item.get("company_name", ""), item.get("source", ""))
+        if key not in seen_website_evidence:
+            seen_website_evidence.add(key)
+            deduped_website_evidence.append(item)
+    result.company_website_evidence = deduped_website_evidence
     content = "\n".join((result.title, result.company_name, result.location_text, result.description))
     result.content_hash = sha256(content.encode("utf-8")).hexdigest() if content.strip() else ""
     return result
@@ -1090,7 +1190,10 @@ def fetch_job(url, timeout=15, session=None):
             headers={"User-Agent": "Mozilla/5.0 (compatible; GMapsScraper-JobDiscovery/1.0)"},
         )
         response.raise_for_status()
-        return parse_job_html(canonical, response.text, provider)
+        response_url = getattr(response, "url", "")
+        final_url = normalize_job_url(response_url) if isinstance(response_url, str) else ""
+        final_url = final_url or canonical
+        return parse_job_html(final_url, response.text, detect_provider(final_url))
     except requests.RequestException as error:
         base.fetch_status = "FAILED"
         base.fetch_error = f"{type(error).__name__}: {error}"[:1000]

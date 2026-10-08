@@ -165,24 +165,36 @@ class TemporaryTabTests(TestCase):
 
 
 class ResourceConfigurationTests(TestCase):
-    def test_low_resource_preferences_and_safe_flags(self):
+    def test_low_resource_keeps_flags_and_notifications_but_allows_images(self):
         options = FakeOptions()
         GoogleMaps.configure_low_resource_options(options)
-        self.assertIn("--disable-background-networking", options.arguments)
-        self.assertIn("--disable-notifications", options.arguments)
-        self.assertNotIn("--disable-javascript", options.arguments)
-        self.assertEqual(
-            options.experimental["prefs"]["profile.managed_default_content_settings.images"],
-            2,
+        self.assertEqual(options.arguments, [
+            "--disable-background-networking",
+            "--disable-default-apps",
+            "--disable-sync",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-notifications",
+            "--autoplay-policy=user-gesture-required",
+        ])
+        self.assertEqual(options.experimental, {"prefs": {
+            "profile.default_content_setting_values.notifications": 2,
+        }})
+        self.assertNotIn(
+            "profile.managed_default_content_settings.images",
+            options.experimental["prefs"],
         )
 
-    def test_fonts_and_media_are_blocked_but_css_is_not(self):
+    def test_cdp_font_and_video_blocking_is_unchanged(self):
         driver = Mock()
         GoogleMaps.apply_low_resource_blocking(driver)
-        blocked = driver.execute_cdp_cmd.call_args_list[1].args[1]["urls"]
-        self.assertIn("*.woff2", blocked)
-        self.assertIn("*.mp4", blocked)
-        self.assertNotIn("*.css", blocked)
+        self.assertEqual(driver.execute_cdp_cmd.call_args_list, [
+            (("Network.enable", {}),),
+            (("Network.setBlockedURLs", {"urls": [
+                "*.woff", "*.woff2", "*.ttf", "*.otf",
+                "*.mp4", "*.webm", "*.avi", "*.mov",
+            ]}),),
+        ])
 
     def test_scroll_polling_sleeps_instead_of_busy_spinning(self):
         scraper = GoogleMaps(scroll_minutes=1, verbose=False)

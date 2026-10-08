@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from requests import ConnectionError
 
 from job_search.discovery import discover_jobs
+from job_search.network import NetworkProtectionRelay
 from job_search.normalization import normalize_job_url
 from job_search.providers import (
     GENERIC_LISTING_REASON,
@@ -510,6 +511,101 @@ class QueryAndDiscoveryTests(TestCase):
             path = Path(directory) / "queries.txt"
             path.write_text("one\n\n  \ntwo\n", encoding="utf-8")
             self.assertEqual(load_queries(path), ["one", "two"])
+
+    def test_two_query_plan_loads_and_executes_once_then_quits_once(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "jobs.db"
+            query_file = root / "queries.txt"
+            query_file.write_text("first query\nsecond query\n", encoding="utf-8")
+            driver = Mock()
+
+            with patch(
+                "job_search.discovery.load_queries", wraps=load_queries,
+            ) as loader, patch(
+                "job_search.discovery.search_query", return_value=([], ""),
+            ) as search:
+                stats = discover_jobs(
+                    query_file, database, limit=1, delay=0,
+                    driver_factory=lambda **unused: driver,
+                )
+
+            loader.assert_called_once_with(query_file)
+            self.assertEqual(
+                [call.args[1] for call in search.call_args_list],
+                ["first query", "second query"],
+            )
+            self.assertEqual(stats["queries"], 2)
+            self.assertEqual(len(stats["query_stats"]), 2)
+            driver.quit.assert_called_once_with()
+
+    def test_captcha_resume_continues_only_the_current_query(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "jobs.db"
+            query_file = root / "queries.txt"
+            query_file.write_text("first query\nsecond query\n", encoding="utf-8")
+            driver = Mock()
+            searches = []
+
+            def search(unused_driver, query, *args, **kwargs):
+                searches.append(query)
+                return ([], "recaptcha") if query == "first query" else ([], "")
+
+            with patch(
+                "job_search.discovery.search_query", side_effect=search,
+            ), patch(
+                "job_search.discovery.wait_for_manual_verification",
+                return_value=([], False),
+            ) as resume:
+                stats = discover_jobs(
+                    query_file, database, limit=1, delay=0, windowed=True,
+                    driver_factory=lambda **unused: driver,
+                )
+
+            self.assertEqual(searches, ["first query", "second query"])
+            resume.assert_called_once()
+            self.assertEqual(resume.call_args.args[1], "first query")
+            self.assertEqual(stats["queries"], 2)
+            driver.quit.assert_called_once_with()
+
+    def test_network_retry_repeats_only_the_current_query_page(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "jobs.db"
+            query_file = root / "queries.txt"
+            query_file.write_text("unused\n", encoding="utf-8")
+            driver = Mock()
+            calls = []
+            probes = iter([False])
+            relay = NetworkProtectionRelay(
+                probe_function=lambda **unused: next(probes),
+                output=lambda message: None,
+            )
+
+            def search(unused_driver, query, *args, **kwargs):
+                calls.append((query, kwargs["start"]))
+                if len(calls) == 1:
+                    raise ConnectionError("ERR_INTERNET_DISCONNECTED")
+                return [], ""
+
+            with patch("job_search.discovery.search_query", side_effect=search):
+                stats = discover_jobs(
+                    query_file, database, limit=1, delay=0,
+                    selected_queries=["first query", "second query"],
+                    query_checkpoints={
+                        "first query": {"page_start_offset": 20},
+                    },
+                    driver_factory=lambda **unused: driver,
+                    network_relay=relay,
+                )
+
+            self.assertEqual(
+                calls,
+                [("first query", 20), ("first query", 20), ("second query", 0)],
+            )
+            self.assertEqual(stats["queries"], 2)
+            driver.quit.assert_called_once_with()
 
     def _run(self, database, marker=""):
         driver = Mock()
