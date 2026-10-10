@@ -183,6 +183,18 @@ class MapsReadinessLifecycleTests(TestCase):
         self.assertEqual(scraper.start_scrapper("query"), "COMPLETED")
         self.assertEqual(scraper.resource_metrics()["maps_no_results_confirmed"], 0)
 
+    def test_consent_abort_has_distinct_observability_state(self):
+        scraper = self.make_scraper(
+            [MapsReadiness.CONSENT_REQUIRED], input_function=lambda prompt: "q",
+        )
+        self.assertEqual(
+            scraper.start_scrapper("query"), MapsQueryState.CONSENT_ABORTED.value,
+        )
+        metrics = scraper.resource_metrics()
+        self.assertEqual(metrics["maps_queries_completed"], 0)
+        self.assertEqual(metrics["maps_queries_blocked"], 1)
+        self.assertTrue(scraper._stop_event.is_set())
+
     def test_explicit_no_results_finishes_without_collection(self):
         scraper = self.make_scraper([MapsReadiness.NO_RESULTS_CONFIRMED])
         scraper.scroll_to_the_end_event = Mock(side_effect=AssertionError("collection ran"))

@@ -20,7 +20,12 @@ from typing import Iterable, Iterator
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
-from company_registry.storage import DEFAULT_DATABASE, connect_registry
+from company_registry.storage import (
+    DEFAULT_DATABASE,
+    connect_registry,
+    initialize_registry,
+    migrate_registry,
+)
 from utils.build_leads import (
     FREE_EMAIL_DOMAINS,
     clean_value,
@@ -612,6 +617,10 @@ def import_history(project_root: Path, database: Path = DEFAULT_DATABASE, *,
                 finally:
                     source_connection.close()
                     target_connection.close()
+            if simulation.exists():
+                migrate_registry(simulation)
+            else:
+                initialize_registry(simulation)
             connection = connect_registry(simulation)
             try:
                 _import_into(connection, load_records(selected), report,
@@ -620,6 +629,8 @@ def import_history(project_root: Path, database: Path = DEFAULT_DATABASE, *,
                 connection.close()
         return report
 
+    if not database.exists():
+        initialize_registry(database)
     connection = connect_registry(database)
     try:
         populated = sum(

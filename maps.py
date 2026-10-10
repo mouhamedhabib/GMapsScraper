@@ -32,6 +32,29 @@ from company_registry.shadow import (
     DEFAULT_SHADOW_DATABASE,
     open_shadow_observer,
 )
+from company_registry.discovery_adapter import DiscoveryMode, parse_discovery_mode
+from company_registry.maps_authoritative import DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY
+
+
+def _finalize_shadow(observer, observability=None):
+    """Best-effort passive reporting that cannot affect scraper results."""
+    if observer is None:
+        return
+    if observability is not None:
+        try:
+            observer.set_run_observability(observability)
+        except BaseException as exception:
+            print(
+                "[shadow] observability error ignored: "
+                f"{type(exception).__name__}: {exception}"
+            )
+    try:
+        observer.close()
+    except BaseException as exception:
+        print(
+            "[shadow] finalization error ignored: "
+            f"{type(exception).__name__}: {exception}"
+        )
 
 
 def run_maps_discovery(
@@ -42,35 +65,63 @@ def run_maps_discovery(
     company_registry_shadow=False,
     shadow_database=DEFAULT_SHADOW_DATABASE,
     shadow_report_directory=DEFAULT_REPORT_DIRECTORY,
+    known_companies_directory="./CSV_FILES",
+    allow_empty_known_companies=False,
+    discovery_mode="legacy",
+    registry_database=None,
+    registry_run_id=None,
+    resume_run_id=None,
+    authoritative_export_directory=DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY,
+    allow_production_registry=False,
 ):
     """Run the existing Maps pipeline incrementally and return its counters."""
     queries = FastSearchAlgo.load_query_file(file_name=str(query_file))
     if not queries:
         raise ValueError(f"No usable search queries found in {query_file}")
+    mode = parse_discovery_mode(discovery_mode)
+    if company_registry_shadow and mode not in {DiscoveryMode.LEGACY, DiscoveryMode.SHADOW}:
+        raise ValueError("passive shadow and authoritative modes are mutually exclusive")
+    if company_registry_shadow:
+        mode = DiscoveryMode.SHADOW
     shadow = open_shadow_observer(
-        company_registry_shadow, source_system="GOOGLE_MAPS",
+        mode is DiscoveryMode.SHADOW, source_system="GOOGLE_MAPS",
         database=Path(shadow_database), report_directory=Path(shadow_report_directory),
     )
-    algo = FastSearchAlgo(
-        headless=not windowed, wait_time=browser_wait, output_path=str(output_folder),
-        workers=min(threads, len(queries)), result_range=limit, scroll_minutes=scroll_minutes,
-        verbose=verbose, output_format="CSV", incremental=True,
-        low_resource=low_resource, shadow_observer=shadow,
-    )
     try:
+        algo = FastSearchAlgo(
+            headless=not windowed, wait_time=browser_wait, output_path=str(output_folder),
+            workers=min(threads, len(queries)), result_range=limit, scroll_minutes=scroll_minutes,
+            verbose=verbose, output_format="CSV", incremental=True,
+            low_resource=low_resource, shadow_observer=shadow,
+            known_companies_dir=str(known_companies_directory),
+            allow_empty_known_companies=allow_empty_known_companies,
+            query_file_path=query_file,
+            discovery_mode=mode.value,
+            registry_database=registry_database,
+            registry_run_id=registry_run_id,
+            resume_run_id=resume_run_id,
+            authoritative_export_directory=authoritative_export_directory,
+            allow_production_registry=allow_production_registry,
+        )
         stats = algo.fast_search_algorithm(queries)
     finally:
-        if shadow is not None:
-            shadow.close()
-    exported = export_maps_rows(
-        getattr(algo, "run_records", lambda: [])(),
-        export_directory=export_directory,
-    )
-    stats.update({
-        "csv_path": str(exported["timestamped"]),
-        "csv_latest": str(exported["latest"]),
-        "csv_rows": exported["rows"],
-    })
+        observability = None
+        if 'algo' in locals():
+            try:
+                observability = algo.run_observability()
+            except BaseException:
+                pass
+        _finalize_shadow(shadow, observability)
+    if not mode.is_authoritative:
+        exported = export_maps_rows(
+            getattr(algo, "run_records", lambda: [])(),
+            export_directory=export_directory,
+        )
+        stats.update({
+            "csv_path": str(exported["timestamped"]),
+            "csv_latest": str(exported["latest"]),
+            "csv_rows": exported["rows"],
+        })
     return stats
 
 
@@ -81,6 +132,8 @@ class GMapsScraper:
         self._args = None
         self._parser = None
         self._run_records = []
+        self._effective_mode = DiscoveryMode.LEGACY
+        self._stats = None
 
     def arg_parser(self):
         """Parse scraper options and store the resulting command-line namespace."""
@@ -93,7 +146,7 @@ class GMapsScraper:
         parser.add_argument('-w', '--threads',
                             help='Number of threads to use (default: 1)', type=int, default=1)
         parser.add_argument('-l', '--limit',
-                            help='Maximum number of results to scrape (default: 1)',
+                            help='Maximum newly persisted companies across the entire run (default: 1)',
                             type=int, default=1)
         parser.add_argument(
             '--incremental', action='store_true',
@@ -115,6 +168,17 @@ class GMapsScraper:
         parser.add_argument('-o', '--output-folder',
                             help='Output folder to store CSV details (default: ./CSV_FILES)',
                             type=str, default='./CSV_FILES')
+        parser.add_argument(
+            '--known-companies-dir', type=str, default='./CSV_FILES',
+            help='Historical CSV directory used by incremental identity checks',
+        )
+        parser.add_argument(
+            '--allow-empty-known-companies', action='store_true',
+            help=(
+                'Deliberately allow incremental discovery with a missing or empty '
+                'historical identity baseline'
+            ),
+        )
         parser.add_argument(
             '--export-dir', type=str, default=str(DEFAULT_EXPORT_DIRECTORY),
             help='Timestamped CSV export directory',
@@ -138,6 +202,43 @@ class GMapsScraper:
         parser.add_argument(
             '--company-registry-shadow', action='store_true',
             help='Record passive registry comparisons; legacy decisions remain authoritative',
+        )
+        parser.add_argument(
+            '--discovery-mode',
+            choices=[mode.value for mode in DiscoveryMode],
+            default=None,
+            help=(
+                'Identity authority mode: legacy (default), shadow, '
+                'authoritative-canary, or authoritative'
+            ),
+        )
+        parser.add_argument(
+            '--registry-database', type=str,
+            help=(
+                'Explicit schema-v6 SQLite registry for authoritative modes; '
+                'the canonical production path remains denied without its '
+                'separate opt-in'
+            ),
+        )
+        parser.add_argument(
+            '--registry-run-id', type=str,
+            help='New durable run ID; must not already exist',
+        )
+        parser.add_argument(
+            '--resume-run-id', type=str,
+            help='Explicitly resume an eligible schema-v6 Maps run',
+        )
+        parser.add_argument(
+            '--authoritative-export-dir', type=str,
+            default=str(DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY),
+            help='Isolated directory for SQLite-derived authoritative exports',
+        )
+        parser.add_argument(
+            '--allow-production-registry', action='store_true',
+            help=(
+                'Explicitly permit a validated schema-v6 canonical production '
+                'registry in authoritative mode; denied by default'
+            ),
         )
         parser.add_argument(
             '--shadow-database', type=str, default=str(DEFAULT_SHADOW_DATABASE),
@@ -168,6 +269,27 @@ class GMapsScraper:
             parser.error("--scroll-minutes must be >= 1")
         if self._args.incremental and self._args.output_format != "CSV":
             parser.error("--incremental requires --output-format CSV for restart-safe state")
+        selected = self._args.discovery_mode or "legacy"
+        if self._args.company_registry_shadow:
+            if self._args.discovery_mode not in (None, "shadow"):
+                parser.error(
+                    "--company-registry-shadow cannot be combined with a non-shadow "
+                    "--discovery-mode"
+                )
+            selected = "shadow"
+        self._effective_mode = parse_discovery_mode(selected)
+        if self._effective_mode.is_authoritative and not self._args.registry_database:
+            parser.error("authoritative modes require --registry-database")
+        if self._args.resume_run_id and self._args.registry_run_id:
+            parser.error("--resume-run-id and --registry-run-id are mutually exclusive")
+        if self._args.resume_run_id and not self._effective_mode.is_authoritative:
+            parser.error("--resume-run-id requires an authoritative discovery mode")
+        if self._args.allow_production_registry and (
+            self._effective_mode is not DiscoveryMode.AUTHORITATIVE
+        ):
+            parser.error(
+                "--allow-production-registry requires --discovery-mode authoritative"
+            )
 
     @staticmethod
     def print_query_file_help():
@@ -180,7 +302,7 @@ class GMapsScraper:
 
     @staticmethod
     def print_limit_help():
-        print("Use this option to specify the maximum number of results to scrape.")
+        print("Use this option to cap newly persisted companies across the entire run.")
         print("The limit must be at least 1.")
         sys.exit(0)
 
@@ -214,35 +336,64 @@ class GMapsScraper:
         limit_results = self._args.limit
 
         shadow = open_shadow_observer(
-            self._args.company_registry_shadow, source_system="GOOGLE_MAPS",
+            self._effective_mode is DiscoveryMode.SHADOW,
+            source_system="GOOGLE_MAPS",
             database=Path(self._args.shadow_database),
             report_directory=Path(self._args.shadow_report_dir),
         )
-        algo_obj = FastSearchAlgo(
-            unavailable_text=self._args.unavailable_text,
-            headless=self._args.windowed_browser,
-            wait_time=self._args.browser_wait,
-            suggested_ext=self._args.suggested_ext,
-            output_path=self._args.output_folder,
-            workers=threads_limit,
-            result_range=limit_results,
-            scroll_minutes=self._args.scroll_minutes,
-            verbose=False if self._args.disable_verbose else True,
-            output_format=self._args.output_format,
-            incremental=self._args.incremental,
-            low_resource=self._args.low_resource,
-            shadow_observer=shadow,
-        )
-
         try:
+            algo_obj = FastSearchAlgo(
+                unavailable_text=self._args.unavailable_text,
+                headless=self._args.windowed_browser,
+                wait_time=self._args.browser_wait,
+                suggested_ext=self._args.suggested_ext,
+                output_path=self._args.output_folder,
+                workers=threads_limit,
+                result_range=limit_results,
+                scroll_minutes=self._args.scroll_minutes,
+                verbose=False if self._args.disable_verbose else True,
+                output_format=self._args.output_format,
+                incremental=self._args.incremental,
+                low_resource=self._args.low_resource,
+                shadow_observer=shadow,
+                known_companies_dir=self._args.known_companies_dir,
+                allow_empty_known_companies=self._args.allow_empty_known_companies,
+                query_file_path=self._args.query_file,
+                discovery_mode=self._effective_mode.value,
+                registry_database=self._args.registry_database,
+                registry_run_id=self._args.registry_run_id,
+                resume_run_id=self._args.resume_run_id,
+                authoritative_export_directory=self._args.authoritative_export_dir,
+                allow_production_registry=self._args.allow_production_registry,
+            )
             stats = algo_obj.fast_search_algorithm(queries_list)
+        except (FileNotFoundError, ValueError) as exception:
+            self._parser.error(str(exception))
         finally:
-            if shadow is not None:
-                shadow.close()
+            observability = None
+            if 'algo_obj' in locals():
+                try:
+                    observability = algo_obj.run_observability()
+                except BaseException:
+                    pass
+            _finalize_shadow(shadow, observability)
         self._run_records = getattr(algo_obj, "run_records", lambda: [])()
+        self._stats = stats
         return stats
 
     def export_maps_csv(self):
+        if self._effective_mode.is_authoritative:
+            export = self._stats.get("authoritative_export")
+            termination = self._stats.get("run_observability", {}).get(
+                "termination_reason"
+            )
+            if export is None and termination == "INTERRUPTED":
+                return None
+            if export is None:
+                raise RuntimeError(
+                    "Authoritative Maps run completed without export metadata"
+                )
+            return export
         return export_maps_rows(
             self._run_records, export_directory=self._args.export_dir,
         )
@@ -253,8 +404,15 @@ def main():
     App.arg_parser()
     App.scrape_maps_data()
     exported = App.export_maps_csv()
-    print(f"Maps CSV: {exported['timestamped']}")
-    print(f"Latest: {exported['latest']}")
+    if exported is None:
+        print("Authoritative Maps run interrupted; no export finalized.")
+        return
+    if "csv" in exported and "manifest" in exported:
+        print(f"Authoritative Maps CSV: {exported['csv']}")
+        print(f"Manifest: {exported['manifest']}")
+    else:
+        print(f"Maps CSV: {exported['timestamped']}")
+        print(f"Latest: {exported['latest']}")
 
 
 if __name__ == '__main__':

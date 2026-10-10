@@ -24,6 +24,8 @@ _NOISE_TERMS = (
     "restaurant", "hotel", "school", "university", "retail", "store",
     "supermarket", "shopping", "cafe", "coffee shop", "real estate",
     "car dealer", "medical", "dentist", "beauty salon",
+    "travel agency", "tour agency", "tour operator", "marketing agency",
+    "advertising agency",
 )
 _MALTA_LOCALITIES = (
     "malta", "valletta", "sliema", "birkirkara", "mosta", "qormi",

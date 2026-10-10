@@ -77,10 +77,13 @@ python maps.py \
 
 Use `python maps.py --help` to see the CLI help.
 
-For incremental discovery, keep the CSV output in `CSV_FILES` and add
-`--incremental`. Existing identities are loaded once from `leads_master.csv`,
-`google_maps_data.csv`, and `google_search_companies.csv`. In this mode `-l`
-counts newly accepted companies rather than already-known result cards:
+For incremental discovery, add `--incremental`. Historical identities are read
+from `--known-companies-dir` (default `./CSV_FILES`) independently of where new
+results are written. The baseline loads `leads_master.csv`,
+`google_maps_data.csv`, and `google_search_companies.csv`. A missing or
+identity-empty baseline fails safely unless `--allow-empty-known-companies` is
+supplied deliberately. In this mode `-l` caps newly persisted companies across
+the entire run rather than counting already-known result cards:
 
 ```bash
 python3 maps.py -q queries.txt -l 15 -o ./CSV_FILES -of CSV --incremental
@@ -92,18 +95,30 @@ python3 maps.py -q queries.txt -l 15 -o ./CSV_FILES -of CSV --incremental
 | --- | --- | --- |
 | `-q`, `--query-file` | Text file containing one query or Maps URL per line | `./queries.txt` |
 | `-w`, `--threads` | Number of concurrent query workers | `1` |
-| `-l`, `--limit` | Maximum results per query; `-1` means all available results | `-1` |
-| `--incremental` | Skip known identities early and make `--limit` count new companies | off |
+| `-l`, `--limit` | Maximum newly persisted companies across the entire run | `1` |
+| `--incremental` | Skip identities loaded from the historical baseline | off |
 | `-u`, `--unavailable-text` | Text used when a value cannot be found | `Not Available` |
 | `-bw`, `--browser-wait` | Browser and page wait timeout in seconds | `15` |
 | `-se`, `--suggested-ext` | Website path to inspect for contacts; repeat for multiple paths | none |
 | `-wb`, `--windowed-browser` | Show the Chrome window instead of running headlessly | off |
 | `-nv`, `--disable-verbose` | Use the script's non-verbose status mode | off |
 | `-o`, `--output-folder` | Folder used for the selected output file | `./CSV_FILES` |
+| `--known-companies-dir` | Historical CSV directory for incremental identity checks | `./CSV_FILES` |
+| `--allow-empty-known-companies` | Explicitly permit an empty incremental baseline | off |
+| `--discovery-mode` | `legacy`, `shadow`, `authoritative-canary`, or `authoritative` | `legacy` |
+| `--registry-database` | Existing schema-v4 registry required by authoritative modes | none |
+| `--registry-run-id` | New durable run ID; existing IDs are rejected in Phase 3C.1 | generated |
+| `--authoritative-export-dir` | Isolated SQLite-derived NEW-company exports | `data/authoritative_maps` |
 | `-of`, `--output-format` | `CSV`, `EXCEL`, or `JSON` | `CSV` |
 | `-sm`, `--scroll-minutes` | Maximum time spent loading additional results | `1` |
 
 Website contact extraction is disabled unless at least one `-se` value is supplied. Values such as `contact`, `contacts`, `contact-us`, `about`, and `about-us` are expanded to common path variants; the original website URL is checked as well.
+
+Each Maps run prints and returns a `run_observability` summary containing the
+resolved query-file path, loaded/scheduled/completed query counts and zero-based
+indexes, the final global acceptance-budget snapshot, and an explicit
+termination reason. Passive shadow summaries include the same sanitized block
+when shadow mode is enabled.
 
 ## Scraped fields
 
@@ -269,6 +284,25 @@ python3 utils/build_leads.py --analyze-identities \
 Google Search discovery does not extract email addresses. Search-only records
 therefore remain in `leads_master.csv` and do not enter `leads_ready.csv` until
 a future, separate process obtains and validates an email address.
+
+Google Search also supports opt-in SQLite-authoritative modes while preserving
+the legacy default and `--company-registry-shadow` compatibility:
+
+```bash
+python3 -m utils.google_search_discovery \
+  -q queries.txt -l 5 \
+  --discovery-mode authoritative-canary \
+  --registry-database /tmp/gmaps-registry-v4.db \
+  --registry-run-id offline-search-001 \
+  --authoritative-export-dir /tmp/gmaps-search-authoritative
+```
+
+The selected database must be an existing non-production schema-v4 registry.
+Authoritative Search bypasses legacy CSV identity decisions and writes only the
+isolated SQLite-derived export. Maps and Search resolve through the same company
+registry, but separate processes have separate run budgets; reusing a run ID is
+rejected rather than treated as cross-process coordination. See
+`company_registry/PHASE_3C2.md` for the offline contract and recovery behavior.
 
 Ranked-list/article titles such as “163 Top startups in Tunisia for August
 2026” are discovery noise, not company records. The current focused title/path

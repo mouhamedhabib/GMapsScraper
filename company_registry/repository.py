@@ -22,12 +22,23 @@ class RegistryRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
 
-    def prior_observation(self, source_system: str, source_key: str,
-                          payload_hash: str) -> sqlite3.Row | None:
+    def observation(self, source_system: str, source_key: str,
+                    payload_hash: str) -> sqlite3.Row | None:
         return self.connection.execute(
             """SELECT * FROM discovery_observations
                WHERE source_system=? AND source_record_key=? AND payload_hash=?""",
             (source_system, source_key, payload_hash),
+        ).fetchone()
+
+    def prior_run_decision(self, run_id: str, source_system: str,
+                           source_key: str, payload_hash: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT decision.* FROM discovery_run_decisions decision
+               JOIN discovery_observations observation
+                 ON observation.observation_id=decision.observation_id
+               WHERE decision.run_id=? AND observation.source_system=?
+                 AND observation.source_record_key=? AND observation.payload_hash=?""",
+            (run_id, source_system, source_key, payload_hash),
         ).fetchone()
 
     @staticmethod
@@ -216,6 +227,31 @@ class RegistryRepository:
             ),
         )
 
+    def persist_run_decision(self, decision_id: str, run_id: str,
+                             observation_id: str, resolution: Resolution,
+                             resolver_version: str, observed_at: str,
+                             now: str) -> None:
+        self.connection.execute(
+            """INSERT INTO discovery_run_decisions
+               (decision_id, run_id, observation_id, classification,
+                resolution_action, company_id, branch_id,
+                candidate_company_ids_json, candidate_branch_ids_json,
+                matched_evidence_json, conflicts_json, requires_review,
+                resolution_reason, resolver_version, observed_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                decision_id, run_id, observation_id,
+                resolution.classification.value, resolution.action.value,
+                resolution.company_id, resolution.branch_id,
+                canonical_json(resolution.candidate_company_ids),
+                canonical_json(resolution.candidate_branch_ids),
+                canonical_json(resolution.matched_evidence),
+                canonical_json(resolution.conflicting_evidence),
+                int(resolution.requires_review), resolution.reason,
+                resolver_version, observed_at, now,
+            ),
+        )
+
     def record_run_company(self, run_id: str, resolution: Resolution,
                            observed_at: str, now: str) -> None:
         if resolution.company_id is None or resolution.classification in {
@@ -242,4 +278,3 @@ class RegistryRepository:
                    WHERE run_id=? AND company_id=?""",
                 (status, observed_at, run_id, resolution.company_id),
             )
-

@@ -78,7 +78,9 @@ class MapsResultCollectionTests(TestCase):
         self.assertTrue(GoogleMaps.is_individual_place_url(PLACE_ONE))
 
     def test_multiple_semantic_place_anchors_are_collected(self):
-        scraper = GoogleMaps(incremental=True, verbose=False)
+        scraper = GoogleMaps(
+            incremental=True, known_companies=KnownCompanies(), verbose=False,
+        )
         scraper._wait = ImmediateWait()
         driver = CollectionDriver([
             Anchor(PLACE_ONE), Anchor(SEARCH), Anchor(PLACE_TWO), Anchor(PLACE_ONE),
@@ -92,7 +94,9 @@ class MapsResultCollectionTests(TestCase):
         self.assertEqual(counters["individual_place_urls_accepted"], 2)
 
     def test_timeout_on_search_page_returns_no_placeholder(self):
-        scraper = GoogleMaps(incremental=True, verbose=False)
+        scraper = GoogleMaps(
+            incremental=True, known_companies=KnownCompanies(), verbose=False,
+        )
         scraper._wait = Mock()
         scraper._wait.until.side_effect = TimeoutException()
         driver = Mock(current_url=SEARCH)

@@ -1,6 +1,6 @@
 """Versioned SQLite schema for persistent company discovery identity."""
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 MIGRATION_1 = """
 CREATE TABLE companies (
@@ -301,4 +301,146 @@ BEGIN
 END;
 """
 
-MIGRATIONS = ((1, MIGRATION_1), (2, MIGRATION_2), (3, MIGRATION_3))
+MIGRATION_4 = """
+CREATE TABLE discovery_run_decisions (
+    decision_id TEXT PRIMARY KEY
+        CHECK (length(trim(decision_id)) > 0),
+    run_id TEXT NOT NULL
+        REFERENCES discovery_runs(run_id) ON DELETE CASCADE,
+    observation_id TEXT NOT NULL
+        REFERENCES discovery_observations(observation_id) ON DELETE RESTRICT,
+    classification TEXT NOT NULL CHECK (classification IN (
+        'NEW', 'KNOWN', 'UPDATED', 'LEGACY_UNKNOWN',
+        'AMBIGUOUS', 'QUARANTINED'
+    )),
+    resolution_action TEXT NOT NULL CHECK (resolution_action IN (
+        'CREATE_COMPANY', 'CREATE_BRANCH', 'UPDATE_ENTITY',
+        'ADD_PLACE_ALIAS', 'MATCH_ONLY', 'NONE'
+    )),
+    company_id TEXT REFERENCES companies(company_id) ON DELETE RESTRICT,
+    branch_id TEXT REFERENCES branches(branch_id) ON DELETE RESTRICT,
+    candidate_company_ids_json TEXT NOT NULL,
+    candidate_branch_ids_json TEXT NOT NULL,
+    matched_evidence_json TEXT NOT NULL,
+    conflicts_json TEXT NOT NULL,
+    requires_review INTEGER NOT NULL CHECK (requires_review IN (0, 1)),
+    resolution_reason TEXT NOT NULL CHECK (length(trim(resolution_reason)) > 0),
+    resolver_version TEXT NOT NULL CHECK (length(trim(resolver_version)) > 0),
+    observed_at TEXT NOT NULL CHECK (length(trim(observed_at)) > 0),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    CHECK (
+        (classification IN ('AMBIGUOUS', 'QUARANTINED')
+         AND company_id IS NULL AND branch_id IS NULL
+         AND resolution_action = 'NONE' AND requires_review = 1)
+        OR
+        (classification NOT IN ('AMBIGUOUS', 'QUARANTINED')
+         AND company_id IS NOT NULL)
+    ),
+    CHECK (classification != 'NEW' OR resolution_action = 'CREATE_COMPANY'),
+    CHECK (branch_id IS NULL OR company_id IS NOT NULL),
+    UNIQUE (run_id, observation_id)
+);
+
+CREATE INDEX idx_discovery_run_decisions_run_classification
+    ON discovery_run_decisions(run_id, classification);
+CREATE INDEX idx_discovery_run_decisions_company
+    ON discovery_run_decisions(company_id);
+CREATE INDEX idx_discovery_run_decisions_branch
+    ON discovery_run_decisions(branch_id);
+"""
+
+MIGRATION_5 = """
+CREATE TABLE qualification_assessments (
+    assessment_id TEXT PRIMARY KEY
+        CHECK (length(trim(assessment_id)) > 0),
+    decision_id TEXT NOT NULL
+        REFERENCES discovery_run_decisions(decision_id) ON DELETE CASCADE,
+    company_id TEXT NOT NULL
+        REFERENCES companies(company_id) ON DELETE RESTRICT,
+    policy_version TEXT NOT NULL
+        CHECK (length(trim(policy_version)) > 0),
+    evidence_hash TEXT NOT NULL CHECK (length(evidence_hash) = 64),
+    evidence_json TEXT NOT NULL CHECK (length(trim(evidence_json)) > 0),
+    employment_relevance TEXT NOT NULL CHECK (employment_relevance IN (
+        'TARGET', 'POSSIBLE', 'NOISE', 'UNKNOWN'
+    )),
+    mission_relevance TEXT NOT NULL CHECK (mission_relevance IN (
+        'TARGET', 'POSSIBLE', 'NOISE', 'UNKNOWN'
+    )),
+    employment_eligibility TEXT NOT NULL CHECK (employment_eligibility IN (
+        'ELIGIBLE', 'REVIEW', 'EXCLUDED'
+    )),
+    mission_eligibility TEXT NOT NULL CHECK (mission_eligibility IN (
+        'ELIGIBLE', 'REVIEW', 'EXCLUDED'
+    )),
+    employment_reasons_json TEXT NOT NULL
+        CHECK (length(trim(employment_reasons_json)) > 0),
+    mission_reasons_json TEXT NOT NULL
+        CHECK (length(trim(mission_reasons_json)) > 0),
+    assessed_at TEXT NOT NULL CHECK (length(trim(assessed_at)) > 0),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    UNIQUE (decision_id, policy_version)
+);
+
+CREATE INDEX idx_qualification_assessments_company
+    ON qualification_assessments(company_id);
+CREATE INDEX idx_qualification_assessments_employment
+    ON qualification_assessments(employment_eligibility, company_id);
+CREATE INDEX idx_qualification_assessments_mission
+    ON qualification_assessments(mission_eligibility, company_id);
+"""
+
+MIGRATION_6 = """
+CREATE TABLE discovery_runs_v6 (
+    run_id TEXT PRIMARY KEY
+        CHECK (length(trim(run_id)) > 0),
+    run_type TEXT NOT NULL
+        CHECK (run_type IN ('SCRAPE', 'LEGACY_IMPORT', 'MANUAL')),
+    status TEXT NOT NULL CHECK (status IN (
+        'RUNNING', 'FINALIZING', 'SUCCESS', 'PARTIAL', 'FAILED', 'INTERRUPTED'
+    )),
+    started_at TEXT NOT NULL CHECK (length(trim(started_at)) > 0),
+    finished_at TEXT,
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    new_company_limit INTEGER CHECK (
+        new_company_limit IS NULL OR new_company_limit >= 1
+    ),
+    run_config_hash TEXT CHECK (
+        run_config_hash IS NULL OR length(run_config_hash) = 64
+    ),
+    lease_owner TEXT CHECK (
+        lease_owner IS NULL OR length(trim(lease_owner)) > 0
+    ),
+    lease_expires_at TEXT CHECK (
+        lease_expires_at IS NULL OR length(trim(lease_expires_at)) > 0
+    ),
+    heartbeat_at TEXT CHECK (
+        heartbeat_at IS NULL OR length(trim(heartbeat_at)) > 0
+    ),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        CHECK (length(trim(updated_at)) > 0),
+    CHECK (finished_at IS NULL OR length(trim(finished_at)) > 0),
+    CHECK (
+        (lease_owner IS NULL AND lease_expires_at IS NULL)
+        OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+    )
+);
+
+INSERT INTO discovery_runs_v6
+    (run_id, run_type, status, started_at, finished_at, created_at, updated_at)
+SELECT run_id, run_type, status, started_at, finished_at, created_at,
+       COALESCE(finished_at, created_at)
+  FROM discovery_runs;
+
+DROP TABLE discovery_runs;
+ALTER TABLE discovery_runs_v6 RENAME TO discovery_runs;
+"""
+
+MIGRATIONS = (
+    (1, MIGRATION_1),
+    (2, MIGRATION_2),
+    (3, MIGRATION_3),
+    (4, MIGRATION_4),
+    (5, MIGRATION_5),
+    (6, MIGRATION_6),
+)

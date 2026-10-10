@@ -15,7 +15,8 @@ from uuid import UUID, uuid4, uuid5
 from company_registry.models import IdentityObservation
 from company_registry.normalization import canonical_json, clean_text, normalize_domain
 from company_registry.resolver import IdentityResolver, normalize_observation
-from company_registry.storage import connect_registry
+from company_registry.schema import SCHEMA_VERSION
+from company_registry.storage import connect_registry, migrate_registry
 from utils.maps_identity import maps_identities_for
 
 
@@ -147,6 +148,7 @@ def create_consistent_shadow_snapshot(
         finally:
             source.close()
     try:
+        migrate_registry(temporary)
         connection = connect_registry(temporary)
         try:
             connection.executescript(SHADOW_SCHEMA)
@@ -212,6 +214,20 @@ class ShadowObserver:
             raise FileNotFoundError(
                 f"Shadow registry is not initialized: {self.database}"
             )
+        inspection = sqlite3.connect(
+            f"file:{self.database.resolve()}?mode=ro", uri=True,
+        )
+        try:
+            version = inspection.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            inspection.close()
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Shadow registry schema version {version} is incompatible; "
+                f"runtime requires version {SCHEMA_VERSION}. Protected shadows "
+                "are never migrated automatically; create a new schema-v6 shadow "
+                "snapshot at an explicitly approved path."
+            )
         self.source_system = source_system.upper()
         self.run_id = run_id or f"shadow-{self.source_system.casefold()}-{uuid4()}"
         self.report_directory = Path(report_directory)
@@ -220,6 +236,7 @@ class ShadowObserver:
         self.summary_path = self.report_directory / f"{self.run_id}.summary.json"
         self._lock = Lock()
         self._closed = False
+        self._run_observability = {}
         connection = connect_registry(self.database)
         try:
             connection.executescript(SHADOW_SCHEMA)
@@ -373,7 +390,7 @@ class ShadowObserver:
             for row in rows
         )
         actions = Counter(row["resolver_action"] or "ERROR" for row in rows)
-        return {
+        result = {
             "run_id": self.run_id,
             "source_system": self.source_system,
             "shadow_database": str(self.database),
@@ -391,6 +408,31 @@ class ShadowObserver:
             ),
             "jsonl_report": str(self.jsonl_path),
         }
+        with self._lock:
+            if self._run_observability:
+                result["run_observability"] = dict(self._run_observability)
+        return result
+
+    def set_run_observability(self, metadata: dict) -> bool:
+        """Attach sanitized Maps telemetry without affecting resolver state."""
+        try:
+            allowed = {
+                "query_file_path", "queries_loaded", "queries_scheduled",
+                "queries_completed", "query_indexes_scheduled",
+                "query_indexes_completed", "termination_reason",
+                "global_acceptance_budget",
+            }
+            sanitized = {
+                key: metadata[key] for key in allowed if key in metadata
+            }
+            # Round-trip validation prevents non-serializable telemetry from
+            # breaking the passive summary writer.
+            sanitized = json.loads(json.dumps(sanitized, sort_keys=True))
+            with self._lock:
+                self._run_observability = sanitized
+            return True
+        except BaseException:
+            return False
 
     def close(self) -> dict[str, object]:
         if self._closed:

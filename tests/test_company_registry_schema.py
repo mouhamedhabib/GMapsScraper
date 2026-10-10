@@ -18,6 +18,7 @@ class CompanyRegistrySchemaTests(TestCase):
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "company_registry.db"
+        initialize_registry(self.path)
         self.connection = connect_registry(self.path)
         self.addCleanup(self.connection.close)
 
@@ -52,6 +53,7 @@ class CompanyRegistrySchemaTests(TestCase):
             "companies", "branches", "company_identities",
             "discovery_runs", "run_companies", "historical_source_records",
             "branch_identities", "discovery_observations", "resolution_reviews",
+            "discovery_run_decisions", "qualification_assessments",
         })
         self.assertEqual(
             self.connection.execute("PRAGMA user_version").fetchone()[0],
@@ -292,5 +294,5 @@ class CompanyRegistrySchemaTests(TestCase):
         raw = sqlite3.connect(self.path)
         raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
         raw.close()
-        with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+        with self.assertRaisesRegex(RuntimeError, "Unsupported company registry schema"):
             connect_registry(self.path)

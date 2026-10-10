@@ -21,6 +21,8 @@ EXPECTED_TABLES = {
     "branch_identities",
     "discovery_observations",
     "resolution_reviews",
+    "discovery_run_decisions",
+    "qualification_assessments",
 }
 
 EXPECTED_COLUMNS = {
@@ -40,7 +42,8 @@ EXPECTED_COLUMNS = {
     },
     "discovery_runs": {
         "run_id", "run_type", "status", "started_at", "finished_at",
-        "created_at",
+        "created_at", "new_company_limit", "run_config_hash", "lease_owner",
+        "lease_expires_at", "heartbeat_at", "updated_at",
     },
     "run_companies": {
         "run_id", "company_id", "discovery_status", "observed_at", "created_at",
@@ -68,6 +71,20 @@ EXPECTED_COLUMNS = {
         "review_id", "observation_id", "previous_classification",
         "decided_classification", "company_id", "branch_id", "reviewer",
         "decision_reason", "created_at",
+    },
+    "discovery_run_decisions": {
+        "decision_id", "run_id", "observation_id", "classification",
+        "resolution_action", "company_id", "branch_id",
+        "candidate_company_ids_json", "candidate_branch_ids_json",
+        "matched_evidence_json", "conflicts_json", "requires_review",
+        "resolution_reason", "resolver_version", "observed_at", "created_at",
+    },
+    "qualification_assessments": {
+        "assessment_id", "decision_id", "company_id", "policy_version",
+        "evidence_hash", "evidence_json", "employment_relevance",
+        "mission_relevance", "employment_eligibility", "mission_eligibility",
+        "employment_reasons_json", "mission_reasons_json", "assessed_at",
+        "created_at",
     },
 }
 
@@ -149,6 +166,35 @@ def _backfill_branch_identities(connection: sqlite3.Connection) -> None:
             )
 
 
+def _backfill_run_decisions(connection: sqlite3.Connection) -> None:
+    """Preserve every v3 observation as its original run's first decision."""
+    from company_registry.repository import stable_id
+
+    for row in connection.execute("SELECT * FROM discovery_observations"):
+        decision_id = stable_id(
+            "decision", f"{row['run_id']}|{row['observation_id']}",
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO discovery_run_decisions
+               (decision_id, run_id, observation_id, classification,
+                resolution_action, company_id, branch_id,
+                candidate_company_ids_json, candidate_branch_ids_json,
+                matched_evidence_json, conflicts_json, requires_review,
+                resolution_reason, resolver_version, observed_at, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                decision_id, row["run_id"], row["observation_id"],
+                row["classification"], row["resolution_action"],
+                row["company_id"], row["branch_id"],
+                row["candidate_company_ids_json"],
+                row["candidate_branch_ids_json"],
+                row["matched_evidence_json"], row["conflicts_json"],
+                row["requires_review"], row["resolution_reason"],
+                row["resolver_version"], row["observed_at"], row["created_at"],
+            ),
+        )
+
+
 def _enable_foreign_keys(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = ON")
     enabled = connection.execute("PRAGMA foreign_keys").fetchone()[0]
@@ -183,8 +229,8 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
         raise RuntimeError("Company registry contains foreign-key violations")
 
 
-def initialize_schema(connection: sqlite3.Connection) -> None:
-    """Apply each pending migration once and reject unsupported databases."""
+def migrate_schema(connection: sqlite3.Connection) -> None:
+    """Explicitly apply pending migrations on a caller-selected database."""
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     if version > SCHEMA_VERSION:
         raise RuntimeError(
@@ -192,46 +238,135 @@ def initialize_schema(connection: sqlite3.Connection) -> None:
             f"version {SCHEMA_VERSION}"
         )
 
+    user_tables = connection.execute(
+        "SELECT count(*) FROM sqlite_master "
+        "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchone()[0]
+    if version == 0 and user_tables:
+        raise RuntimeError(
+            "Unsupported unversioned company registry; migration requires a "
+            "known schema version"
+        )
+
     for migration_version, script in MIGRATIONS:
         if version >= migration_version:
             continue
+        foreign_keys_disabled = migration_version == 6
         try:
+            if foreign_keys_disabled:
+                connection.execute("PRAGMA foreign_keys = OFF")
             connection.executescript("BEGIN IMMEDIATE;\n" + script)
             if migration_version == 3:
                 _backfill_branch_identities(connection)
+            elif migration_version == 4:
+                _backfill_run_decisions(connection)
+            if migration_version == 6:
+                # Validate the rebuilt parent table and every foreign-key edge
+                # before committing the schema/version change.
+                _validate_schema(connection)
             connection.execute(f"PRAGMA user_version = {migration_version}")
             connection.commit()
         except BaseException:
             if connection.in_transaction:
                 connection.rollback()
             raise
+        finally:
+            if foreign_keys_disabled:
+                connection.execute("PRAGMA foreign_keys = ON")
+                if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                    raise RuntimeError(
+                        "SQLite foreign-key enforcement could not be restored"
+                    )
         version = migration_version
 
     _validate_schema(connection)
 
 
-def connect_registry(path: str | Path = DEFAULT_DATABASE) -> sqlite3.Connection:
-    """Open an initialized registry connection with foreign keys enforced."""
+def _connect_existing(path: str | Path) -> sqlite3.Connection:
     database_path = Path(path)
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database_path)
+    if not database_path.is_file():
+        raise FileNotFoundError(f"Company registry does not exist: {database_path}")
+    connection = sqlite3.connect(
+        f"file:{database_path.resolve()}?mode=rw", uri=True,
+    )
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA busy_timeout = 5000")
         _enable_foreign_keys(connection)
-        initialize_schema(connection)
     except BaseException:
         connection.close()
         raise
     return connection
 
 
-def initialize_registry(path: str | Path = DEFAULT_DATABASE) -> Path:
-    """Create or validate the registry database and return its path."""
-    database_path = Path(path)
-    connection = connect_registry(database_path)
+def open_registry(path: str | Path = DEFAULT_DATABASE) -> sqlite3.Connection:
+    """Open an existing current-version registry without creating or migrating."""
+    connection = _connect_existing(path)
     try:
-        connection.commit()
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported company registry schema version {version}; "
+                f"runtime requires version {SCHEMA_VERSION}. Run the explicit "
+                "registry migration command first."
+            )
+        _validate_schema(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+# Backward-compatible name with runtime-safe semantics.
+connect_registry = open_registry
+
+
+def initialize_registry(path: str | Path = DEFAULT_DATABASE) -> Path:
+    """Explicitly create a new current-version registry, or validate an existing one."""
+    database_path = Path(path)
+    if database_path.exists():
+        connection = _connect_existing(database_path)
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            tables = connection.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'"
+            ).fetchone()[0]
+            if version == 0 and tables == 0:
+                migrate_schema(connection)
+            else:
+                if version != SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Unsupported company registry schema version {version}; "
+                        f"initialization will not migrate an existing database. "
+                        "Run the explicit registry migration command first."
+                    )
+                _validate_schema(connection)
+        finally:
+            connection.close()
+        return database_path
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database_path)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        _enable_foreign_keys(connection)
+        migrate_schema(connection)
+    except BaseException:
+        connection.close()
+        database_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if connection:
+            connection.close()
+    return database_path
+
+
+def migrate_registry(path: str | Path = DEFAULT_DATABASE) -> Path:
+    """Explicitly migrate an existing registry to the supported schema version."""
+    database_path = Path(path)
+    connection = _connect_existing(database_path)
+    try:
+        migrate_schema(connection)
     finally:
         connection.close()
     return database_path
@@ -239,10 +374,15 @@ def initialize_registry(path: str | Path = DEFAULT_DATABASE) -> Path:
 
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=("init", "migrate"), nargs="?", default="init")
     parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
     arguments = parser.parse_args()
-    path = initialize_registry(arguments.database)
-    print(f"Company registry initialized: {path}")
+    if arguments.action == "migrate":
+        path = migrate_registry(arguments.database)
+        print(f"Company registry migrated: {path}")
+    else:
+        path = initialize_registry(arguments.database)
+        print(f"Company registry initialized: {path}")
     print(f"Schema version: {SCHEMA_VERSION}")
 
 

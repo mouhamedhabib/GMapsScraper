@@ -9,7 +9,7 @@ from company_registry.models import Classification, IdentityObservation, Resolut
 from company_registry.normalization import canonical_json, payload_hash
 from company_registry.resolver import IdentityResolver
 from company_registry.service import RegistryService
-from company_registry.storage import connect_registry
+from company_registry.storage import connect_registry, initialize_registry
 
 
 STAMP = "2026-10-08T12:00:00+00:00"
@@ -20,6 +20,7 @@ class IdentityResolverTests(TestCase):
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "registry.db"
+        initialize_registry(self.path)
         connection = connect_registry(self.path)
         connection.execute(
             """INSERT INTO discovery_runs

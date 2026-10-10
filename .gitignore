@@ -162,20 +162,57 @@ cython_debug/
 # Claude Code project guidance (local only)
 CLAUDE.md
 
-# CSV files
-/CSV_FILES/
+# Local Codex project context (intentionally untracked)
+/context/
+/codex.md
 
-# Local job-search operational state (Docker uses a named volume instead).
-/data/*.db
-/data/*.db-shm
-/data/*.db-wal
-/data/*.db-journal
-/data/reports/*
+# Generated discovery, enrichment, outreach, and historical datasets
+/CSV_FILES/
+/JSON_FILES/
+/XLSX_FILES/
+/exports/
+
+# All local registries, reports, scraped output, logs, and temporary state.
 /data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+/logs/
+/reports/
+/tmp/
+
+# Local credentials, API keys, browser profiles, cookies, and sessions.
+.env.*
+!.env.example
+!.env.template
+credentials*.json
+client_secret*.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+/browser-profile/
+/browser_profiles/
+/chrome-profile/
+/chrome_profiles/
+/sessions/
+/session-data/
+/cookies/
+cookies*.json
 
 # Local browser installer
 /google-chrome-stable_current_amd64.deb
 
-/queries.txt
+/queries.txt/
 
 /google_queries.txt/

@@ -36,6 +36,7 @@ Maps shadow mode:
 
 ```bash
 .venv/bin/python maps.py --incremental --company-registry-shadow \
+  --known-companies-dir CSV_FILES \
   --shadow-database data/company_registry_shadow.db \
   --shadow-report-dir data/reports/company_registry_shadow
 ```

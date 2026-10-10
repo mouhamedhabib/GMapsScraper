@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from company_registry.schema import MIGRATION_1, MIGRATION_2
+from company_registry.schema import MIGRATION_1, MIGRATION_2, MIGRATION_3, SCHEMA_VERSION
 from company_registry.shadow import (
     ShadowObserver,
     create_consistent_shadow_snapshot,
@@ -47,7 +47,7 @@ class PassiveShadowTests(TestCase):
     def test_snapshot_migrates_only_shadow_and_refuses_implicit_overwrite(self):
         production_before = self.production.read_bytes()
         result = self.initialize_shadow()
-        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(result["schema_version"], SCHEMA_VERSION)
         self.assertEqual(result["integrity_check"], "ok")
         self.assertEqual(result["foreign_key_violations"], 0)
         self.assertEqual(self.production.read_bytes(), production_before)
@@ -63,7 +63,9 @@ class PassiveShadowTests(TestCase):
             self.production, self.shadow, reset=True,
         )
         self.assertTrue(Path(result["backup_path"]).is_file())
-        self.assertEqual(inspect_shadow_database(self.shadow)["schema_version"], 3)
+        self.assertEqual(
+            inspect_shadow_database(self.shadow)["schema_version"], SCHEMA_VERSION,
+        )
 
     def test_restart_and_concurrent_submissions_are_idempotent(self):
         self.initialize_shadow()
@@ -101,6 +103,28 @@ class PassiveShadowTests(TestCase):
         ).fetchone()[0], 2)
         self.assertEqual(connection.execute("SELECT count(*) FROM companies").fetchone()[0], 1)
         connection.close()
+
+    def test_v3_shadow_is_rejected_without_mutation_or_report_side_effects(self):
+        connection = sqlite3.connect(self.shadow)
+        connection.executescript(MIGRATION_1)
+        connection.executescript(MIGRATION_2)
+        connection.executescript(MIGRATION_3)
+        connection.execute("PRAGMA user_version=3")
+        connection.commit()
+        connection.close()
+        before = self.shadow.read_bytes()
+        reports = self.root / "v3-reports"
+
+        with self.assertRaisesRegex(
+            RuntimeError, "schema version 3 is incompatible.*never migrated automatically",
+        ):
+            ShadowObserver(
+                self.shadow, source_system="GOOGLE_MAPS",
+                report_directory=reports, run_id="v3-rejected",
+            )
+
+        self.assertEqual(self.shadow.read_bytes(), before)
+        self.assertFalse(reports.exists())
 
     def configure_maps_scraper(self, shadow_observer=None):
         scraper = GoogleMaps(

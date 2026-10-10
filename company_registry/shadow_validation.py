@@ -25,8 +25,19 @@ from company_registry.models import Classification, IdentityObservation, Resolut
 from company_registry.normalization import clean_text
 from company_registry.repository import RegistryRepository
 from company_registry.resolver import ResolutionPolicy, normalize_observation
-from company_registry.storage import _backfill_branch_identities, connect_registry
+from company_registry.schema import SCHEMA_VERSION
+from company_registry.storage import (
+    _backfill_branch_identities,
+    connect_registry,
+    initialize_registry,
+    migrate_registry,
+)
 from utils.known_companies import KnownCompanies
+
+
+def _schema_version_is_current(version: int) -> bool:
+    """Return whether a validation replay reached the runtime schema."""
+    return version == SCHEMA_VERSION
 
 
 CUTOFF_DATE = "2026-09-15"
@@ -496,6 +507,7 @@ def run_validation(project_root: Path, output: Path) -> dict[str, object]:
         temporary = Path(directory)
         replay_db = temporary / "replay.db"
         shutil.copy2(production_path, replay_db)
+        migrate_registry(replay_db)
         replay = connect_registry(replay_db)
         migration = {
             "schema_version": replay.execute("PRAGMA user_version").fetchone()[0],
@@ -533,7 +545,7 @@ def run_validation(project_root: Path, output: Path) -> dict[str, object]:
         replay.close()
 
         baseline_db = temporary / "cutoff-baseline.db"
-        connect_registry(baseline_db).close()
+        initialize_registry(baseline_db)
         baseline_report = import_history(
             project_root, baseline_db, dry_run=False, sources=pre_sources,
         )
@@ -610,7 +622,7 @@ def run_validation(project_root: Path, output: Path) -> dict[str, object]:
         "production_hash_unchanged": before_hash == after_hash,
     }
     required_pass = all((
-        migration["schema_version"] == 3,
+        _schema_version_is_current(migration["schema_version"]),
         migration["integrity_check"] == "ok",
         migration["foreign_key_violations"] == 0,
         migration["company_ids_preserved"], migration["branch_ids_preserved"],

@@ -26,9 +26,26 @@ from csv import DictReader, DictWriter
 from os import replace
 from pathlib import Path
 from re import IGNORECASE, compile
+import sys
 from tempfile import NamedTemporaryFile
 from time import sleep
 from urllib.parse import quote_plus, unquote_plus, urlsplit
+
+if __package__ in {None, ""}:  # Preserve the documented direct-script CLI.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from company_registry.discovery_adapter import (
+    DiscoveryMode,
+    RegistryUnavailableError,
+    parse_discovery_mode,
+)
+from company_registry.search_authoritative import (
+    AuthoritativeSearchSession,
+    DEFAULT_AUTHORITATIVE_SEARCH_EXPORT_DIRECTORY,
+    search_observation,
+)
+from company_registry.shadow import DEFAULT_REPORT_DIRECTORY, DEFAULT_SHADOW_DATABASE
+from utils.run_acceptance_budget import RunAcceptanceBudget
 
 try:
     from utils.build_leads import clean_value, website_domain
@@ -566,19 +583,33 @@ def discover_companies(
     rebuild=False,
     incremental=False,
     shadow_observer=None,
+    authoritative_session=None,
+    acceptance_budget=None,
 ):
     """Run all queries, merge unique domains, and checkpoint after each query."""
     query_file = Path(query_file)
     output_path = Path(output_path)
     queries = load_queries(query_file)
-    discoveries = [] if rebuild else merge_discoveries(read_discoveries(output_path), [])
-    known_companies = (
-        KnownCompanies.from_directory(output_path.parent) if incremental else None
+    authoritative = authoritative_session is not None
+    discoveries = (
+        [] if authoritative or rebuild
+        else merge_discoveries(read_discoveries(output_path), [])
     )
-    overall = {"queries": 0, "inspected": 0, "known": 0, "same_run": 0, "new": 0}
+    known_companies = (
+        KnownCompanies.from_directory(output_path.parent)
+        if incremental and not authoritative else None
+    )
+    overall = {
+        "queries": 0, "inspected": 0, "known": 0, "same_run": 0,
+        "new": 0, "updated": 0, "branch": 0, "ambiguous": 0,
+        "quarantined": 0, "limit": 0,
+    }
     if not queries or limit == 0:
-        atomic_write_discoveries(output_path, discoveries)
+        if not authoritative:
+            atomic_write_discoveries(output_path, discoveries)
         return discoveries
+    if authoritative:
+        acceptance_budget = acceptance_budget or RunAcceptanceBudget(limit)
 
     driver = None
     resolution_cache = {}
@@ -586,6 +617,8 @@ def discover_companies(
         try:
             driver = (driver_factory or create_chrome_driver)(windowed=windowed)
         except Exception as error:
+            if authoritative:
+                raise
             print(f"[-] Browser unavailable: {type(error).__name__}: {error}")
             return discoveries
         try:
@@ -596,10 +629,16 @@ def discover_companies(
             if verbose:
                 print(f"[+] Searching: {query}")
             try:
-                query_stats = {"inspected": 0, "known": 0, "same_run": 0, "new": 0}
+                query_stats = {
+                    "inspected": 0, "known": 0, "same_run": 0, "new": 0,
+                    "updated": 0, "branch": 0, "ambiguous": 0,
+                    "quarantined": 0, "limit": 0,
+                }
                 page_start = 0
                 page_attempts = 0
-                inspection_limit = max(100, limit * 10) if incremental else limit
+                inspection_limit = (
+                    max(100, limit * 10) if incremental or authoritative else limit
+                )
                 should_stop_all = False
                 while (
                     query_stats["inspected"] < inspection_limit
@@ -608,14 +647,15 @@ def discover_companies(
                     page_attempts += 1
                     page_limit = (
                         min(10, inspection_limit - query_stats["inspected"])
-                        if incremental else limit
+                        if incremental or authoritative else limit
                     )
                     rows, blocked_marker = search_query(
                         driver, query, page_limit,
                         timeout, verbose=verbose, start=page_start,
                     )
                     if blocked_marker:
-                        atomic_write_discoveries(output_path, discoveries)
+                        if not authoritative:
+                            atomic_write_discoveries(output_path, discoveries)
                         if not windowed:
                             print(
                                 "[!] Google verification detected; manual verification "
@@ -627,10 +667,49 @@ def discover_companies(
                             driver, query, page_limit, timeout,
                             output_path, discoveries, verbose=verbose,
                             input_function=input_function,
+                            checkpoint_function=(
+                                (lambda: None) if authoritative else None
+                            ),
                         )
                         if should_stop:
                             should_stop_all = True
                             break
+
+                    if authoritative:
+                        if not rows:
+                            if has_next_search_page(driver):
+                                page_start += 10
+                                continue
+                            break
+                        for row in rows:
+                            if query_stats["inspected"] >= inspection_limit:
+                                break
+                            query_stats["inspected"] += 1
+                            observation = search_observation(
+                                row, query=query, observed_at=discovery_timestamp(),
+                            )
+                            outcome = authoritative_session.resolve(
+                                observation, acceptance_budget,
+                            )
+                            query_stats[outcome.outcome] += 1
+                            if outcome.outcome == "new":
+                                normalized = normalize_discovery({
+                                    **dict(row), "added_at": observation.observed_at,
+                                })
+                                if normalized is not None:
+                                    discoveries.append(normalized)
+                            if acceptance_budget.committed_exhausted():
+                                should_stop_all = True
+                                break
+                        if should_stop_all:
+                            break
+                        if (
+                            len(rows) < min(10, inspection_limit)
+                            and not has_next_search_page(driver)
+                        ):
+                            break
+                        page_start += 10
+                        continue
 
                     if not incremental:
                         if shadow_observer is not None:
@@ -705,19 +784,23 @@ def discover_companies(
                         break
                     page_start += 10
 
-                if incremental:
+                if incremental or authoritative:
                     overall["queries"] += 1
-                    for key in ("inspected", "known", "same_run", "new"):
-                        overall[key] += query_stats[key]
-                    print(f"Query: {query}")
-                    print(f"Inspected results: {query_stats['inspected']}")
-                    print(f"Already known skipped: {query_stats['known']}")
-                    print(f"Same-run duplicates skipped: {query_stats['same_run']}")
-                    print(f"New companies added: {query_stats['new']}")
+                    for key in overall:
+                        if key != "queries":
+                            overall[key] += query_stats.get(key, 0)
+                    if incremental:
+                        print(f"Query: {query}")
+                        print(f"Inspected results: {query_stats['inspected']}")
+                        print(f"Already known skipped: {query_stats['known']}")
+                        print(f"Same-run duplicates skipped: {query_stats['same_run']}")
+                        print(f"New companies added: {query_stats['new']}")
                 if should_stop_all:
                     break
                 if verbose:
                     print(f"[+] Stored {len(discoveries)} unique company domains")
+            except RegistryUnavailableError:
+                raise
             except Exception as error:
                 print(f"[-] Query failed ({query}): {type(error).__name__}: {error}")
             if query_index + 1 < len(queries) and delay:
@@ -736,6 +819,63 @@ def discover_companies(
         print(f"Same-run duplicates skipped: {overall['same_run']}")
         print(f"New companies added: {overall['new']}")
     return discoveries
+
+
+def run_search_discovery(
+    *,
+    discovery_mode="legacy",
+    company_registry_shadow=False,
+    registry_database=None,
+    registry_run_id=None,
+    authoritative_export_directory=DEFAULT_AUTHORITATIVE_SEARCH_EXPORT_DIRECTORY,
+    shadow_database=DEFAULT_SHADOW_DATABASE,
+    shadow_report_directory=DEFAULT_REPORT_DIRECTORY,
+    **discovery_options,
+):
+    """Select one Search authority mode and finalize its owned resources."""
+    mode = parse_discovery_mode(discovery_mode)
+    if company_registry_shadow:
+        if mode not in {DiscoveryMode.LEGACY, DiscoveryMode.SHADOW}:
+            raise ValueError("passive shadow and authoritative modes are mutually exclusive")
+        mode = DiscoveryMode.SHADOW
+    if mode.is_authoritative and registry_database is None:
+        raise ValueError("authoritative modes require --registry-database")
+
+    session = None
+    shadow = None
+    if mode.is_authoritative:
+        session = AuthoritativeSearchSession(
+            registry_database,
+            authoritative_export_directory,
+            mode=mode,
+            run_id=registry_run_id,
+        )
+    else:
+        from company_registry.shadow import open_shadow_observer
+        shadow = open_shadow_observer(
+            mode is DiscoveryMode.SHADOW,
+            source_system="GOOGLE_SEARCH",
+            database=Path(shadow_database),
+            report_directory=Path(shadow_report_directory),
+        )
+    try:
+        discoveries = discover_companies(
+            shadow_observer=shadow,
+            authoritative_session=session,
+            **discovery_options,
+        )
+        export = session.complete() if session is not None else None
+        return {"discoveries": discoveries, "authoritative_export": export}
+    except BaseException:
+        if session is not None:
+            try:
+                session.fail()
+            except BaseException:
+                pass
+        raise
+    finally:
+        if shadow is not None:
+            shadow.close()
 
 
 def parse_arguments():
@@ -761,6 +901,25 @@ def parse_arguments():
         help="Record passive registry comparisons; CSV decisions remain authoritative",
     )
     parser.add_argument(
+        "--discovery-mode", choices=[mode.value for mode in DiscoveryMode],
+        default=None,
+        help=("Identity authority mode: legacy (default), shadow, "
+              "authoritative-canary, or authoritative"),
+    )
+    parser.add_argument(
+        "--registry-database", type=Path,
+        help="Explicit disposable schema-v4 SQLite registry for authoritative modes",
+    )
+    parser.add_argument(
+        "--registry-run-id",
+        help="New durable Search run ID; existing IDs are rejected",
+    )
+    parser.add_argument(
+        "--authoritative-export-dir", type=Path,
+        default=DEFAULT_AUTHORITATIVE_SEARCH_EXPORT_DIRECTORY,
+        help="Isolated directory for SQLite-derived authoritative exports",
+    )
+    parser.add_argument(
         "--shadow-database", type=Path,
         default=Path("data/company_registry_shadow.db"),
     )
@@ -777,35 +936,47 @@ def parse_arguments():
         parser.error("--timeout must be greater than zero")
     if not arguments.query_file.is_file():
         parser.error(f"query file not found: {arguments.query_file}")
+    selected = arguments.discovery_mode or "legacy"
+    if arguments.company_registry_shadow:
+        if arguments.discovery_mode not in (None, "shadow"):
+            parser.error(
+                "--company-registry-shadow cannot be combined with a non-shadow "
+                "--discovery-mode"
+            )
+        selected = "shadow"
+    arguments.discovery_mode = parse_discovery_mode(selected)
+    if arguments.discovery_mode.is_authoritative and not arguments.registry_database:
+        parser.error("authoritative modes require --registry-database")
     return arguments
 
 
 def main():
     arguments = parse_arguments()
-    from company_registry.shadow import open_shadow_observer
-    shadow = open_shadow_observer(
-        arguments.company_registry_shadow, source_system="GOOGLE_SEARCH",
-        database=arguments.shadow_database,
-        report_directory=arguments.shadow_report_dir,
+    result = run_search_discovery(
+        discovery_mode=arguments.discovery_mode,
+        company_registry_shadow=arguments.company_registry_shadow,
+        registry_database=arguments.registry_database,
+        registry_run_id=arguments.registry_run_id,
+        authoritative_export_directory=arguments.authoritative_export_dir,
+        shadow_database=arguments.shadow_database,
+        shadow_report_directory=arguments.shadow_report_dir,
+        query_file=arguments.query_file,
+        output_path=arguments.output,
+        limit=arguments.limit,
+        delay=arguments.delay,
+        timeout=arguments.timeout,
+        windowed=arguments.windowed,
+        verbose=arguments.verbose,
+        rebuild=arguments.rebuild,
+        incremental=arguments.incremental,
     )
-    try:
-        discoveries = discover_companies(
-            query_file=arguments.query_file,
-            output_path=arguments.output,
-            limit=arguments.limit,
-            delay=arguments.delay,
-            timeout=arguments.timeout,
-            windowed=arguments.windowed,
-            verbose=arguments.verbose,
-            rebuild=arguments.rebuild,
-            incremental=arguments.incremental,
-            shadow_observer=shadow,
-        )
-    finally:
-        if shadow is not None:
-            shadow.close()
+    discoveries = result["discoveries"]
     print(f"Unique company domains: {len(discoveries)}")
-    print(f"Output: {arguments.output}")
+    if result["authoritative_export"] is not None:
+        print(f"Authoritative Search CSV: {result['authoritative_export']['csv']}")
+        print(f"Manifest: {result['authoritative_export']['manifest']}")
+    else:
+        print(f"Output: {arguments.output}")
 
 
 if __name__ == "__main__":

@@ -167,7 +167,7 @@ class MapsIncrementalTests(TestCase):
         self.assertEqual(summary["known"], 12)
         self.assertEqual(summary["new"], 15)
 
-    def test_limit_is_reset_for_each_query(self):
+    def test_limit_is_shared_across_queries(self):
         class LimitScraper(GoogleMaps):
             def create_chrome_driver(self):
                 return FakeMapsDriver()
@@ -188,6 +188,10 @@ class MapsIncrementalTests(TestCase):
                 return MapsReadiness.READY_RESULTS
 
             def _scrape_result_and_store(self, driver, result, query, results_indices):
+                reservation = self._acceptance_budget.try_reserve()
+                if reservation is None:
+                    return "limit"
+                reservation.commit()
                 return "new"
 
         summary = {"queries": 0, "inspected": 0, "known": 0, "same_run": 0, "new": 0}
@@ -198,7 +202,7 @@ class MapsIncrementalTests(TestCase):
         scraper.start_scrapper("first query")
         scraper.start_scrapper("second query")
         self.assertEqual(summary["queries"], 2)
-        self.assertEqual(summary["new"], 4)
+        self.assertEqual(summary["new"], 2)
 
     def test_search_page_placeholder_is_not_stored_as_company(self):
         scraper = GoogleMaps(

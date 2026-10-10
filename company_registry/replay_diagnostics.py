@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from company_registry.resolver import ResolutionPolicy, normalize_observation
 from company_registry.repository import RegistryRepository
 from company_registry.shadow_validation import observation_from_row
-from company_registry.storage import connect_registry
+from company_registry.storage import connect_registry, migrate_registry
 
 
 def token(value: str) -> str:
@@ -54,6 +54,7 @@ def diagnose(production: Path, output: Path) -> dict[str, object]:
     with TemporaryDirectory(prefix="phase-2b2-diagnostic-") as directory:
         copy = Path(directory) / "registry.db"
         shutil.copy2(production, copy)
+        migrate_registry(copy)
         connection = connect_registry(copy)
         policy = ResolutionPolicy(RegistryRepository(connection))
         cases = []

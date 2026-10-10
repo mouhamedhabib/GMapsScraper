@@ -3,8 +3,10 @@
 from pathlib import Path
 from unittest import TestCase
 
+from company_registry.schema import SCHEMA_VERSION
 from company_registry.shadow_validation import (
     HOLDOUT_PATH,
+    _schema_version_is_current,
     classifications_agree,
     observation_from_row,
     pre_cutoff_sources,
@@ -15,6 +17,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ShadowValidationTests(TestCase):
+    def test_validation_requires_the_runtime_schema_not_legacy_v4(self):
+        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertTrue(_schema_version_is_current(SCHEMA_VERSION))
+        self.assertFalse(_schema_version_is_current(4))
+
     def test_agreement_treats_updated_as_known_but_not_unresolved(self):
         self.assertTrue(classifications_agree("KNOWN", "KNOWN"))
         self.assertTrue(classifications_agree("KNOWN", "UPDATED"))

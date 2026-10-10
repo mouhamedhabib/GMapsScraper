@@ -2,9 +2,9 @@ import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from maps import GMapsScraper
+from maps import GMapsScraper, main
 from utils.threading_controller import FastSearchAlgo
 
 
@@ -36,6 +36,116 @@ class MapsCliValidationTests(TestCase):
         self.assertEqual(app._args.browser_wait, 15)
         self.assertEqual(app._args.scroll_minutes, 1)
         self.assertIsNone(app._args.suggested_ext)
+        self.assertEqual(app._args.known_companies_dir, "./CSV_FILES")
+        self.assertFalse(app._args.allow_empty_known_companies)
+        self.assertEqual(app._effective_mode.value, "legacy")
+
+    def test_discovery_modes_are_explicit_and_mutually_exclusive(self):
+        shadow = self.parse("--discovery-mode", "shadow")
+        self.assertEqual(shadow._effective_mode.value, "shadow")
+        legacy_shadow = self.parse("--company-registry-shadow")
+        self.assertEqual(legacy_shadow._effective_mode.value, "shadow")
+        self.assert_parse_error(
+            "cannot be combined",
+            "--company-registry-shadow", "--discovery-mode", "authoritative",
+            "--registry-database", "/tmp/disposable.db",
+        )
+        self.assert_parse_error(
+            "require --registry-database",
+            "--discovery-mode", "authoritative-canary",
+        )
+        authoritative = self.parse(
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+        )
+        self.assertTrue(authoritative._effective_mode.is_authoritative)
+
+    def test_resume_is_explicit_authoritative_and_mutually_exclusive(self):
+        self.assert_parse_error(
+            "requires an authoritative",
+            "--resume-run-id", "run-1",
+        )
+        self.assert_parse_error(
+            "mutually exclusive",
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+            "--registry-run-id", "fresh",
+            "--resume-run-id", "existing",
+        )
+        resumed = self.parse(
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+            "--resume-run-id", "existing",
+        )
+        self.assertEqual(resumed._args.resume_run_id, "existing")
+
+    def test_production_registry_opt_in_requires_exact_authoritative_mode(self):
+        self.assert_parse_error(
+            "requires --discovery-mode authoritative",
+            "--registry-database", "/tmp/disposable.db",
+            "--allow-production-registry",
+        )
+        self.assert_parse_error(
+            "requires --discovery-mode authoritative",
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+            "--allow-production-registry",
+        )
+        app = self.parse(
+            "--discovery-mode", "authoritative",
+            "--registry-database", "/tmp/disposable.db",
+            "--allow-production-registry",
+        )
+        self.assertTrue(app._args.allow_production_registry)
+
+    def test_interrupted_authoritative_run_has_no_export(self):
+        app = self.parse(
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+        )
+        app._stats = {
+            "run_observability": {"termination_reason": "INTERRUPTED"},
+        }
+        self.assertIsNone(app.export_maps_csv())
+
+    def test_non_interrupted_authoritative_missing_export_fails_closed(self):
+        app = self.parse(
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+        )
+        app._stats = {
+            "run_observability": {"termination_reason": "NORMAL_COMPLETION"},
+        }
+        with self.assertRaisesRegex(RuntimeError, "without export metadata"):
+            app.export_maps_csv()
+
+    def test_main_reports_interruption_without_export_paths(self):
+        app = Mock()
+        app.export_maps_csv.return_value = None
+        with patch("maps.GMapsScraper", return_value=app), patch(
+            "builtins.print"
+        ) as output:
+            main()
+        output.assert_called_once_with(
+            "Authoritative Maps run interrupted; no export finalized."
+        )
+
+    def test_main_preserves_successful_authoritative_export_reporting(self):
+        app = Mock()
+        app.export_maps_csv.return_value = {
+            "csv": "/tmp/result.csv", "manifest": "/tmp/result.manifest.json",
+        }
+        with patch("maps.GMapsScraper", return_value=app), patch(
+            "builtins.print"
+        ) as output:
+            main()
+        self.assertEqual(
+            [call.args[0] for call in output.call_args_list],
+            [
+                "Authoritative Maps CSV: /tmp/result.csv",
+                "Manifest: /tmp/result.manifest.json",
+            ],
+        )
 
     def test_zero_and_negative_workers_are_rejected(self):
         for value in ("0", "-2"):
@@ -128,6 +238,34 @@ class MapsCliValidationTests(TestCase):
             )
         self.assertTrue(app._args.incremental)
         self.assertEqual(app._args.limit, 15)
+
+    def test_independent_output_and_known_company_directories_are_forwarded(self):
+        captured = {}
+
+        class FakeAlgo:
+            load_query_file = staticmethod(FastSearchAlgo.load_query_file)
+
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def fast_search_algorithm(self, queries):
+                return {}
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            query_file = root / "queries.txt"
+            query_file.write_text("software Tunis\n", encoding="utf-8")
+            app = self.parse(
+                "-q", str(query_file), "--incremental",
+                "--output-folder", str(root / "output"),
+                "--known-companies-dir", str(root / "history"),
+                "--allow-empty-known-companies",
+            )
+            with patch("maps.FastSearchAlgo", FakeAlgo):
+                app.scrape_maps_data()
+        self.assertEqual(captured["output_path"], str(root / "output"))
+        self.assertEqual(captured["known_companies_dir"], str(root / "history"))
+        self.assertTrue(captured["allow_empty_known_companies"])
 
 
 class WorkerCoordinatorValidationTests(TestCase):

@@ -42,9 +42,13 @@ class KnownCompanies:
         self._lock = Lock()
 
     @classmethod
-    def from_directory(cls, directory):
+    def from_directory(cls, directory, *, require_nonempty=False):
         registry = cls()
         root = Path(directory)
+        if require_nonempty and not root.is_dir():
+            raise FileNotFoundError(
+                f"Known-companies directory does not exist: {root}"
+            )
         for filename in (
             "leads_master.csv",
             "google_maps_data.csv",
@@ -52,6 +56,11 @@ class KnownCompanies:
         ):
             registry.load_csv(root / filename)
         registry._startup_identities = registry._identity_tokens()
+        if require_nonempty and not registry._startup_identities:
+            raise ValueError(
+                "Known-companies baseline contains no usable identities: "
+                f"{root}"
+            )
         return registry
 
     def _identity_tokens(self):

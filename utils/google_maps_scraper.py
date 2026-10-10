@@ -41,6 +41,9 @@ import re
 from urllib.parse import parse_qs, urlsplit
 from utils.known_companies import KnownCompanies, identities_for
 from utils.discovery_timestamps import discovery_timestamp
+from utils.run_acceptance_budget import RunAcceptanceBudget
+from company_registry.discovery_adapter import RegistryUnavailableError
+from company_registry.maps_authoritative import maps_observation
 from job_search.network import (
     NetworkPauseExceeded, NetworkProtectionRelay, TargetSiteNetworkError,
     classify_network_error,
@@ -61,6 +64,7 @@ class MapsQueryState(str, Enum):
     COMPLETED = "COMPLETED"
     NO_RESULTS = "NO_RESULTS"
     VERIFICATION_ABORTED = "VERIFICATION_ABORTED"
+    CONSENT_ABORTED = "CONSENT_ABORTED"
     NETWORK_INTERRUPTED = "NETWORK_INTERRUPTED"
     SEARCH_TIMEOUT = "SEARCH_TIMEOUT"
     FAILED = "FAILED"
@@ -180,6 +184,10 @@ class GoogleMaps:
                  readiness_delays=(5, 10, 15),
                  sleep_function=None,
                  shadow_observer=None,
+                 acceptance_budget=None,
+                 known_companies_dir="./CSV_FILES",
+                 allow_empty_known_companies=False,
+                 authoritative_session=None,
                  ) -> None:
         """
         Initialize the GoogleMaps scraper instance.
@@ -212,14 +220,19 @@ class GoogleMaps:
         self.__output_format = output_format
         self._scroll_minutes = scroll_minutes
         self._incremental = incremental
-        self._known_companies = known_companies or (
-            KnownCompanies.from_directory(output_path) if incremental else None
-        )
+        self._authoritative_session = authoritative_session
+        self._authoritative = authoritative_session is not None
+        self._known_companies = known_companies
+        if incremental and not self._authoritative and self._known_companies is None:
+            self._known_companies = KnownCompanies.from_directory(
+                known_companies_dir,
+                require_nonempty=not allow_empty_known_companies,
+            )
         self._summary = summary
         self._summary_lock = summary_lock or Lock()
         self._inspection_limit = (
             max(100, result_range * 10)
-            if incremental and result_range is not None
+            if (incremental or self._authoritative) and result_range is not None
             else result_range
         )
         self._pending_identity = None
@@ -230,6 +243,12 @@ class GoogleMaps:
         self._readiness_delays = tuple(readiness_delays)
         self._sleep_function = sleep_function or sleep
         self._shadow_observer = shadow_observer
+        self._acceptance_budget = (
+            acceptance_budget
+            if acceptance_budget is not None
+            else RunAcceptanceBudget(result_range)
+        )
+        self._pending_budget_reservation = None
         self._driver = None
         self._browser_instances_created = 0
         self._browser_instances_recreated = 0
@@ -628,7 +647,7 @@ class GoogleMaps:
             if state == MapsReadiness.CONSENT_REQUIRED:
                 if not self._prompt_for_manual_maps_action(query, consent=True):
                     self._stop_event.set()
-                    raise MapsManualAbort(MapsQueryState.FAILED)
+                    raise MapsManualAbort(MapsQueryState.CONSENT_ABORTED)
                 continue
             if state == MapsReadiness.NETWORK_DEGRADED:
                 try:
@@ -1076,20 +1095,31 @@ class GoogleMaps:
             # That page is not a company and must never become an export row.
             self.reset_driver_for_next_run(result, driver)
             return "noise"
-        if self._incremental:
+        if self._incremental and not self._authoritative:
             duplicate_kind = self._known_companies.duplicate_kind(identity)
             if duplicate_kind:
                 self._observe_shadow(identity, duplicate_kind, query)
                 self.reset_driver_for_next_run(result, driver)
                 return duplicate_kind
+            budget_reservation = self._acceptance_budget.try_reserve()
+            if budget_reservation is None:
+                self.reset_driver_for_next_run(result, driver)
+                return "limit"
             # Reserve atomically so another query/thread skips the same company.
             if not self._known_companies.check_and_add(identity):
+                budget_reservation.release()
                 self._observe_shadow(identity, "same_run", query)
                 self.reset_driver_for_next_run(result, driver)
                 return "same_run"
             self._pending_identity = identity
+            self._pending_budget_reservation = budget_reservation
             self._observe_shadow(identity, "", query)
-        else:
+        elif not self._authoritative:
+            budget_reservation = self._acceptance_budget.try_reserve()
+            if budget_reservation is None:
+                self.reset_driver_for_next_run(result, driver)
+                return "limit"
+            self._pending_budget_reservation = budget_reservation
             self._observe_shadow(identity, "", query)
 
         # get cover image
@@ -1167,17 +1197,38 @@ class GoogleMaps:
         # store about related data
         temp_data.update(card_about)
 
-        # Store data in runtime
-        # This is the first durable acceptance point. Duplicate exits above
-        # never reach it, so known and same-run companies keep their old date.
+        # Store data in runtime. SQLite is the sole durable acceptance point in
+        # authoritative mode; legacy mode keeps its CSV-first behavior.
         temp_data["added_at"] = discovery_timestamp()
+        if self._authoritative:
+            authoritative = self._authoritative_session.resolve(
+                maps_observation(
+                    temp_data, query=query, observed_at=temp_data["added_at"],
+                ),
+                self._acceptance_budget,
+            )
+            if authoritative.outcome == "new":
+                self._collection_counters["companies_persisted"] += 1
+            return authoritative.outcome
+
         temp_list = [temp_data]
         self.__pprint_override(query=query, status="Dumping data in CSV file", results_indices=results_indices)
-        self._file_creator.create(list_of_dict_data=temp_list)
+        try:
+            self._file_creator.create(list_of_dict_data=temp_list)
+        except BaseException:
+            if self._incremental and self._pending_identity:
+                self._known_companies.discard(self._pending_identity)
+            self._pending_identity = None
+            if self._pending_budget_reservation is not None:
+                self._pending_budget_reservation.release()
+                self._pending_budget_reservation = None
+            raise
+        self._pending_budget_reservation.commit()
+        self._pending_budget_reservation = None
+        self._pending_identity = None
         self._collection_counters["companies_persisted"] += 1
         if self._record_sink is not None:
             self._record_sink(dict(temp_data))
-        self._pending_identity = None
         return "new"
 
     def _finish_query(self, query: str, state: MapsQueryState, stats: dict) -> str:
@@ -1186,18 +1237,23 @@ class GoogleMaps:
         counter = "maps_queries_completed" if successful else "maps_queries_blocked"
         self._collection_counters[counter] += 1
         self._query_states.append({"query": query, "state": state.value})
-        if self._incremental:
+        if self._incremental or self._authoritative:
             print(f"Query: {query}")
             print(f"Query state: {state.value}")
             print(f"Inspected results: {stats['inspected']}")
             print(f"Already known skipped: {stats['known']}")
             print(f"Same-run duplicates skipped: {stats['same_run']}")
             print(f"New companies added: {stats['new']}")
+            if self._authoritative:
+                print(f"Updated companies: {stats['updated']}")
+                print(f"New branches: {stats['branch']}")
+                print(f"Review-only ambiguous: {stats['ambiguous']}")
+                print(f"Review-only quarantined: {stats['quarantined']}")
             if self._summary is not None:
                 with self._summary_lock:
                     self._summary["queries"] += 1
-                    for key in ("inspected", "known", "same_run", "new"):
-                        self._summary[key] += stats[key]
+                    for key, value in stats.items():
+                        self._summary[key] = self._summary.get(key, 0) + value
         self.__pprint_override(query=query, status=f"Query {state.value}")
         return state.value
 
@@ -1207,7 +1263,10 @@ class GoogleMaps:
             :param query: The search query.
         """
 
-        stats = {"inspected": 0, "known": 0, "same_run": 0, "new": 0}
+        stats = {
+            "inspected": 0, "known": 0, "same_run": 0, "new": 0,
+            "updated": 0, "branch": 0, "ambiguous": 0, "quarantined": 0,
+        }
         terminal_state = MapsQueryState.FAILED
         try:
             if self._verbose:
@@ -1256,7 +1315,7 @@ class GoogleMaps:
             for result in results:
                 if self._stop_event.is_set():
                     break
-                if self._incremental and self._results_range is not None and stats["new"] >= self._results_range:
+                if self._acceptance_budget.committed_exhausted():
                     break
                 try:
                     if result != "continue":
@@ -1267,7 +1326,7 @@ class GoogleMaps:
                                     "search_page_urls_rejected"
                                 ] += 1
                             continue
-                    if self._incremental and result != "continue":
+                    if self._incremental and not self._authoritative and result != "continue":
                         duplicate_kind = self._known_companies.duplicate_kind({"map_link": href})
                         if duplicate_kind:
                             self._observe_shadow(
@@ -1282,8 +1341,11 @@ class GoogleMaps:
                         driver=driver, result=result, query=query,
                         results_indices=result_indices,
                     )
-                    if self._incremental and outcome in stats:
+                    if (self._incremental or self._authoritative) and outcome in stats:
                         stats[outcome] += 1
+                except RegistryUnavailableError:
+                    self._stop_event.set()
+                    raise
                 except Exception as e:
                     # One bad result (stale element, timeout, IO error) must not abort
                     # the whole query — log it, recover the window state, and continue.
@@ -1292,6 +1354,9 @@ class GoogleMaps:
                     if self._incremental and self._pending_identity:
                         self._known_companies.discard(self._pending_identity)
                         self._pending_identity = None
+                    if self._pending_budget_reservation is not None:
+                        self._pending_budget_reservation.release()
+                        self._pending_budget_reservation = None
                     try:
                         for handle in list(driver.window_handles):
                             if handle != self._main_handler:
@@ -1307,6 +1372,9 @@ class GoogleMaps:
             terminal_state = MapsQueryState.COMPLETED
         except MapsManualAbort as error:
             terminal_state = error.terminal_state
+        except RegistryUnavailableError:
+            self._stop_event.set()
+            raise
         except NoSuchWindowException:
             self.__pprint_override(query=query, status="Browser Closed")
             self.quit_driver()
