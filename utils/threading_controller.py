@@ -67,11 +67,11 @@ class FastSearchAlgo:
             raise ValueError("wait_time must be >= 1")
         if scroll_minutes < 1:
             raise ValueError("scroll_minutes must be >= 1")
-        if (
-            diagnostic_stack_interval_seconds is not None
-            and diagnostic_stack_interval_seconds <= 0
-        ):
-            raise ValueError("diagnostic_stack_interval_seconds must be > 0")
+        if diagnostic_stack_interval_seconds is not None:
+            raise ValueError(
+                "diagnostic_stack_interval_seconds is disabled because the "
+                "CPython faulthandler watchdog is unsafe"
+            )
         if suggested_ext is None:
             suggested_ext = ["contact-us", "contact"]
 
@@ -92,13 +92,6 @@ class FastSearchAlgo:
             raise ValueError("registry_run_id and resume_run_id are mutually exclusive")
         if resume_run_id is not None and not self._discovery_mode.is_authoritative:
             raise ValueError("resume_run_id requires an authoritative discovery mode")
-        if (
-            diagnostic_stack_interval_seconds is not None
-            and not self._discovery_mode.is_authoritative
-        ):
-            raise ValueError(
-                "diagnostic_stack_interval_seconds requires an authoritative mode"
-            )
         self._authoritative_session = None
         if self._discovery_mode.is_authoritative:
             if registry_database is None:

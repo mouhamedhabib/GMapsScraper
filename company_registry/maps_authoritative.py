@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import faulthandler
 from hashlib import sha256
 import json
 import logging
@@ -55,7 +54,6 @@ from company_registry.storage import DEFAULT_DATABASE, open_registry
 DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY = Path("data/authoritative_maps")
 LEASE_DIAGNOSTIC_MAX_BYTES = 1024 * 1024
 LEASE_DIAGNOSTIC_BACKUP_COUNT = 3
-STACK_DIAGNOSTIC_BACKUP_COUNT = 3
 
 
 class _LeaseDiagnosticLog:
@@ -132,124 +130,6 @@ def _process_diagnostics() -> dict:
         "system_load_15m": round(load_15m, 6) if load_15m is not None else None,
         "cpu_count": os.cpu_count(),
     }
-
-
-class _PeriodicStackSnapshots:
-    """Keep a bounded rotation of opt-in all-thread stack snapshots."""
-
-    def __init__(
-        self,
-        path: Path,
-        run_id: str,
-        interval_seconds: float,
-        diagnostic_log: _LeaseDiagnosticLog,
-    ) -> None:
-        self.path = path
-        self.run_id = run_id
-        self.interval_seconds = interval_seconds
-        self._diagnostic_log = diagnostic_log
-        self._stop = Event()
-        self._thread: Thread | None = None
-
-    def _rotate(self) -> None:
-        oldest = Path(f"{self.path}.{STACK_DIAGNOSTIC_BACKUP_COUNT}")
-        oldest.unlink(missing_ok=True)
-        for index in range(STACK_DIAGNOSTIC_BACKUP_COUNT - 1, 0, -1):
-            source = Path(f"{self.path}.{index}")
-            if source.exists():
-                source.replace(Path(f"{self.path}.{index + 1}"))
-        if self.path.exists():
-            self.path.replace(Path(f"{self.path}.1"))
-
-    def _run(self) -> None:
-        reason = "shutdown_requested"
-        initial_snapshot_pending = True
-        try:
-            while not self._stop.is_set():
-                self._rotate()
-                with self.path.open("w", encoding="utf-8") as handle:
-                    os.chmod(self.path, 0o600)
-                    handle.write(
-                        f"timestamp={datetime.now(timezone.utc).isoformat()} "
-                        f"run_id={self.run_id} pid={os.getpid()}\n"
-                    )
-                    handle.flush()
-                    if initial_snapshot_pending:
-                        faulthandler.dump_traceback(
-                            file=handle, all_threads=True,
-                        )
-                        handle.flush()
-                        initial_snapshot_pending = False
-                        self._diagnostic_log.write(
-                            "stack_snapshot_initial_written",
-                            path=str(self.path),
-                            **_process_diagnostics(),
-                        )
-                    # The CPython watchdog used here can emit this one pre-armed
-                    # snapshot even when ordinary Python threads cannot get the
-                    # GIL. It intentionally does not repeat while starved, which
-                    # keeps an extended stall from growing the file without bound.
-                    faulthandler.dump_traceback_later(
-                        self.interval_seconds,
-                        repeat=False,
-                        file=handle,
-                    )
-                    grace = min(max(self.interval_seconds * 0.1, 0.01), 0.25)
-                    stopped = self._stop.wait(self.interval_seconds + grace)
-                    faulthandler.cancel_dump_traceback_later()
-                    handle.flush()
-                if stopped:
-                    break
-        except BaseException as error:
-            reason = "snapshot_failure"
-            self._diagnostic_log.write(
-                "stack_snapshot_failed",
-                level=logging.ERROR,
-                error_type=type(error).__name__,
-                error_message=str(error),
-                **_process_diagnostics(),
-            )
-        finally:
-            try:
-                faulthandler.cancel_dump_traceback_later()
-            except BaseException:
-                pass
-            self._diagnostic_log.write(
-                "stack_snapshot_thread_stopped",
-                reason=reason,
-                path=str(self.path),
-                **_process_diagnostics(),
-            )
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
-        self._stop.clear()
-        self._thread = Thread(
-            target=self._run,
-            name=f"registry-stacks-{self.run_id}",
-            daemon=True,
-        )
-        self._thread.start()
-        self._diagnostic_log.write(
-            "stack_snapshot_thread_started",
-            interval_seconds=self.interval_seconds,
-            path=str(self.path),
-            backup_count=STACK_DIAGNOSTIC_BACKUP_COUNT,
-            **_process_diagnostics(),
-        )
-
-    def stop(self) -> None:
-        self._stop.set()
-        try:
-            faulthandler.cancel_dump_traceback_later()
-        except BaseException:
-            pass
-        if self._thread is not None:
-            self._thread.join(timeout=max(self.interval_seconds + 1, 1))
-            self._thread = None
 
 
 class UnsafeAuthoritativePathError(ValueError):
@@ -419,11 +299,11 @@ class AuthoritativeMapsSession:
             raise ValueError("lease_seconds must be >= 1")
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be > 0")
-        if (
-            stack_snapshot_interval_seconds is not None
-            and stack_snapshot_interval_seconds <= 0
-        ):
-            raise ValueError("stack_snapshot_interval_seconds must be > 0")
+        if stack_snapshot_interval_seconds is not None:
+            raise ValueError(
+                "Periodic stack snapshots are disabled because the CPython "
+                "faulthandler watchdog is unsafe"
+            )
         self.mode = parse_discovery_mode(mode)
         if not self.mode.is_authoritative:
             raise ValueError("AuthoritativeMapsSession requires an authoritative mode")
@@ -438,7 +318,6 @@ class AuthoritativeMapsSession:
         self.new_company_limit = new_company_limit
         self.lease_seconds = lease_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
-        self.stack_snapshot_interval_seconds = stack_snapshot_interval_seconds
         self.lease_owner = lease_owner or f"maps-writer-{uuid4()}"
         self.adapter = AuthoritativeDiscoveryAdapter(self.database, mode=self.mode)
         self.export_result: dict | None = None
@@ -453,9 +332,7 @@ class AuthoritativeMapsSession:
         self._last_successful_renewal_at: str | None = None
         self._last_successful_renewal_monotonic: float | None = None
         self.diagnostic_log_path = self.database.parent / "logs/writer_lease.jsonl"
-        self.stack_diagnostic_path = self.database.parent / "logs/writer_stacks.log"
         self._diagnostic_log: _LeaseDiagnosticLog | None = None
-        self._stack_snapshots: _PeriodicStackSnapshots | None = None
         if self.is_resume:
             # Explicit resume remains read-only until configure_queries() can
             # validate the complete query-dependent configuration.
@@ -792,14 +669,6 @@ class AuthoritativeMapsSession:
             return
         log = self._ensure_diagnostic_log()
         self._heartbeat_stop.clear()
-        if self.stack_snapshot_interval_seconds is not None:
-            self._stack_snapshots = _PeriodicStackSnapshots(
-                self.stack_diagnostic_path,
-                self.run_id,
-                self.stack_snapshot_interval_seconds,
-                log,
-            )
-            self._stack_snapshots.start()
         self._heartbeat_thread = Thread(
             target=self._heartbeat_loop,
             name=f"registry-lease-{self.run_id}",
@@ -824,9 +693,6 @@ class AuthoritativeMapsSession:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=max(self.heartbeat_interval_seconds, 1))
             self._heartbeat_thread = None
-        if self._stack_snapshots is not None:
-            self._stack_snapshots.stop()
-            self._stack_snapshots = None
         try:
             release_run_lease(self.database, self.run_id, self.lease_owner)
         except BaseException as error:

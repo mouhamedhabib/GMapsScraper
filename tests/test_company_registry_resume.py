@@ -4,8 +4,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
-import subprocess
-import sys
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
 from unittest import TestCase
@@ -359,113 +357,18 @@ class MapsResumeLeaseTests(TestCase):
         self.assertEqual(self.run_row()["status"], "RUNNING")
         session.release_lease()
 
-    def test_opt_in_stack_snapshots_are_private_rotated_and_cleaned_up(self):
-        session = self.fresh(
-            heartbeat_interval_seconds=5,
-            stack_snapshot_interval_seconds=0.03,
-        )
-        session.configure_queries(QUERIES)
-        session.start_heartbeat()
-
-        deadline = monotonic() + 1
-        while monotonic() < deadline:
-            if (
-                session.stack_diagnostic_path.exists()
-                and "Thread" in session.stack_diagnostic_path.read_text(
-                    encoding="utf-8"
-                )
-            ):
-                break
-            sleep(0.01)
-        else:
-            self.fail("stack snapshot was not written")
-
-        sleep(0.12)
-        session.fail("INTERRUPTED")
-        stack_files = list(
-            session.stack_diagnostic_path.parent.glob("writer_stacks.log*")
-        )
-        self.assertLessEqual(len(stack_files), 4)
-        self.assertTrue(stack_files)
-        for path in stack_files:
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        names = [item["event"] for item in self.diagnostic_events(session)]
-        self.assertIn("stack_snapshot_thread_started", names)
-        self.assertIn("stack_snapshot_initial_written", names)
-        self.assertIn("stack_snapshot_thread_stopped", names)
-        self.assertIsNone(session._stack_snapshots)
-
-    def test_stack_snapshot_interval_is_opt_in_and_positive(self):
+    def test_stack_snapshot_watchdog_is_rejected_for_programmatic_callers(self):
         session = self.fresh()
-        self.assertIsNone(session.stack_snapshot_interval_seconds)
-        self.assertFalse(session.stack_diagnostic_path.exists())
         session.release_lease()
-        with self.assertRaisesRegex(ValueError, "must be > 0"):
-            self.fresh(run_id="invalid-stack", stack_snapshot_interval_seconds=0)
-
-    def test_abrupt_process_exit_retains_startup_and_initial_stack_evidence(self):
-        script = """
-import json
-import os
-from pathlib import Path
-import sys
-from time import monotonic, sleep
-
-from company_registry.maps_authoritative import AuthoritativeMapsSession
-
-session = AuthoritativeMapsSession(
-    Path(sys.argv[1]),
-    Path(sys.argv[2]),
-    run_id="abrupt-run",
-    new_company_limit=2,
-    heartbeat_interval_seconds=30,
-    stack_snapshot_interval_seconds=30,
-)
-session.configure_queries(["software Tunis", "technology Sousse"])
-session.start_heartbeat()
-deadline = monotonic() + 2
-while monotonic() < deadline:
-    if session.diagnostic_log_path.exists():
-        events = [
-            json.loads(line).get("event")
-            for line in session.diagnostic_log_path.read_text(
-                encoding="utf-8"
-            ).splitlines()
-            if line.strip()
-        ]
-        if (
-            "stack_snapshot_initial_written" in events
-            and "heartbeat_renewal_scheduled" in events
-            and session.stack_diagnostic_path.exists()
-        ):
-            break
-    sleep(0.01)
-else:
-    raise RuntimeError("startup diagnostics were not written")
-os._exit(7)
-"""
-        result = subprocess.run(
-            [
-                sys.executable, "-c", script,
-                str(self.database), str(self.exports),
-            ],
-            cwd=Path(__file__).resolve().parents[1],
-            check=False,
-        )
-
-        self.assertEqual(result.returncode, 7)
-        log_path = self.database.parent / "logs/writer_lease.jsonl"
-        events = [
-            json.loads(line)["event"]
-            for line in log_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        self.assertIn("heartbeat_startup_completed", events)
-        self.assertIn("heartbeat_renewal_scheduled", events)
-        self.assertIn("stack_snapshot_initial_written", events)
-        stack_path = self.database.parent / "logs/writer_stacks.log"
-        self.assertIn("Thread", stack_path.read_text(encoding="utf-8"))
-        self.assertEqual(self.run_row("abrupt-run")["status"], "RUNNING")
+        for interval in (0, 30):
+            with self.subTest(interval=interval), self.assertRaisesRegex(
+                ValueError, "faulthandler watchdog is unsafe"
+            ):
+                self.fresh(
+                    run_id=f"invalid-stack-{interval}",
+                    stack_snapshot_interval_seconds=interval,
+                )
+        self.assertFalse((self.root / "logs" / "writer_stacks.log").exists())
 
     def test_heartbeat_renewal_exception_is_logged_and_visible(self):
         session = self.fresh(heartbeat_interval_seconds=0.01)

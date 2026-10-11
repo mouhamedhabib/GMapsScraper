@@ -41,6 +41,7 @@ class LocalReleaseTests(TestCase):
             backup_directory=str(root / "backups"),
             export_directory=str(root / "exports"),
             browser_home=str(root / "browser-home"),
+            show_browser=False,
             diagnostic_stack_interval_seconds=None,
         )
 
@@ -52,6 +53,7 @@ class LocalReleaseTests(TestCase):
         self.assertEqual(Path(args.registry_path), DEFAULT_LOCAL_REGISTRY)
         self.assertEqual(Path(args.export_directory), DEFAULT_LOCAL_EXPORTS)
         self.assertEqual(Path(args.browser_home), DEFAULT_BROWSER_HOME)
+        self.assertFalse(args.show_browser)
         self.assertIsNone(args.diagnostic_stack_interval_seconds)
 
     def test_fresh_command_is_fixed_to_authoritative_local_options(self):
@@ -72,21 +74,24 @@ class LocalReleaseTests(TestCase):
         self.assertNotIn("--registry-run-id", command)
         self.assertEqual(command[command.index("--resume-run-id") + 1], "daily-1")
 
-    def test_stack_snapshot_opt_in_is_forwarded_without_changing_defaults(self):
+    def test_show_browser_is_forwarded_for_resume(self):
+        command = build_maps_command(
+            query_file="queries.txt", max_new=3, run_id="daily-1",
+            resume=True, show_browser=True,
+        )
+        self.assertIn("--show-browser", command)
+
+    def test_stack_snapshot_watchdog_cannot_be_forwarded(self):
         default = build_maps_command(
             query_file="queries.txt", max_new=3, run_id="daily-1", resume=True,
         )
         self.assertNotIn("--diagnostic-stack-interval-seconds", default)
-        enabled = build_maps_command(
-            query_file="queries.txt", max_new=3, run_id="daily-1", resume=True,
-            diagnostic_stack_interval_seconds=30,
-        )
-        option = enabled.index("--diagnostic-stack-interval-seconds")
-        self.assertEqual(enabled[option + 1], "30")
-        with self.assertRaisesRegex(LocalReleaseError, "must be > 0"):
+        with self.assertRaisesRegex(
+            LocalReleaseError, "faulthandler watchdog is unsafe"
+        ):
             build_maps_command(
                 query_file="queries.txt", max_new=3, run_id="daily-1",
-                diagnostic_stack_interval_seconds=0,
+                diagnostic_stack_interval_seconds=30,
             )
 
     def test_production_and_shadow_paths_are_rejected(self):
@@ -143,16 +148,37 @@ class LocalReleaseTests(TestCase):
                 execute_release(args, runner=runner)
             runner.assert_not_called()
 
-    def test_invalid_stack_interval_fails_before_backup_or_launch(self):
+    def test_stack_watchdog_option_fails_before_backup_or_launch(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             registry = self.make_registry(root)
             args = self.release_args(root, registry)
-            args.diagnostic_stack_interval_seconds = 0
+            args.diagnostic_stack_interval_seconds = 30
             runner = Mock()
             with (
                 patch("local_release.create_verified_backup") as backup,
-                self.assertRaisesRegex(LocalReleaseError, "must be > 0"),
+                self.assertRaisesRegex(
+                    LocalReleaseError, "faulthandler watchdog is unsafe"
+                ),
+            ):
+                execute_release(args, runner=runner)
+            backup.assert_not_called()
+            runner.assert_not_called()
+
+    def test_missing_wslg_display_fails_before_backup_or_launch(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self.make_registry(root)
+            args = self.release_args(root, registry)
+            args.show_browser = True
+            runner = Mock()
+            with (
+                patch(
+                    "local_release.validate_wslg_display",
+                    side_effect=ValueError("WSLg display unavailable"),
+                ),
+                patch("local_release.create_verified_backup") as backup,
+                self.assertRaisesRegex(LocalReleaseError, "WSLg display unavailable"),
             ):
                 execute_release(args, runner=runner)
             backup.assert_not_called()

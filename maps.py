@@ -19,21 +19,22 @@ Previous / next:
     This is the pipeline entry point; ``utils/build_leads.py`` normally follows.
 """
 
-from utils.threading_controller import FastSearchAlgo
 from argparse import ArgumentParser
 from os import R_OK, access
 from os.path import isfile
 from pathlib import Path
 import sys
 
-from job_search.csv_exports import DEFAULT_EXPORT_DIRECTORY, export_maps_rows
+from company_registry.discovery_adapter import DiscoveryMode, parse_discovery_mode
+from company_registry.maps_authoritative import DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY
 from company_registry.shadow import (
     DEFAULT_REPORT_DIRECTORY,
     DEFAULT_SHADOW_DATABASE,
     open_shadow_observer,
 )
-from company_registry.discovery_adapter import DiscoveryMode, parse_discovery_mode
-from company_registry.maps_authoritative import DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY
+from job_search.csv_exports import DEFAULT_EXPORT_DIRECTORY, export_maps_rows
+from utils.display_environment import validate_wslg_display
+from utils.threading_controller import FastSearchAlgo
 
 
 def _finalize_shadow(observer, observability=None):
@@ -76,6 +77,8 @@ def run_maps_discovery(
     diagnostic_stack_interval_seconds=None,
 ):
     """Run the existing Maps pipeline incrementally and return its counters."""
+    if windowed:
+        validate_wslg_display()
     queries = FastSearchAlgo.load_query_file(file_name=str(query_file))
     if not queries:
         raise ValueError(f"No usable search queries found in {query_file}")
@@ -163,8 +166,8 @@ class GMapsScraper:
         parser.add_argument('-se', '--suggested-ext',
                             help='Suggested URL extensions to try (can be specified multiple times)', action='append',
                             default=None)
-        parser.add_argument('-wb', '--windowed-browser',
-                            help='Disable headless mode', action='store_false',
+        parser.add_argument('-wb', '--windowed-browser', '--show-browser',
+                            help='Show Chrome in a visible WSLg window', action='store_false',
                             default=True)
         parser.add_argument('-nv', '--disable-verbose', help='Disable verbose mode', action='store_true')
         parser.add_argument('-o', '--output-folder',
@@ -245,8 +248,7 @@ class GMapsScraper:
         parser.add_argument(
             '--diagnostic-stack-interval-seconds', type=float,
             help=(
-                'Opt in to bounded periodic all-thread stack snapshots for an '
-                'authoritative run'
+                'Disabled: periodic faulthandler stack snapshots are unsafe'
             ),
         )
         parser.add_argument(
@@ -268,6 +270,11 @@ class GMapsScraper:
 
         self._parser = parser
         self._args = parser.parse_args()
+        if not self._args.windowed_browser:
+            try:
+                validate_wslg_display()
+            except ValueError as error:
+                parser.error(str(error))
         if self._args.limit < 1:
             parser.error("--limit must be >= 1")
         if self._args.threads < 1:
@@ -299,17 +306,10 @@ class GMapsScraper:
             parser.error(
                 "--allow-production-registry requires --discovery-mode authoritative"
             )
-        if (
-            self._args.diagnostic_stack_interval_seconds is not None
-            and self._args.diagnostic_stack_interval_seconds <= 0
-        ):
-            parser.error("--diagnostic-stack-interval-seconds must be > 0")
-        if (
-            self._args.diagnostic_stack_interval_seconds is not None
-            and not self._effective_mode.is_authoritative
-        ):
+        if self._args.diagnostic_stack_interval_seconds is not None:
             parser.error(
-                "--diagnostic-stack-interval-seconds requires an authoritative mode"
+                "--diagnostic-stack-interval-seconds is disabled because the "
+                "CPython faulthandler watchdog is unsafe"
             )
 
     @staticmethod

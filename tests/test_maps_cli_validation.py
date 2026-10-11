@@ -39,25 +39,42 @@ class MapsCliValidationTests(TestCase):
         self.assertEqual(app._args.known_companies_dir, "./CSV_FILES")
         self.assertFalse(app._args.allow_empty_known_companies)
         self.assertIsNone(app._args.diagnostic_stack_interval_seconds)
+        self.assertTrue(app._args.windowed_browser)
         self.assertEqual(app._effective_mode.value, "legacy")
 
-    def test_stack_snapshots_are_positive_opt_in_for_authoritative_mode(self):
-        self.assert_parse_error(
-            "must be > 0",
-            "--discovery-mode", "authoritative-canary",
-            "--registry-database", "/tmp/disposable.db",
-            "--diagnostic-stack-interval-seconds", "0",
-        )
-        self.assert_parse_error(
-            "requires an authoritative mode",
-            "--diagnostic-stack-interval-seconds", "30",
-        )
-        app = self.parse(
-            "--discovery-mode", "authoritative-canary",
-            "--registry-database", "/tmp/disposable.db",
-            "--diagnostic-stack-interval-seconds", "30",
-        )
-        self.assertEqual(app._args.diagnostic_stack_interval_seconds, 30)
+    def test_show_browser_alias_validates_wslg_and_disables_headless(self):
+        for option in ("--show-browser", "--windowed-browser"):
+            with self.subTest(option=option), patch(
+                "maps.validate_wslg_display"
+            ) as validate:
+                app = self.parse(option)
+                self.assertFalse(app._args.windowed_browser)
+                validate.assert_called_once_with()
+
+    def test_show_browser_rejects_missing_wslg_display(self):
+        with patch(
+            "maps.validate_wslg_display",
+            side_effect=ValueError("WSLg display unavailable"),
+        ):
+            self.assert_parse_error("WSLg display unavailable", "--show-browser")
+
+    def test_stack_snapshot_watchdog_is_always_rejected(self):
+        for arguments in (
+            ("--diagnostic-stack-interval-seconds", "30"),
+            (
+                "--discovery-mode", "authoritative-canary",
+                "--registry-database", "/tmp/disposable.db",
+                "--diagnostic-stack-interval-seconds", "30",
+            ),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assert_parse_error(
+                    "faulthandler watchdog is unsafe", *arguments
+                )
+
+    def test_programmatic_maps_runner_rejects_stack_watchdog(self):
+        with self.assertRaisesRegex(ValueError, "faulthandler watchdog is unsafe"):
+            FastSearchAlgo(diagnostic_stack_interval_seconds=30)
 
     def test_discovery_modes_are_explicit_and_mutually_exclusive(self):
         shadow = self.parse("--discovery-mode", "shadow")

@@ -610,7 +610,7 @@ class GoogleMaps:
     def _prompt_for_manual_maps_action(self, query: str, *, consent: bool) -> bool:
         if self._headless:
             label = "consent" if consent else "verification"
-            print(f"[!] Google Maps {label} requires --windowed-browser.")
+            print(f"[!] Google Maps {label} requires --show-browser.")
             return False
         if consent:
             print("[!] Google Maps consent action required.")

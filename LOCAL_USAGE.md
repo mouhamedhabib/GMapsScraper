@@ -22,6 +22,7 @@ ignored. The safe defaults are:
 - Browser HOME: `data/local_registry/browser_home`
 - Mode: authoritative Google Maps
 - Browser resource mode: one low-resource worker
+- Browser visibility: headless unless `--show-browser` is supplied
 
 The wrapper creates the browser HOME with mode `0700`. It never adds
 `--allow-production-registry` and refuses the canonical production and shadow
@@ -84,31 +85,31 @@ python local_release.py resume \
 Resume is never automatic. An unknown run ID or a stored configuration mismatch
 fails before browser work.
 
-For a run under heartbeat investigation, explicitly enable bounded periodic
-all-thread snapshots (60 seconds is an operational diagnostic choice, not a
-lease change):
+Periodic stack snapshots are disabled because CPython 3.12.3
+`faulthandler.dump_traceback_later()` caused a confirmed SIGSEGV. Supplying
+`--diagnostic-stack-interval-seconds` fails before backup or browser launch.
+Structured diagnostics remain enabled without that option. To show Chrome in a
+normal WSLg window, add `--show-browser`. The wrapper requires a live WSLg X11
+or Wayland socket and fails before backup/browser launch if one is unavailable;
+it never silently falls back to headless mode. The exact safe visible-browser
+resume command for the interrupted global run is:
 
 ```bash
 python local_release.py resume \
   --query-file queries.txt \
   --max-new 100 \
   --run-id maps-20261011-global-01 \
-  --diagnostic-stack-interval-seconds 60
+  --show-browser
 ```
 
 Structured heartbeat, SQLite-stage, process/scheduler, and website-stage timing
 is always retained for authoritative runs at
-`data/local_registry/logs/writer_lease.jsonl` (1 MiB plus three backups). The
-stack opt-in writes one current plus three rotated private files at
-`data/local_registry/logs/writer_stacks.log*`. Stack files contain Python file
-paths and function names but no locals or page content. Inspect them without
-starting Maps:
+`data/local_registry/logs/writer_lease.jsonl` (1 MiB plus three backups).
+Inspect it without starting Maps:
 
 ```bash
 jq -c 'select(.run_id == "maps-20261011-global-01")' \
   data/local_registry/logs/writer_lease.jsonl
-ls -lh data/local_registry/logs/writer_stacks.log*
-sed -n '1,240p' data/local_registry/logs/writer_stacks.log
 ```
 
 ## Output files

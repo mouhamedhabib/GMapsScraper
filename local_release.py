@@ -18,6 +18,7 @@ from company_registry.exports import verify_run_exports
 from company_registry.schema import SCHEMA_VERSION
 from company_registry.shadow import DEFAULT_SHADOW_DATABASE
 from company_registry.storage import DEFAULT_DATABASE
+from utils.display_environment import validate_wslg_display
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -149,6 +150,7 @@ def build_maps_command(
     registry_path: str | Path = DEFAULT_LOCAL_REGISTRY,
     export_directory: str | Path = DEFAULT_LOCAL_EXPORTS,
     resume: bool = False,
+    show_browser: bool = False,
     diagnostic_stack_interval_seconds: float | None = None,
 ) -> list[str]:
     """Construct the fixed authoritative Maps command for a fresh or resumed run."""
@@ -156,11 +158,11 @@ def build_maps_command(
         raise LocalReleaseError("--max-new must be >= 1")
     if not run_id.strip():
         raise LocalReleaseError("--run-id must not be empty")
-    if (
-        diagnostic_stack_interval_seconds is not None
-        and diagnostic_stack_interval_seconds <= 0
-    ):
-        raise LocalReleaseError("--diagnostic-stack-interval-seconds must be > 0")
+    if diagnostic_stack_interval_seconds is not None:
+        raise LocalReleaseError(
+            "--diagnostic-stack-interval-seconds is disabled because the "
+            "CPython faulthandler watchdog is unsafe"
+        )
     identifier_option = "--resume-run-id" if resume else "--registry-run-id"
     command = [
         sys.executable,
@@ -173,11 +175,8 @@ def build_maps_command(
         identifier_option, run_id,
         "--authoritative-export-dir", str(_resolved(export_directory)),
     ]
-    if diagnostic_stack_interval_seconds is not None:
-        command.extend([
-            "--diagnostic-stack-interval-seconds",
-            str(diagnostic_stack_interval_seconds),
-        ])
+    if show_browser:
+        command.append("--show-browser")
     return command
 
 
@@ -210,10 +209,6 @@ def _lease_diagnostic_path(registry: Path) -> Path:
     return registry.parent / "logs/writer_lease.jsonl"
 
 
-def _stack_diagnostic_path(registry: Path) -> Path:
-    return registry.parent / "logs/writer_stacks.log"
-
-
 def execute_release(
     args: Namespace,
     *,
@@ -227,8 +222,17 @@ def execute_release(
     if not any(line.strip() for line in query_file.read_text(encoding="utf-8").splitlines()):
         raise LocalReleaseError(f"Query file has no usable queries: {query_file}")
     stack_interval = getattr(args, "diagnostic_stack_interval_seconds", None)
-    if stack_interval is not None and stack_interval <= 0:
-        raise LocalReleaseError("--diagnostic-stack-interval-seconds must be > 0")
+    if stack_interval is not None:
+        raise LocalReleaseError(
+            "--diagnostic-stack-interval-seconds is disabled because the "
+            "CPython faulthandler watchdog is unsafe"
+        )
+    show_browser = getattr(args, "show_browser", False)
+    if show_browser:
+        try:
+            validate_wslg_display()
+        except ValueError as error:
+            raise LocalReleaseError(str(error)) from error
     _validate_run_selection(registry, args.run_id, args.command == "resume")
     pre_backup = create_verified_backup(
         registry, args.backup_directory, label=f"pre-{args.run_id}"
@@ -246,20 +250,15 @@ def execute_release(
         registry_path=registry,
         export_directory=args.export_directory,
         resume=args.command == "resume",
+        show_browser=show_browser,
         diagnostic_stack_interval_seconds=stack_interval,
     )
     completed = runner(command, cwd=PROJECT_ROOT, env=environment, check=False)
     if completed.returncode != 0:
-        stack_diagnostic = (
-            f"; thread-stack diagnostics: {_stack_diagnostic_path(registry)}"
-            if getattr(args, "diagnostic_stack_interval_seconds", None) is not None
-            else ""
-        )
         raise LocalReleaseError(
             f"Maps process failed with exit code {completed.returncode}; "
             f"verified pre-run backup: {pre_backup['path']}; "
             f"writer-lease diagnostics: {_lease_diagnostic_path(registry)}"
-            f"{stack_diagnostic}"
         )
     status = _run_status(registry, args.run_id)
     if status != "SUCCESS":
@@ -278,11 +277,6 @@ def execute_release(
         "post_backup": post_backup,
         "exports": exports,
         "lease_diagnostics": _lease_diagnostic_path(registry),
-        "stack_diagnostics": (
-            _stack_diagnostic_path(registry)
-            if getattr(args, "diagnostic_stack_interval_seconds", None) is not None
-            else None
-        ),
     }
 
 
@@ -318,8 +312,12 @@ def build_parser() -> ArgumentParser:
             help="Isolated writable HOME for Chrome/ChromeDriver caches",
         )
         operation.add_argument(
+            "--show-browser", action="store_true",
+            help="Show Chrome in a visible WSLg window",
+        )
+        operation.add_argument(
             "--diagnostic-stack-interval-seconds", type=float,
-            help="Opt in to bounded periodic Python thread stack snapshots",
+            help="Disabled: periodic faulthandler stack snapshots are unsafe",
         )
     return parser
 
@@ -340,8 +338,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{name.title()} manifest: {export['manifest']}")
         print(f"Post-run backup: {result['post_backup']['path']}")
         print(f"Writer-lease diagnostics: {result['lease_diagnostics']}")
-        if result["stack_diagnostics"] is not None:
-            print(f"Thread-stack diagnostics: {result['stack_diagnostics']}")
         return 0
     except (LocalReleaseError, OSError, sqlite3.Error, UnicodeError, ValueError) as error:
         print(f"Local release failed safely: {error}", file=sys.stderr)
