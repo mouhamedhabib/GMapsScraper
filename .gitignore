@@ -213,6 +213,6 @@ cookies*.json
 # Local browser installer
 /google-chrome-stable_current_amd64.deb
 
-/queries.txt/
+/queries.txt
 
 /google_queries.txt/
