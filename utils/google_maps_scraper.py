@@ -271,7 +271,14 @@ class GoogleMaps:
 
         self._query_states = []
 
-        self._web_pattern_scraper = PatternScrapper(wait_time=self._wait_time, verbose=self._verbose)
+        self._web_pattern_scraper = PatternScrapper(
+            wait_time=self._wait_time,
+            verbose=self._verbose,
+            timing_callback=(
+                self._authoritative_session.record_runtime_diagnostic
+                if self._authoritative_session is not None else None
+            ),
+        )
         if self.__output_format.lower() == "json":
             self._file_creator = JSONCreator(file_lock=print_lock, output_path=output_path)
         elif self.__output_format.lower() == "excel":

@@ -26,22 +26,36 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup
 from re import compile
 from time import monotonic
-from typing import Optional
+from typing import Callable, Optional
 
 
 class PatternScrapper:
     """Extract contact patterns from a bounded set of rendered website pages."""
+
+    _EMAIL_LOCAL_CHARACTERS = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._%+-"
+    )
+    _EMAIL_DOMAIN_CHARACTERS = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"
+    )
+    _EMAIL_TLD_CHARACTERS = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
+    _MAX_EMAIL_LOCAL_CHARACTERS = 64
+    _MAX_EMAIL_DOMAIN_CHARACTERS = 253
 
     def __init__(
         self,
         wait_time: int = 15,
         verbose: bool = True,
         overall_timeout: Optional[float] = None,
+        timing_callback: Callable[..., None] | None = None,
     ):
         self._last_opened_handler = None
         self._wait_time = wait_time
         self._verbose = verbose
         self._overall_timeout = overall_timeout
+        self._timing_callback = timing_callback
         self.last_attempted_urls = []
         self.last_failure_kind = None
         self.last_failure_message = ""
@@ -56,6 +70,54 @@ class PatternScrapper:
         # Resolve the parser once; fall back to the stdlib parser when lxml is
         # absent so website parsing never hard-crashes mid-run.
         self._html_parser = self._resolve_parser()
+        self._timing = {}
+        self._reset_timing()
+
+    def _reset_timing(self) -> None:
+        self._timing = {
+            "navigation_seconds": 0.0,
+            "dom_retrieval_seconds": 0.0,
+            "parsing_seconds": 0.0,
+            "serialization_seconds": 0.0,
+            "regex_seconds": 0.0,
+            "dom_retrieval_count": 0,
+            "source_page_count": 0,
+            "dom_characters": 0,
+            "max_dom_characters": 0,
+            "serialized_characters": 0,
+        }
+
+    def _page_source(self, driver: WebDriver) -> str:
+        started = monotonic()
+        source = driver.page_source
+        self._timing["dom_retrieval_seconds"] += monotonic() - started
+        self._timing["dom_retrieval_count"] += 1
+        self._timing["dom_characters"] += len(source)
+        self._timing["max_dom_characters"] = max(
+            self._timing["max_dom_characters"], len(source)
+        )
+        return source
+
+    def _emit_timing(self, total_seconds: float, outcome: str) -> None:
+        if self._timing_callback is None:
+            return
+        details = {
+            key: round(value, 6) if key.endswith("_seconds") else value
+            for key, value in self._timing.items()
+        }
+        try:
+            self._timing_callback(
+                "website_enrichment_timing",
+                outcome=outcome,
+                parser=self._html_parser,
+                total_seconds=round(total_seconds, 6),
+                candidate_url_count=len(self.last_attempted_urls),
+                failure_kind=self.last_failure_kind,
+                **details,
+            )
+        except BaseException:
+            # Timing evidence must never affect scraping or persistence.
+            pass
 
     @staticmethod
     def _resolve_parser() -> str:
@@ -165,7 +227,13 @@ class PatternScrapper:
                     return remaining
 
                 driver.set_page_load_timeout(remaining_timeout())
-                driver.get(url)
+                navigation_started = monotonic()
+                try:
+                    driver.get(url)
+                finally:
+                    self._timing["navigation_seconds"] += (
+                        monotonic() - navigation_started
+                    )
 
                 wait = WebDriverWait(driver, remaining_timeout())
                 wait.until(lambda current_driver: current_driver.execute_script(
@@ -179,7 +247,7 @@ class PatternScrapper:
                 stable_polls = [0]
 
                 def dom_is_stable(current_driver):
-                    current_size = len(current_driver.page_source)
+                    current_size = len(self._page_source(current_driver))
                     if current_size == previous_size[0]:
                         stable_polls[0] += 1
                     else:
@@ -195,7 +263,7 @@ class PatternScrapper:
                     # end of this bounded rendering wait.
                     pass
 
-                source_codes.append(driver.page_source)
+                source_codes.append(self._page_source(driver))
             except TimeoutException as e:
                 self.last_failure_kind, self.last_failure_message = self._navigation_failure(e, url)
                 if self._verbose:
@@ -254,6 +322,65 @@ class PatternScrapper:
 
         return decoded_mail
 
+    def _scan_emails(self, text: str) -> list[str]:
+        """Extract bounded email candidates without rescanning every suffix."""
+        emails = []
+        search_from = 0
+        text_length = len(text)
+
+        while True:
+            at_index = text.find("@", search_from)
+            if at_index < 0:
+                break
+            search_from = at_index + 1
+
+            left_limit = max(0, at_index - self._MAX_EMAIL_LOCAL_CHARACTERS)
+            left = at_index
+            while (
+                left > left_limit
+                and text[left - 1] in self._EMAIL_LOCAL_CHARACTERS
+            ):
+                left -= 1
+            if left == at_index:
+                continue
+            if (
+                left == left_limit
+                and left > 0
+                and text[left - 1] in self._EMAIL_LOCAL_CHARACTERS
+            ):
+                continue
+
+            right_limit = min(
+                text_length,
+                at_index + 1 + self._MAX_EMAIL_DOMAIN_CHARACTERS,
+            )
+            right = at_index + 1
+            while (
+                right < right_limit
+                and text[right] in self._EMAIL_DOMAIN_CHARACTERS
+            ):
+                right += 1
+            if (
+                right == right_limit
+                and right < text_length
+                and text[right] in self._EMAIL_DOMAIN_CHARACTERS
+            ):
+                continue
+
+            # An unanchored regex used to stop before sentence punctuation or
+            # other non-letter domain suffixes. Preserve that behavior while
+            # keeping the final regex check bounded to an RFC-sized candidate.
+            while (
+                right > at_index + 1
+                and text[right - 1] not in self._EMAIL_TLD_CHARACTERS
+            ):
+                right -= 1
+            candidate = text[left:right]
+            if self._email_pattern.fullmatch(candidate):
+                emails.append(candidate)
+
+        return emails
+
     def _href_emails(self, soup: BeautifulSoup) -> list:
         email_list = []
         mail_tos = soup.select('a[href]')
@@ -265,7 +392,7 @@ class PatternScrapper:
                     email_list.append(self.email_decoder(href.split("#", 1)[1]))
                 elif href_lower.startswith("mailto:"):
                     mailto_value = unquote(href[len("mailto:"):]).split("?", 1)[0]
-                    email_list.extend(self._email_pattern.findall(mailto_value))
+                    email_list.extend(self._scan_emails(mailto_value))
             except (ValueError, IndexError):
                 continue
 
@@ -301,9 +428,20 @@ class PatternScrapper:
                          "youtube_links": [], "linkedin_links": []}
 
         for source in source_codes:
+            parsing_started = monotonic()
             soup = BeautifulSoup(source, self._html_parser)
+            self._timing["parsing_seconds"] += monotonic() - parsing_started
+            self._timing["source_page_count"] += 1
 
-            site_email = self._email_pattern.findall(str(soup))
+            serialization_started = monotonic()
+            serialized = str(soup)
+            self._timing["serialization_seconds"] += (
+                monotonic() - serialization_started
+            )
+            self._timing["serialized_characters"] += len(serialized)
+
+            regex_started = monotonic()
+            site_email = self._scan_emails(serialized)
             site_email.extend(self._href_emails(soup))
 
             facebook_links = [link['href'] for link in soup.find_all('a', href=self._fb_pattern)]
@@ -311,6 +449,7 @@ class PatternScrapper:
             instagram_links = [link['href'] for link in soup.find_all('a', href=self._insta_pattern)]
             youtube_links = [link['href'] for link in soup.find_all('a', href=self._youtube_pattern)]
             linkedin_links = [link['href'] for link in soup.find_all('a', href=self._linkedin_pattern)]
+            self._timing["regex_seconds"] += monotonic() - regex_started
 
             patterns_data["site_email"].extend(site_email)
             patterns_data["facebook_links"].extend(facebook_links)
@@ -348,6 +487,9 @@ class PatternScrapper:
                 patterns_data[key] = unavailable
             return patterns_data
 
+        self._reset_timing()
+        timing_started = monotonic()
+        timing_outcome = "failed"
         valid_urls = self.create_urls(site_url, suggested_ext)
 
         self._last_opened_handler = driver.current_window_handle
@@ -358,22 +500,29 @@ class PatternScrapper:
                 print(f"[-] Website scraping failed: {site_url} ({type(e).__name__}: {e})")
             for key in patterns_data.keys():
                 patterns_data[key] = unavailable
+            timing_outcome = "navigation_failed"
             return patterns_data
+        finally:
+            if "sources" not in locals():
+                self._emit_timing(monotonic() - timing_started, timing_outcome)
 
         try:
-            social_data = self.get_pattern_data(sources)
+            try:
+                social_data = self.get_pattern_data(sources)
+            finally:
+                # HTML strings can be several megabytes. Release them as soon as
+                # this company's parse finishes rather than retaining the list.
+                sources.clear()
+
+            for key in social_data.keys():
+                if not social_data[key]:
+                    patterns_data[key] = unavailable
+                else:
+                    patterns_data[key] = social_data[key][0]
+            timing_outcome = "completed"
+            return patterns_data
         finally:
-            # HTML strings can be several megabytes. Release them as soon as
-            # this company's parse finishes rather than retaining the list.
-            sources.clear()
-
-        for key in social_data.keys():
-            if not social_data[key]:
-                patterns_data[key] = unavailable
-            else:
-                patterns_data[key] = social_data[key][0]
-
-        return patterns_data
+            self._emit_timing(monotonic() - timing_started, timing_outcome)
 
 
 """Testing samples"""

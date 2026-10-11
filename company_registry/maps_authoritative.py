@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import faulthandler
 from hashlib import sha256
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
-from threading import Event, Lock, Thread
+import resource
+from threading import Event, Lock, Thread, current_thread, get_native_id
+from time import monotonic, process_time
 from uuid import uuid4
 
 from company_registry.discovery_adapter import (
@@ -46,6 +53,203 @@ from company_registry.storage import DEFAULT_DATABASE, open_registry
 
 
 DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY = Path("data/authoritative_maps")
+LEASE_DIAGNOSTIC_MAX_BYTES = 1024 * 1024
+LEASE_DIAGNOSTIC_BACKUP_COUNT = 3
+STACK_DIAGNOSTIC_BACKUP_COUNT = 3
+
+
+class _LeaseDiagnosticLog:
+    """Write bounded local JSONL evidence for one authoritative Maps session."""
+
+    def __init__(self, path: Path, run_id: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        self._logger = logging.getLogger(f"gmaps.lease.{uuid4()}")
+        self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
+        self._handler = RotatingFileHandler(
+            self.path,
+            maxBytes=LEASE_DIAGNOSTIC_MAX_BYTES,
+            backupCount=LEASE_DIAGNOSTIC_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        self._handler.setFormatter(logging.Formatter("%(message)s"))
+        self._logger.addHandler(self._handler)
+        os.chmod(self.path, 0o600)
+
+    def write(self, event: str, *, level: int = logging.INFO, **details) -> None:
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "run_id": self.run_id,
+            **details,
+        }
+        self._logger.log(level, json.dumps(record, sort_keys=True))
+
+    def close(self) -> None:
+        self._handler.flush()
+        self._handler.close()
+        self._logger.removeHandler(self._handler)
+
+
+def _process_diagnostics() -> dict:
+    """Return low-cost process and scheduler evidence for runtime events."""
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    thread_usage = (
+        resource.getrusage(resource.RUSAGE_THREAD)
+        if hasattr(resource, "RUSAGE_THREAD") else None
+    )
+    try:
+        load_1m, load_5m, load_15m = os.getloadavg()
+    except (AttributeError, OSError):
+        load_1m = load_5m = load_15m = None
+    return {
+        "pid": os.getpid(),
+        "native_thread_id": get_native_id(),
+        "monotonic_seconds": round(monotonic(), 6),
+        "process_cpu_seconds": round(process_time(), 6),
+        "process_user_cpu_seconds": round(usage.ru_utime, 6),
+        "process_system_cpu_seconds": round(usage.ru_stime, 6),
+        "voluntary_context_switches": usage.ru_nvcsw,
+        "involuntary_context_switches": usage.ru_nivcsw,
+        "thread_user_cpu_seconds": (
+            round(thread_usage.ru_utime, 6) if thread_usage else None
+        ),
+        "thread_system_cpu_seconds": (
+            round(thread_usage.ru_stime, 6) if thread_usage else None
+        ),
+        "thread_voluntary_context_switches": (
+            thread_usage.ru_nvcsw if thread_usage else None
+        ),
+        "thread_involuntary_context_switches": (
+            thread_usage.ru_nivcsw if thread_usage else None
+        ),
+        "max_rss_kib": usage.ru_maxrss,
+        "system_load_1m": round(load_1m, 6) if load_1m is not None else None,
+        "system_load_5m": round(load_5m, 6) if load_5m is not None else None,
+        "system_load_15m": round(load_15m, 6) if load_15m is not None else None,
+        "cpu_count": os.cpu_count(),
+    }
+
+
+class _PeriodicStackSnapshots:
+    """Keep a bounded rotation of opt-in all-thread stack snapshots."""
+
+    def __init__(
+        self,
+        path: Path,
+        run_id: str,
+        interval_seconds: float,
+        diagnostic_log: _LeaseDiagnosticLog,
+    ) -> None:
+        self.path = path
+        self.run_id = run_id
+        self.interval_seconds = interval_seconds
+        self._diagnostic_log = diagnostic_log
+        self._stop = Event()
+        self._thread: Thread | None = None
+
+    def _rotate(self) -> None:
+        oldest = Path(f"{self.path}.{STACK_DIAGNOSTIC_BACKUP_COUNT}")
+        oldest.unlink(missing_ok=True)
+        for index in range(STACK_DIAGNOSTIC_BACKUP_COUNT - 1, 0, -1):
+            source = Path(f"{self.path}.{index}")
+            if source.exists():
+                source.replace(Path(f"{self.path}.{index + 1}"))
+        if self.path.exists():
+            self.path.replace(Path(f"{self.path}.1"))
+
+    def _run(self) -> None:
+        reason = "shutdown_requested"
+        initial_snapshot_pending = True
+        try:
+            while not self._stop.is_set():
+                self._rotate()
+                with self.path.open("w", encoding="utf-8") as handle:
+                    os.chmod(self.path, 0o600)
+                    handle.write(
+                        f"timestamp={datetime.now(timezone.utc).isoformat()} "
+                        f"run_id={self.run_id} pid={os.getpid()}\n"
+                    )
+                    handle.flush()
+                    if initial_snapshot_pending:
+                        faulthandler.dump_traceback(
+                            file=handle, all_threads=True,
+                        )
+                        handle.flush()
+                        initial_snapshot_pending = False
+                        self._diagnostic_log.write(
+                            "stack_snapshot_initial_written",
+                            path=str(self.path),
+                            **_process_diagnostics(),
+                        )
+                    # The CPython watchdog used here can emit this one pre-armed
+                    # snapshot even when ordinary Python threads cannot get the
+                    # GIL. It intentionally does not repeat while starved, which
+                    # keeps an extended stall from growing the file without bound.
+                    faulthandler.dump_traceback_later(
+                        self.interval_seconds,
+                        repeat=False,
+                        file=handle,
+                    )
+                    grace = min(max(self.interval_seconds * 0.1, 0.01), 0.25)
+                    stopped = self._stop.wait(self.interval_seconds + grace)
+                    faulthandler.cancel_dump_traceback_later()
+                    handle.flush()
+                if stopped:
+                    break
+        except BaseException as error:
+            reason = "snapshot_failure"
+            self._diagnostic_log.write(
+                "stack_snapshot_failed",
+                level=logging.ERROR,
+                error_type=type(error).__name__,
+                error_message=str(error),
+                **_process_diagnostics(),
+            )
+        finally:
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except BaseException:
+                pass
+            self._diagnostic_log.write(
+                "stack_snapshot_thread_stopped",
+                reason=reason,
+                path=str(self.path),
+                **_process_diagnostics(),
+            )
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.path.parent, 0o700)
+        self._stop.clear()
+        self._thread = Thread(
+            target=self._run,
+            name=f"registry-stacks-{self.run_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        self._diagnostic_log.write(
+            "stack_snapshot_thread_started",
+            interval_seconds=self.interval_seconds,
+            path=str(self.path),
+            backup_count=STACK_DIAGNOSTIC_BACKUP_COUNT,
+            **_process_diagnostics(),
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except BaseException:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.interval_seconds + 1, 1))
+            self._thread = None
 
 
 class UnsafeAuthoritativePathError(ValueError):
@@ -203,6 +407,7 @@ class AuthoritativeMapsSession:
         new_company_limit: int | None = None,
         lease_seconds: int = 120,
         heartbeat_interval_seconds: float = 40.0,
+        stack_snapshot_interval_seconds: float | None = None,
         lease_owner: str | None = None,
         allow_production_registry: bool = False,
     ) -> None:
@@ -214,6 +419,11 @@ class AuthoritativeMapsSession:
             raise ValueError("lease_seconds must be >= 1")
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be > 0")
+        if (
+            stack_snapshot_interval_seconds is not None
+            and stack_snapshot_interval_seconds <= 0
+        ):
+            raise ValueError("stack_snapshot_interval_seconds must be > 0")
         self.mode = parse_discovery_mode(mode)
         if not self.mode.is_authoritative:
             raise ValueError("AuthoritativeMapsSession requires an authoritative mode")
@@ -228,6 +438,7 @@ class AuthoritativeMapsSession:
         self.new_company_limit = new_company_limit
         self.lease_seconds = lease_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.stack_snapshot_interval_seconds = stack_snapshot_interval_seconds
         self.lease_owner = lease_owner or f"maps-writer-{uuid4()}"
         self.adapter = AuthoritativeDiscoveryAdapter(self.database, mode=self.mode)
         self.export_result: dict | None = None
@@ -239,6 +450,12 @@ class AuthoritativeMapsSession:
         self._heartbeat_thread: Thread | None = None
         self._heartbeat_error: BaseException | None = None
         self._heartbeat_lock = Lock()
+        self._last_successful_renewal_at: str | None = None
+        self._last_successful_renewal_monotonic: float | None = None
+        self.diagnostic_log_path = self.database.parent / "logs/writer_lease.jsonl"
+        self.stack_diagnostic_path = self.database.parent / "logs/writer_stacks.log"
+        self._diagnostic_log: _LeaseDiagnosticLog | None = None
+        self._stack_snapshots: _PeriodicStackSnapshots | None = None
         if self.is_resume:
             # Explicit resume remains read-only until configure_queries() can
             # validate the complete query-dependent configuration.
@@ -284,6 +501,7 @@ class AuthoritativeMapsSession:
                     ),
                 )
                 connection.commit()
+                self._remember_successful_renewal(now)
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
@@ -309,6 +527,9 @@ class AuthoritativeMapsSession:
                 expected_config_hash=config_hash,
                 expected_new_company_limit=self.new_company_limit,
                 lease_seconds=self.lease_seconds,
+            )
+            self._remember_successful_renewal(
+                datetime.now(timezone.utc).isoformat()
             )
             return
         now = datetime.now(timezone.utc).isoformat()
@@ -338,36 +559,254 @@ class AuthoritativeMapsSession:
         finally:
             connection.close()
 
-    def heartbeat(self) -> str:
+    def heartbeat(self, *, timing_callback=None) -> str:
         """Renew this session's lease or fail if ownership was lost."""
-        return heartbeat_run_lease(
+        expiration = heartbeat_run_lease(
             self.database,
             self.run_id,
             self.lease_owner,
             lease_seconds=self.lease_seconds,
+            timing_callback=timing_callback,
+        )
+        self._remember_successful_renewal(datetime.now(timezone.utc).isoformat())
+        return expiration
+
+    def _remember_successful_renewal(self, timestamp: str) -> None:
+        with self._heartbeat_lock:
+            self._last_successful_renewal_at = timestamp
+            self._last_successful_renewal_monotonic = monotonic()
+
+    def _ensure_diagnostic_log(self) -> _LeaseDiagnosticLog:
+        if self._diagnostic_log is None:
+            self._diagnostic_log = _LeaseDiagnosticLog(
+                self.diagnostic_log_path, self.run_id,
+            )
+        return self._diagnostic_log
+
+    def _thread_diagnostics(self) -> dict:
+        thread = self._heartbeat_thread
+        return {
+            "heartbeat_thread_name": thread.name if thread else None,
+            "heartbeat_thread_ident": thread.ident if thread else None,
+            "heartbeat_thread_alive": bool(thread and thread.is_alive()),
+            "heartbeat_stop_requested": self._heartbeat_stop.is_set(),
+        }
+
+    def _renewal_diagnostics(self) -> dict:
+        now = datetime.now(timezone.utc)
+        with self._heartbeat_lock:
+            last_at = self._last_successful_renewal_at
+            last_monotonic = self._last_successful_renewal_monotonic
+            heartbeat_error = self._heartbeat_error
+        return {
+            "last_successful_renewal_at": last_at,
+            "elapsed_since_successful_renewal_seconds": (
+                round(
+                    (
+                        now
+                        - datetime.fromisoformat(last_at).astimezone(timezone.utc)
+                    ).total_seconds(),
+                    3,
+                )
+                if last_at is not None else None
+            ),
+            "active_elapsed_since_successful_renewal_seconds": (
+                round(monotonic() - last_monotonic, 3)
+                if last_monotonic is not None else None
+            ),
+            "heartbeat_error_type": (
+                type(heartbeat_error).__name__ if heartbeat_error else None
+            ),
+            **self._thread_diagnostics(),
+            **_process_diagnostics(),
+        }
+
+    def record_runtime_diagnostic(self, event: str, **details) -> None:
+        """Append a bounded non-content runtime diagnostic event."""
+        self._ensure_diagnostic_log().write(
+            event,
+            **details,
+            **_process_diagnostics(),
+        )
+
+    @staticmethod
+    def _is_lease_expiration(error: BaseException) -> bool:
+        current: BaseException | None = error
+        while current is not None:
+            if "writer lease has expired" in str(current):
+                return True
+            current = current.__cause__
+        return False
+
+    def _log_lease_expiration(self, error: BaseException, operation: str) -> None:
+        if not self._is_lease_expiration(error):
+            return
+        self._ensure_diagnostic_log().write(
+            "lease_expiration_detected",
+            level=logging.ERROR,
+            operation=operation,
+            error_type=type(error).__name__,
+            error_message=str(error),
+            **self._renewal_diagnostics(),
+        )
+
+    def _transition(self, target_status: str) -> None:
+        log = self._ensure_diagnostic_log()
+        log.write(
+            "lifecycle_transition_started",
+            target_status=target_status,
+            **self._thread_diagnostics(),
+        )
+        try:
+            transition_run(
+                self.database,
+                self.run_id,
+                target_status,
+                lease_owner=self.lease_owner,
+            )
+        except BaseException as error:
+            log.write(
+                "lifecycle_transition_failed",
+                level=logging.ERROR,
+                target_status=target_status,
+                error_type=type(error).__name__,
+                error_message=str(error),
+                **self._renewal_diagnostics(),
+            )
+            self._log_lease_expiration(error, f"transition_to_{target_status}")
+            raise
+        log.write(
+            "lifecycle_transition_succeeded",
+            target_status=target_status,
+            **self._thread_diagnostics(),
         )
 
     def _heartbeat_loop(self) -> None:
-        while not self._heartbeat_stop.wait(self.heartbeat_interval_seconds):
-            try:
-                self.heartbeat()
-            except BaseException as error:
-                with self._heartbeat_lock:
-                    self._heartbeat_error = error
-                self._heartbeat_stop.set()
-                return
+        log = self._ensure_diagnostic_log()
+        log.write(
+            "heartbeat_thread_started",
+            thread_name=current_thread().name,
+            thread_ident=current_thread().ident,
+            heartbeat_interval_seconds=self.heartbeat_interval_seconds,
+            lease_seconds=self.lease_seconds,
+            **_process_diagnostics(),
+        )
+        stop_reason = "shutdown_requested"
+        attempt_sequence = 0
+        try:
+            while True:
+                attempt_sequence += 1
+                scheduled_monotonic = monotonic() + self.heartbeat_interval_seconds
+                scheduled_at = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=self.heartbeat_interval_seconds)
+                ).isoformat()
+                log.write(
+                    "heartbeat_renewal_scheduled",
+                    attempt_sequence=attempt_sequence,
+                    scheduled_at=scheduled_at,
+                    scheduled_monotonic_seconds=round(scheduled_monotonic, 6),
+                    **_process_diagnostics(),
+                )
+                if self._heartbeat_stop.wait(self.heartbeat_interval_seconds):
+                    break
+                attempt_started = monotonic()
+                attempt_details = {
+                    "attempt_sequence": attempt_sequence,
+                    "scheduled_at": scheduled_at,
+                    "scheduled_monotonic_seconds": round(
+                        scheduled_monotonic, 6
+                    ),
+                    "attempt_monotonic_seconds": round(attempt_started, 6),
+                    "schedule_delay_seconds": round(
+                        max(0.0, attempt_started - scheduled_monotonic), 6
+                    ),
+                }
+                log.write(
+                    "heartbeat_renewal_attempt_entered",
+                    **attempt_details,
+                    **_process_diagnostics(),
+                )
+
+                def stage_timing(
+                    stage: str,
+                    phase: str,
+                    duration_seconds: float | None,
+                    error_type: str | None,
+                ) -> None:
+                    log.write(
+                        "heartbeat_renewal_stage",
+                        attempt_sequence=attempt_sequence,
+                        stage=stage,
+                        phase=phase,
+                        duration_seconds=(
+                            round(duration_seconds, 6)
+                            if duration_seconds is not None else None
+                        ),
+                        error_type=error_type,
+                        **_process_diagnostics(),
+                    )
+
+                try:
+                    expiration = self.heartbeat(timing_callback=stage_timing)
+                except BaseException as error:
+                    with self._heartbeat_lock:
+                        self._heartbeat_error = error
+                    stop_reason = "renewal_failure"
+                    log.write(
+                        "heartbeat_renewal_failed",
+                        level=logging.ERROR,
+                        error_type=type(error).__name__,
+                        error_message=str(error),
+                        thread_name=current_thread().name,
+                        thread_ident=current_thread().ident,
+                        attempt_duration_seconds=round(
+                            monotonic() - attempt_started, 6
+                        ),
+                        **attempt_details,
+                        **self._renewal_diagnostics(),
+                    )
+                    self._heartbeat_stop.set()
+                    return
+                log.write(
+                    "heartbeat_renewal_completed",
+                    lease_expires_at=expiration,
+                    attempt_duration_seconds=round(
+                        monotonic() - attempt_started, 6
+                    ),
+                    **attempt_details,
+                    **_process_diagnostics(),
+                )
+        finally:
+            log.write(
+                "heartbeat_thread_stopped",
+                reason=stop_reason,
+                thread_name=current_thread().name,
+                thread_ident=current_thread().ident,
+                **self._renewal_diagnostics(),
+            )
 
     def start_heartbeat(self) -> None:
         """Start process-local renewal after configuration validation."""
         if self._heartbeat_thread is not None:
             return
+        log = self._ensure_diagnostic_log()
         self._heartbeat_stop.clear()
+        if self.stack_snapshot_interval_seconds is not None:
+            self._stack_snapshots = _PeriodicStackSnapshots(
+                self.stack_diagnostic_path,
+                self.run_id,
+                self.stack_snapshot_interval_seconds,
+                log,
+            )
+            self._stack_snapshots.start()
         self._heartbeat_thread = Thread(
             target=self._heartbeat_loop,
             name=f"registry-lease-{self.run_id}",
             daemon=True,
         )
         self._heartbeat_thread.start()
+        log.write("heartbeat_startup_completed", **self._thread_diagnostics())
 
     def assert_heartbeat_healthy(self) -> None:
         with self._heartbeat_lock:
@@ -379,11 +818,31 @@ class AuthoritativeMapsSession:
 
     def release_lease(self) -> None:
         """Stop renewal and clear this writer's lease on graceful shutdown."""
+        log = self._ensure_diagnostic_log()
+        log.write("heartbeat_shutdown_requested", **self._thread_diagnostics())
         self._heartbeat_stop.set()
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=max(self.heartbeat_interval_seconds, 1))
             self._heartbeat_thread = None
-        release_run_lease(self.database, self.run_id, self.lease_owner)
+        if self._stack_snapshots is not None:
+            self._stack_snapshots.stop()
+            self._stack_snapshots = None
+        try:
+            release_run_lease(self.database, self.run_id, self.lease_owner)
+        except BaseException as error:
+            log.write(
+                "lease_release_failed",
+                level=logging.ERROR,
+                error_type=type(error).__name__,
+                error_message=str(error),
+                **self._renewal_diagnostics(),
+            )
+            raise
+        else:
+            log.write("lease_released", **self._renewal_diagnostics())
+        finally:
+            log.close()
+            self._diagnostic_log = None
 
     def resolve(self, observation: IdentityObservation, budget) -> AuthoritativeOutcome:
         """Preview, reserve possible NEW, then transactionally re-resolve."""
@@ -403,9 +862,10 @@ class AuthoritativeMapsSession:
             if reservation is not None:
                 reservation.release()
             return AuthoritativeOutcome("limit", preview)
-        except BaseException:
+        except BaseException as error:
             if reservation is not None:
                 reservation.release()
+            self._log_lease_expiration(error, "decision_commit")
             raise
 
         resolution = decision.resolution
@@ -455,9 +915,7 @@ class AuthoritativeMapsSession:
             raise RuntimeError(f"Discovery run {self.run_id!r} is already closed")
         if status not in {"SUCCESS", "PARTIAL"}:
             raise ValueError("Completed Maps runs must end in SUCCESS or PARTIAL")
-        transition_run(
-            self.database, self.run_id, "FINALIZING", lease_owner=self.lease_owner,
-        )
+        self._transition("FINALIZING")
         try:
             def inject(artifact: str) -> FailureInjector | None:
                 if failure_injector is None:
@@ -492,9 +950,7 @@ class AuthoritativeMapsSession:
                 verify_export_manifest(result["manifest"])
             if failure_injector:
                 failure_injector("after_exports_verified_before_success")
-            transition_run(
-                self.database, self.run_id, status, lease_owner=self.lease_owner,
-            )
+            self._transition(status)
             self._closed = True
             return self.export_result
         except BaseException:
@@ -511,9 +967,7 @@ class AuthoritativeMapsSession:
         if status not in {"FAILED", "INTERRUPTED"}:
             raise ValueError("Failed Maps runs must end in FAILED or INTERRUPTED")
         try:
-            transition_run(
-                self.database, self.run_id, status, lease_owner=self.lease_owner,
-            )
+            self._transition(status)
             self._closed = True
         finally:
             self.release_lease()

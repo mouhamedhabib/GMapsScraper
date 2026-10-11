@@ -57,6 +57,7 @@ class FastSearchAlgo:
                  resume_run_id=None,
                  authoritative_export_directory=DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY,
                  allow_production_registry: bool = False,
+                 diagnostic_stack_interval_seconds: float | None = None,
                  ) -> None:
         if workers < 1:
             raise ValueError("workers must be >= 1")
@@ -66,6 +67,11 @@ class FastSearchAlgo:
             raise ValueError("wait_time must be >= 1")
         if scroll_minutes < 1:
             raise ValueError("scroll_minutes must be >= 1")
+        if (
+            diagnostic_stack_interval_seconds is not None
+            and diagnostic_stack_interval_seconds <= 0
+        ):
+            raise ValueError("diagnostic_stack_interval_seconds must be > 0")
         if suggested_ext is None:
             suggested_ext = ["contact-us", "contact"]
 
@@ -86,6 +92,13 @@ class FastSearchAlgo:
             raise ValueError("registry_run_id and resume_run_id are mutually exclusive")
         if resume_run_id is not None and not self._discovery_mode.is_authoritative:
             raise ValueError("resume_run_id requires an authoritative discovery mode")
+        if (
+            diagnostic_stack_interval_seconds is not None
+            and not self._discovery_mode.is_authoritative
+        ):
+            raise ValueError(
+                "diagnostic_stack_interval_seconds requires an authoritative mode"
+            )
         self._authoritative_session = None
         if self._discovery_mode.is_authoritative:
             if registry_database is None:
@@ -98,6 +111,9 @@ class FastSearchAlgo:
                 resume_run_id=resume_run_id,
                 new_company_limit=result_range,
                 allow_production_registry=allow_production_registry,
+                stack_snapshot_interval_seconds=(
+                    diagnostic_stack_interval_seconds
+                ),
             )
             # Authoritative workers never initialize a writer in the legacy
             # output destination, even though their writer is never invoked.

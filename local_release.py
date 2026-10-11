@@ -149,14 +149,20 @@ def build_maps_command(
     registry_path: str | Path = DEFAULT_LOCAL_REGISTRY,
     export_directory: str | Path = DEFAULT_LOCAL_EXPORTS,
     resume: bool = False,
+    diagnostic_stack_interval_seconds: float | None = None,
 ) -> list[str]:
     """Construct the fixed authoritative Maps command for a fresh or resumed run."""
     if max_new < 1:
         raise LocalReleaseError("--max-new must be >= 1")
     if not run_id.strip():
         raise LocalReleaseError("--run-id must not be empty")
+    if (
+        diagnostic_stack_interval_seconds is not None
+        and diagnostic_stack_interval_seconds <= 0
+    ):
+        raise LocalReleaseError("--diagnostic-stack-interval-seconds must be > 0")
     identifier_option = "--resume-run-id" if resume else "--registry-run-id"
-    return [
+    command = [
         sys.executable,
         str(PROJECT_ROOT / "maps.py"),
         "--query-file", str(_resolved(query_file)),
@@ -167,6 +173,12 @@ def build_maps_command(
         identifier_option, run_id,
         "--authoritative-export-dir", str(_resolved(export_directory)),
     ]
+    if diagnostic_stack_interval_seconds is not None:
+        command.extend([
+            "--diagnostic-stack-interval-seconds",
+            str(diagnostic_stack_interval_seconds),
+        ])
+    return command
 
 
 def _validate_run_selection(registry: Path, run_id: str, resume: bool) -> None:
@@ -194,6 +206,14 @@ def _run_status(registry: Path, run_id: str) -> str | None:
         connection.close()
 
 
+def _lease_diagnostic_path(registry: Path) -> Path:
+    return registry.parent / "logs/writer_lease.jsonl"
+
+
+def _stack_diagnostic_path(registry: Path) -> Path:
+    return registry.parent / "logs/writer_stacks.log"
+
+
 def execute_release(
     args: Namespace,
     *,
@@ -206,6 +226,9 @@ def execute_release(
         raise LocalReleaseError(f"Query file does not exist: {query_file}")
     if not any(line.strip() for line in query_file.read_text(encoding="utf-8").splitlines()):
         raise LocalReleaseError(f"Query file has no usable queries: {query_file}")
+    stack_interval = getattr(args, "diagnostic_stack_interval_seconds", None)
+    if stack_interval is not None and stack_interval <= 0:
+        raise LocalReleaseError("--diagnostic-stack-interval-seconds must be > 0")
     _validate_run_selection(registry, args.run_id, args.command == "resume")
     pre_backup = create_verified_backup(
         registry, args.backup_directory, label=f"pre-{args.run_id}"
@@ -223,12 +246,20 @@ def execute_release(
         registry_path=registry,
         export_directory=args.export_directory,
         resume=args.command == "resume",
+        diagnostic_stack_interval_seconds=stack_interval,
     )
     completed = runner(command, cwd=PROJECT_ROOT, env=environment, check=False)
     if completed.returncode != 0:
+        stack_diagnostic = (
+            f"; thread-stack diagnostics: {_stack_diagnostic_path(registry)}"
+            if getattr(args, "diagnostic_stack_interval_seconds", None) is not None
+            else ""
+        )
         raise LocalReleaseError(
             f"Maps process failed with exit code {completed.returncode}; "
-            f"verified pre-run backup: {pre_backup['path']}"
+            f"verified pre-run backup: {pre_backup['path']}; "
+            f"writer-lease diagnostics: {_lease_diagnostic_path(registry)}"
+            f"{stack_diagnostic}"
         )
     status = _run_status(registry, args.run_id)
     if status != "SUCCESS":
@@ -246,6 +277,12 @@ def execute_release(
         "pre_backup": pre_backup,
         "post_backup": post_backup,
         "exports": exports,
+        "lease_diagnostics": _lease_diagnostic_path(registry),
+        "stack_diagnostics": (
+            _stack_diagnostic_path(registry)
+            if getattr(args, "diagnostic_stack_interval_seconds", None) is not None
+            else None
+        ),
     }
 
 
@@ -280,6 +317,10 @@ def build_parser() -> ArgumentParser:
             "--browser-home", default=str(DEFAULT_BROWSER_HOME),
             help="Isolated writable HOME for Chrome/ChromeDriver caches",
         )
+        operation.add_argument(
+            "--diagnostic-stack-interval-seconds", type=float,
+            help="Opt in to bounded periodic Python thread stack snapshots",
+        )
     return parser
 
 
@@ -298,6 +339,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{name.title()} CSV: {export['csv']}")
             print(f"{name.title()} manifest: {export['manifest']}")
         print(f"Post-run backup: {result['post_backup']['path']}")
+        print(f"Writer-lease diagnostics: {result['lease_diagnostics']}")
+        if result["stack_diagnostics"] is not None:
+            print(f"Thread-stack diagnostics: {result['stack_diagnostics']}")
         return 0
     except (LocalReleaseError, OSError, sqlite3.Error, UnicodeError, ValueError) as error:
         print(f"Local release failed safely: {error}", file=sys.stderr)

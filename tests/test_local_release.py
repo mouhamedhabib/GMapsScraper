@@ -41,6 +41,7 @@ class LocalReleaseTests(TestCase):
             backup_directory=str(root / "backups"),
             export_directory=str(root / "exports"),
             browser_home=str(root / "browser-home"),
+            diagnostic_stack_interval_seconds=None,
         )
 
     def test_parser_uses_permanent_local_defaults(self):
@@ -51,6 +52,7 @@ class LocalReleaseTests(TestCase):
         self.assertEqual(Path(args.registry_path), DEFAULT_LOCAL_REGISTRY)
         self.assertEqual(Path(args.export_directory), DEFAULT_LOCAL_EXPORTS)
         self.assertEqual(Path(args.browser_home), DEFAULT_BROWSER_HOME)
+        self.assertIsNone(args.diagnostic_stack_interval_seconds)
 
     def test_fresh_command_is_fixed_to_authoritative_local_options(self):
         command = build_maps_command(
@@ -69,6 +71,23 @@ class LocalReleaseTests(TestCase):
         self.assertIn("--resume-run-id", command)
         self.assertNotIn("--registry-run-id", command)
         self.assertEqual(command[command.index("--resume-run-id") + 1], "daily-1")
+
+    def test_stack_snapshot_opt_in_is_forwarded_without_changing_defaults(self):
+        default = build_maps_command(
+            query_file="queries.txt", max_new=3, run_id="daily-1", resume=True,
+        )
+        self.assertNotIn("--diagnostic-stack-interval-seconds", default)
+        enabled = build_maps_command(
+            query_file="queries.txt", max_new=3, run_id="daily-1", resume=True,
+            diagnostic_stack_interval_seconds=30,
+        )
+        option = enabled.index("--diagnostic-stack-interval-seconds")
+        self.assertEqual(enabled[option + 1], "30")
+        with self.assertRaisesRegex(LocalReleaseError, "must be > 0"):
+            build_maps_command(
+                query_file="queries.txt", max_new=3, run_id="daily-1",
+                diagnostic_stack_interval_seconds=0,
+            )
 
     def test_production_and_shadow_paths_are_rejected(self):
         for relative in ("data/company_registry.db", "data/company_registry_shadow.db"):
@@ -124,13 +143,31 @@ class LocalReleaseTests(TestCase):
                 execute_release(args, runner=runner)
             runner.assert_not_called()
 
+    def test_invalid_stack_interval_fails_before_backup_or_launch(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self.make_registry(root)
+            args = self.release_args(root, registry)
+            args.diagnostic_stack_interval_seconds = 0
+            runner = Mock()
+            with (
+                patch("local_release.create_verified_backup") as backup,
+                self.assertRaisesRegex(LocalReleaseError, "must be > 0"),
+            ):
+                execute_release(args, runner=runner)
+            backup.assert_not_called()
+            runner.assert_not_called()
+
     def test_subprocess_failure_is_reported_and_home_is_isolated(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             registry = self.make_registry(root)
             args = self.release_args(root, registry)
             runner = Mock(return_value=CompletedProcess([], 9))
-            with self.assertRaisesRegex(LocalReleaseError, "exit code 9"):
+            with self.assertRaisesRegex(
+                LocalReleaseError,
+                r"exit code 9.*logs/writer_lease\.jsonl",
+            ):
                 execute_release(args, runner=runner)
             kwargs = runner.call_args.kwargs
             self.assertEqual(kwargs["env"]["HOME"], str((root / "browser-home").resolve()))
@@ -156,6 +193,10 @@ class LocalReleaseTests(TestCase):
                     args, runner=Mock(return_value=CompletedProcess([], 0))
                 )
             self.assertEqual(result["status"], "SUCCESS")
+            self.assertEqual(
+                result["lease_diagnostics"],
+                registry.parent / "logs/writer_lease.jsonl",
+            )
             self.assertEqual(backup.call_count, 2)
             verify.assert_called_once_with(
                 registry.resolve(), args.run_id, (root / "exports").resolve()
@@ -170,4 +211,3 @@ class LocalReleaseTests(TestCase):
             with self.assertRaisesRegex(LocalReleaseError, "unknown run ID"):
                 execute_release(args, runner=runner)
             runner.assert_not_called()
-

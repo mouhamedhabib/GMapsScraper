@@ -2,12 +2,22 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep
 from unittest import TestCase
+from unittest.mock import patch
 
+from company_registry.discovery_adapter import RegistryUnavailableError
 from company_registry.maps_authoritative import AuthoritativeMapsSession, maps_observation
-from company_registry.run_lease import ActiveRunLeaseError, RunResumeError
+from company_registry.run_lease import (
+    ActiveRunLeaseError,
+    RunLeaseError,
+    RunResumeError,
+)
 from company_registry.storage import initialize_registry, open_registry
 from utils.run_acceptance_budget import RunAcceptanceBudget
 
@@ -78,6 +88,29 @@ class MapsResumeLeaseTests(TestCase):
         )
         connection.commit()
         connection.close()
+
+    def diagnostic_events(self, session):
+        if not session.diagnostic_log_path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in session.diagnostic_log_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+
+    def wait_for_diagnostic(self, session, event, timeout=2):
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            matches = [
+                item for item in self.diagnostic_events(session)
+                if item["event"] == event
+            ]
+            if matches:
+                return matches[-1]
+            sleep(0.01)
+        self.fail(f"diagnostic event was not recorded: {event}")
 
     def test_crash_resume_replays_checkpoint_and_uses_remaining_budget(self):
         crashed = self.fresh(limit=2)
@@ -210,3 +243,278 @@ class MapsResumeLeaseTests(TestCase):
         self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         connection.close()
+
+    def test_background_heartbeat_renews_during_processing_longer_than_lease(self):
+        session = self.fresh(
+            lease_seconds=1,
+            heartbeat_interval_seconds=0.1,
+        )
+        session.configure_queries(QUERIES)
+        before = self.run_row()
+        session.start_heartbeat()
+
+        deadline = monotonic() + 2
+        while monotonic() < deadline:
+            renewed = self.run_row()
+            if renewed["heartbeat_at"] > before["heartbeat_at"]:
+                break
+            sleep(0.02)
+        else:
+            self.fail("background heartbeat did not renew the lease")
+
+        # Model slow browser or website work that lasts beyond the original
+        # one-second lease without touching the registry from the worker.
+        sleep(1.1)
+        outcome = session.resolve(self.observation(), RunAcceptanceBudget(None))
+        self.assertEqual(outcome.outcome, "new")
+        session.fail("INTERRUPTED")
+
+    def test_expired_owner_cannot_commit(self):
+        session = self.fresh()
+        session.configure_queries(QUERIES)
+        self.expire_lease()
+
+        with self.assertRaisesRegex(RegistryUnavailableError, "lease has expired"):
+            session.resolve(self.observation(), RunAcceptanceBudget(None))
+
+        self.assertEqual(self.run_row()["status"], "RUNNING")
+        session.release_lease()
+
+    def test_heartbeat_startup_and_shutdown_diagnostics_are_retained(self):
+        session = self.fresh(heartbeat_interval_seconds=0.05)
+        session.configure_queries(QUERIES)
+        session.start_heartbeat()
+        started = self.wait_for_diagnostic(session, "heartbeat_thread_started")
+        self.assertEqual(started["run_id"], session.run_id)
+        self.assertTrue(started["thread_name"].startswith("registry-lease-"))
+
+        session.fail("INTERRUPTED")
+        events = self.diagnostic_events(session)
+        names = [item["event"] for item in events]
+        self.assertIn("heartbeat_startup_completed", names)
+        self.assertIn("heartbeat_shutdown_requested", names)
+        self.assertIn("heartbeat_thread_stopped", names)
+        self.assertIn("lifecycle_transition_succeeded", names)
+        self.assertIn("lease_released", names)
+        self.assertEqual(
+            session.diagnostic_log_path,
+            self.database.parent / "logs/writer_lease.jsonl",
+        )
+
+    def test_heartbeat_records_schedule_entry_sqlite_stages_and_completion(self):
+        session = self.fresh(heartbeat_interval_seconds=0.05)
+        session.configure_queries(QUERIES)
+        session.start_heartbeat()
+        completed = self.wait_for_diagnostic(
+            session, "heartbeat_renewal_completed"
+        )
+        session.fail("INTERRUPTED")
+
+        events = self.diagnostic_events(session)
+        scheduled = next(
+            item for item in events
+            if item["event"] == "heartbeat_renewal_scheduled"
+        )
+        entered = next(
+            item for item in events
+            if item["event"] == "heartbeat_renewal_attempt_entered"
+        )
+        stages = {
+            (item["stage"], item["phase"])
+            for item in events
+            if item["event"] == "heartbeat_renewal_stage"
+        }
+        for stage in (
+            "connection_opening", "schema_validation",
+            "transaction_acquisition", "lease_update", "commit",
+        ):
+            self.assertIn((stage, "started"), stages)
+            self.assertIn((stage, "completed"), stages)
+        self.assertEqual(scheduled["attempt_sequence"], 1)
+        self.assertEqual(entered["attempt_sequence"], 1)
+        self.assertGreaterEqual(entered["schedule_delay_seconds"], 0)
+        self.assertGreaterEqual(completed["attempt_duration_seconds"], 0)
+        self.assertEqual(completed["pid"], scheduled["pid"])
+        self.assertIsInstance(completed["native_thread_id"], int)
+        self.assertIn("process_cpu_seconds", completed)
+        self.assertIn("voluntary_context_switches", completed)
+
+    def test_expired_heartbeat_keeps_stage_evidence_and_fencing(self):
+        session = self.fresh()
+        session.configure_queries(QUERIES)
+        self.expire_lease()
+        timing = []
+
+        with self.assertRaisesRegex(RunLeaseError, "missing, expired, or owned"):
+            session.heartbeat(
+                timing_callback=lambda *values: timing.append(values)
+            )
+
+        self.assertIn(("connection_opening", "started", None, None), timing)
+        self.assertTrue(any(
+            stage == "lease_update" and phase == "completed"
+            for stage, phase, _, _ in timing
+        ))
+        self.assertFalse(any(stage == "commit" for stage, _, _, _ in timing))
+        self.assertEqual(self.run_row()["status"], "RUNNING")
+        session.release_lease()
+
+    def test_opt_in_stack_snapshots_are_private_rotated_and_cleaned_up(self):
+        session = self.fresh(
+            heartbeat_interval_seconds=5,
+            stack_snapshot_interval_seconds=0.03,
+        )
+        session.configure_queries(QUERIES)
+        session.start_heartbeat()
+
+        deadline = monotonic() + 1
+        while monotonic() < deadline:
+            if (
+                session.stack_diagnostic_path.exists()
+                and "Thread" in session.stack_diagnostic_path.read_text(
+                    encoding="utf-8"
+                )
+            ):
+                break
+            sleep(0.01)
+        else:
+            self.fail("stack snapshot was not written")
+
+        sleep(0.12)
+        session.fail("INTERRUPTED")
+        stack_files = list(
+            session.stack_diagnostic_path.parent.glob("writer_stacks.log*")
+        )
+        self.assertLessEqual(len(stack_files), 4)
+        self.assertTrue(stack_files)
+        for path in stack_files:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        names = [item["event"] for item in self.diagnostic_events(session)]
+        self.assertIn("stack_snapshot_thread_started", names)
+        self.assertIn("stack_snapshot_initial_written", names)
+        self.assertIn("stack_snapshot_thread_stopped", names)
+        self.assertIsNone(session._stack_snapshots)
+
+    def test_stack_snapshot_interval_is_opt_in_and_positive(self):
+        session = self.fresh()
+        self.assertIsNone(session.stack_snapshot_interval_seconds)
+        self.assertFalse(session.stack_diagnostic_path.exists())
+        session.release_lease()
+        with self.assertRaisesRegex(ValueError, "must be > 0"):
+            self.fresh(run_id="invalid-stack", stack_snapshot_interval_seconds=0)
+
+    def test_abrupt_process_exit_retains_startup_and_initial_stack_evidence(self):
+        script = """
+import json
+import os
+from pathlib import Path
+import sys
+from time import monotonic, sleep
+
+from company_registry.maps_authoritative import AuthoritativeMapsSession
+
+session = AuthoritativeMapsSession(
+    Path(sys.argv[1]),
+    Path(sys.argv[2]),
+    run_id="abrupt-run",
+    new_company_limit=2,
+    heartbeat_interval_seconds=30,
+    stack_snapshot_interval_seconds=30,
+)
+session.configure_queries(["software Tunis", "technology Sousse"])
+session.start_heartbeat()
+deadline = monotonic() + 2
+while monotonic() < deadline:
+    if session.diagnostic_log_path.exists():
+        events = [
+            json.loads(line).get("event")
+            for line in session.diagnostic_log_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+        if (
+            "stack_snapshot_initial_written" in events
+            and "heartbeat_renewal_scheduled" in events
+            and session.stack_diagnostic_path.exists()
+        ):
+            break
+    sleep(0.01)
+else:
+    raise RuntimeError("startup diagnostics were not written")
+os._exit(7)
+"""
+        result = subprocess.run(
+            [
+                sys.executable, "-c", script,
+                str(self.database), str(self.exports),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 7)
+        log_path = self.database.parent / "logs/writer_lease.jsonl"
+        events = [
+            json.loads(line)["event"]
+            for line in log_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertIn("heartbeat_startup_completed", events)
+        self.assertIn("heartbeat_renewal_scheduled", events)
+        self.assertIn("stack_snapshot_initial_written", events)
+        stack_path = self.database.parent / "logs/writer_stacks.log"
+        self.assertIn("Thread", stack_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.run_row("abrupt-run")["status"], "RUNNING")
+
+    def test_heartbeat_renewal_exception_is_logged_and_visible(self):
+        session = self.fresh(heartbeat_interval_seconds=0.01)
+        session.configure_queries(QUERIES)
+        with patch.object(
+            session,
+            "heartbeat",
+            side_effect=ValueError("injected renewal failure"),
+        ):
+            session.start_heartbeat()
+            failed = self.wait_for_diagnostic(
+                session, "heartbeat_renewal_failed"
+            )
+            with self.assertRaisesRegex(RuntimeError, "heartbeat failed"):
+                session.assert_heartbeat_healthy()
+
+        self.assertEqual(failed["error_type"], "ValueError")
+        self.assertEqual(failed["error_message"], "injected renewal failure")
+        self.assertIsNotNone(failed["last_successful_renewal_at"])
+        self.assertEqual(failed["heartbeat_error_type"], "ValueError")
+        session.fail("INTERRUPTED")
+
+    def test_expiration_diagnostic_retains_last_renewal_and_thread_state(self):
+        session = self.fresh(heartbeat_interval_seconds=0.05)
+        session.configure_queries(QUERIES)
+        session.start_heartbeat()
+        self.wait_for_diagnostic(session, "heartbeat_thread_started")
+        session._heartbeat_stop.set()
+        session._heartbeat_thread.join(timeout=1)
+        self.expire_lease()
+
+        with self.assertRaisesRegex(RegistryUnavailableError, "lease has expired"):
+            session.resolve(self.observation(), RunAcceptanceBudget(None))
+        expiration = self.wait_for_diagnostic(
+            session, "lease_expiration_detected"
+        )
+        self.assertEqual(expiration["operation"], "decision_commit")
+        self.assertIsNotNone(expiration["last_successful_renewal_at"])
+        self.assertIsNotNone(
+            expiration["elapsed_since_successful_renewal_seconds"]
+        )
+        self.assertFalse(expiration["heartbeat_thread_alive"])
+        self.assertTrue(expiration["heartbeat_stop_requested"])
+
+        with self.assertRaisesRegex(RuntimeError, "lease has expired"):
+            session.fail("INTERRUPTED")
+        retained = self.diagnostic_events(session)
+        self.assertTrue(any(
+            item["event"] == "lease_expiration_detected"
+            and item["operation"] == "transition_to_INTERRUPTED"
+            for item in retained
+        ))

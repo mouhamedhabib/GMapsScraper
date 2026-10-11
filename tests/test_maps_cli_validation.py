@@ -38,7 +38,26 @@ class MapsCliValidationTests(TestCase):
         self.assertIsNone(app._args.suggested_ext)
         self.assertEqual(app._args.known_companies_dir, "./CSV_FILES")
         self.assertFalse(app._args.allow_empty_known_companies)
+        self.assertIsNone(app._args.diagnostic_stack_interval_seconds)
         self.assertEqual(app._effective_mode.value, "legacy")
+
+    def test_stack_snapshots_are_positive_opt_in_for_authoritative_mode(self):
+        self.assert_parse_error(
+            "must be > 0",
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+            "--diagnostic-stack-interval-seconds", "0",
+        )
+        self.assert_parse_error(
+            "requires an authoritative mode",
+            "--diagnostic-stack-interval-seconds", "30",
+        )
+        app = self.parse(
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+            "--diagnostic-stack-interval-seconds", "30",
+        )
+        self.assertEqual(app._args.diagnostic_stack_interval_seconds, 30)
 
     def test_discovery_modes_are_explicit_and_mutually_exclusive(self):
         shadow = self.parse("--discovery-mode", "shadow")

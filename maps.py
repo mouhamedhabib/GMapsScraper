@@ -73,6 +73,7 @@ def run_maps_discovery(
     resume_run_id=None,
     authoritative_export_directory=DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY,
     allow_production_registry=False,
+    diagnostic_stack_interval_seconds=None,
 ):
     """Run the existing Maps pipeline incrementally and return its counters."""
     queries = FastSearchAlgo.load_query_file(file_name=str(query_file))
@@ -102,6 +103,7 @@ def run_maps_discovery(
             resume_run_id=resume_run_id,
             authoritative_export_directory=authoritative_export_directory,
             allow_production_registry=allow_production_registry,
+            diagnostic_stack_interval_seconds=diagnostic_stack_interval_seconds,
         )
         stats = algo.fast_search_algorithm(queries)
     finally:
@@ -241,6 +243,13 @@ class GMapsScraper:
             ),
         )
         parser.add_argument(
+            '--diagnostic-stack-interval-seconds', type=float,
+            help=(
+                'Opt in to bounded periodic all-thread stack snapshots for an '
+                'authoritative run'
+            ),
+        )
+        parser.add_argument(
             '--shadow-database', type=str, default=str(DEFAULT_SHADOW_DATABASE),
             help='Initialized isolated company-registry shadow database',
         )
@@ -289,6 +298,18 @@ class GMapsScraper:
         ):
             parser.error(
                 "--allow-production-registry requires --discovery-mode authoritative"
+            )
+        if (
+            self._args.diagnostic_stack_interval_seconds is not None
+            and self._args.diagnostic_stack_interval_seconds <= 0
+        ):
+            parser.error("--diagnostic-stack-interval-seconds must be > 0")
+        if (
+            self._args.diagnostic_stack_interval_seconds is not None
+            and not self._effective_mode.is_authoritative
+        ):
+            parser.error(
+                "--diagnostic-stack-interval-seconds requires an authoritative mode"
             )
 
     @staticmethod
@@ -365,6 +386,9 @@ class GMapsScraper:
                 resume_run_id=self._args.resume_run_id,
                 authoritative_export_directory=self._args.authoritative_export_dir,
                 allow_production_registry=self._args.allow_production_registry,
+                diagnostic_stack_interval_seconds=(
+                    self._args.diagnostic_stack_interval_seconds
+                ),
             )
             stats = algo_obj.fast_search_algorithm(queries_list)
         except (FileNotFoundError, ValueError) as exception:

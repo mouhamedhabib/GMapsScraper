@@ -1,5 +1,7 @@
 """Offline behavioral tests for the production PatternScrapper."""
 
+import json
+from time import monotonic
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -72,6 +74,48 @@ class PatternScrapperTests(TestCase):
         ])
         self.assertEqual(result["site_email"], ["info@lexa.tn"])
 
+    def test_bounded_email_scan_preserves_contact_and_social_extraction(self):
+        scraper = PatternScrapper(verbose=False)
+        result = scraper.get_pattern_data([
+            "<html><body>Write to team@company.test. "
+            '<a href="mailto:sales%40company.test?subject=Hello">Sales</a>'
+            '<a href="https://www.linkedin.com/company/example">LinkedIn</a>'
+            "</body></html>"
+        ])
+
+        self.assertEqual(
+            result["site_email"],
+            ["team@company.test", "sales@company.test"],
+        )
+        self.assertEqual(
+            result["linkedin_links"],
+            ["https://www.linkedin.com/company/example"],
+        )
+
+    def test_email_scan_is_fast_on_long_non_email_html(self):
+        scraper = PatternScrapper(verbose=False)
+        source = "<html><script>" + ("a" * 100_000) + (
+            "</script><p>contact@company.test</p></html>"
+        )
+
+        started = monotonic()
+        result = scraper.get_pattern_data([source])
+        elapsed = monotonic() - started
+
+        self.assertEqual(result["site_email"], ["contact@company.test"])
+        self.assertLess(elapsed, 2.0)
+
+    def test_email_scan_rejects_overlong_candidates(self):
+        scraper = PatternScrapper(verbose=False)
+        overlong_local = ("a" * 65) + "@company.test"
+        overlong_domain = "contact@" + ("a" * 250) + ".test"
+
+        result = scraper.get_pattern_data([
+            f"<p>{overlong_local} {overlong_domain} valid@company.test</p>"
+        ])
+
+        self.assertEqual(result["site_email"], ["valid@company.test"])
+
     @patch("utils.web_site_scraper.WebDriverWait", ImmediateWait)
     def test_empty_suggested_extensions_inspect_homepage_only(self):
         website = "https://lexa.tn/"
@@ -83,6 +127,56 @@ class PatternScrapperTests(TestCase):
         result = scraper.find_patterns(driver, website, [])
 
         self.assertEqual(driver.visited, [website])
+        self.assertEqual(result["site_email"], "info@lexa.tn")
+
+    @patch("utils.web_site_scraper.WebDriverWait", ImmediateWait)
+    def test_website_timing_is_aggregated_and_contains_no_page_content(self):
+        website = "https://private-company.test/"
+        html = '<a href="mailto:secret@private-company.test">Contact</a>'
+        driver = FakeNavigationDriver({website: html})
+        events = []
+        scraper = PatternScrapper(
+            verbose=False,
+            timing_callback=lambda event, **details: events.append(
+                {"event": event, **details}
+            ),
+        )
+
+        result = scraper.find_patterns(driver, website, [])
+
+        self.assertEqual(result["site_email"], "secret@private-company.test")
+        self.assertEqual(len(events), 1)
+        timing = events[0]
+        self.assertEqual(timing["event"], "website_enrichment_timing")
+        self.assertEqual(timing["outcome"], "completed")
+        self.assertEqual(timing["source_page_count"], 1)
+        self.assertGreater(timing["dom_retrieval_count"], 0)
+        self.assertGreater(timing["dom_characters"], 0)
+        self.assertGreater(timing["max_dom_characters"], 0)
+        self.assertGreater(timing["serialized_characters"], 0)
+        for stage in (
+            "navigation_seconds", "dom_retrieval_seconds", "parsing_seconds",
+            "serialization_seconds", "regex_seconds", "total_seconds",
+        ):
+            self.assertGreaterEqual(timing[stage], 0)
+        serialized_event = json.dumps(timing)
+        self.assertNotIn(website, serialized_event)
+        self.assertNotIn("secret@private-company.test", serialized_event)
+
+    @patch("utils.web_site_scraper.WebDriverWait", ImmediateWait)
+    def test_timing_callback_failure_does_not_change_scraping(self):
+        website = "https://lexa.tn/"
+        driver = FakeNavigationDriver({
+            website: '<a href="mailto:info@lexa.tn">Contact</a>',
+        })
+
+        def fail_timing(*args, **kwargs):
+            raise OSError("diagnostic disk unavailable")
+
+        scraper = PatternScrapper(
+            verbose=False, timing_callback=fail_timing,
+        )
+        result = scraper.find_patterns(driver, website, [])
         self.assertEqual(result["site_email"], "info@lexa.tn")
 
     def test_missing_website_skips_navigation(self):

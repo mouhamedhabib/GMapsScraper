@@ -5,9 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from time import monotonic
+from typing import Callable, TypeVar
 
 from company_registry.service import RunBudgetSnapshot, get_run_budget_snapshot
-from company_registry.storage import open_registry
+from company_registry.storage import RegistryTimingCallback, open_registry
+
+
+_T = TypeVar("_T")
 
 
 class RunLeaseError(RuntimeError):
@@ -24,6 +29,38 @@ class RunResumeError(RunLeaseError):
 
 class FinalizationRecoveryError(RunLeaseError):
     """Stored run state or configuration is ineligible for export recovery."""
+
+
+def _timed_renewal_step(
+    callback: RegistryTimingCallback | None,
+    stage: str,
+    operation: Callable[[], _T],
+) -> _T:
+    """Measure one renewal step while keeping diagnostics best-effort."""
+    if callback is not None:
+        try:
+            callback(stage, "started", None, None)
+        except BaseException:
+            pass
+    started = monotonic()
+    try:
+        result = operation()
+    except BaseException as error:
+        if callback is not None:
+            try:
+                callback(
+                    stage, "failed", monotonic() - started,
+                    type(error).__name__,
+                )
+            except BaseException:
+                pass
+        raise
+    if callback is not None:
+        try:
+            callback(stage, "completed", monotonic() - started, None)
+        except BaseException:
+            pass
+    return result
 
 
 @dataclass(frozen=True)
@@ -204,6 +241,7 @@ def heartbeat_run_lease(
     *,
     lease_seconds: int,
     now: datetime | None = None,
+    timing_callback: RegistryTimingCallback | None = None,
 ) -> str:
     """Renew an unexpired owned lease and return its new expiration."""
     if lease_seconds < 1:
@@ -211,22 +249,32 @@ def heartbeat_run_lease(
     timestamp = _utc_now(now)
     now_text = _iso(timestamp)
     expires_text = _iso(timestamp + timedelta(seconds=lease_seconds))
-    connection = open_registry(database)
+    connection = open_registry(database, timing_callback=timing_callback)
     try:
-        connection.execute("BEGIN IMMEDIATE")
-        cursor = connection.execute(
-            """UPDATE discovery_runs
-                  SET lease_expires_at=?, heartbeat_at=?, updated_at=?
-                WHERE run_id=? AND status IN ('RUNNING', 'FINALIZING')
-                  AND lease_owner=?
-                  AND lease_expires_at>?""",
-            (expires_text, now_text, now_text, run_id, owner, now_text),
+        _timed_renewal_step(
+            timing_callback,
+            "transaction_acquisition",
+            lambda: connection.execute("BEGIN IMMEDIATE"),
+        )
+        cursor = _timed_renewal_step(
+            timing_callback,
+            "lease_update",
+            lambda: connection.execute(
+                """UPDATE discovery_runs
+                      SET lease_expires_at=?, heartbeat_at=?, updated_at=?
+                    WHERE run_id=? AND status IN ('RUNNING', 'FINALIZING')
+                      AND lease_owner=?
+                      AND lease_expires_at>?""",
+                (expires_text, now_text, now_text, run_id, owner, now_text),
+            ),
         )
         if cursor.rowcount != 1:
             raise RunLeaseError(
                 f"Run {run_id!r} lease is missing, expired, or owned elsewhere"
             )
-        connection.commit()
+        _timed_renewal_step(
+            timing_callback, "commit", connection.commit,
+        )
         return expires_text
     except BaseException:
         if connection.in_transaction:

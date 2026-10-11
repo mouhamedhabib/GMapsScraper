@@ -84,6 +84,33 @@ python local_release.py resume \
 Resume is never automatic. An unknown run ID or a stored configuration mismatch
 fails before browser work.
 
+For a run under heartbeat investigation, explicitly enable bounded periodic
+all-thread snapshots (60 seconds is an operational diagnostic choice, not a
+lease change):
+
+```bash
+python local_release.py resume \
+  --query-file queries.txt \
+  --max-new 100 \
+  --run-id maps-20261011-global-01 \
+  --diagnostic-stack-interval-seconds 60
+```
+
+Structured heartbeat, SQLite-stage, process/scheduler, and website-stage timing
+is always retained for authoritative runs at
+`data/local_registry/logs/writer_lease.jsonl` (1 MiB plus three backups). The
+stack opt-in writes one current plus three rotated private files at
+`data/local_registry/logs/writer_stacks.log*`. Stack files contain Python file
+paths and function names but no locals or page content. Inspect them without
+starting Maps:
+
+```bash
+jq -c 'select(.run_id == "maps-20261011-global-01")' \
+  data/local_registry/logs/writer_lease.jsonl
+ls -lh data/local_registry/logs/writer_stacks.log*
+sed -n '1,240p' data/local_registry/logs/writer_stacks.log
+```
+
 ## Output files
 
 After `Run status: SUCCESS`, inspect `data/local_registry/exports/`:
@@ -133,4 +160,3 @@ SQLite registry with plain `cp`, and never delete a WAL/SHM file to make a copy.
 - Exit code or status is not `SUCCESS`: inspect the printed failure and registry
   run status. No success is claimed and no post-run backup is created; the
   verified pre-run backup path is printed.
-

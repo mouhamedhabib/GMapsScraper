@@ -4,12 +4,18 @@ from argparse import ArgumentParser
 import json
 from pathlib import Path
 import sqlite3
+from time import monotonic
+from typing import Callable
 from uuid import UUID, uuid5
 
 from company_registry.schema import MIGRATIONS, SCHEMA_VERSION
 
 
 DEFAULT_DATABASE = Path("data/company_registry.db")
+
+RegistryTimingCallback = Callable[
+    [str, str, float | None, str | None], None
+]
 
 EXPECTED_TABLES = {
     "companies",
@@ -299,9 +305,50 @@ def _connect_existing(path: str | Path) -> sqlite3.Connection:
     return connection
 
 
-def open_registry(path: str | Path = DEFAULT_DATABASE) -> sqlite3.Connection:
+def _report_registry_timing(
+    callback: RegistryTimingCallback | None,
+    stage: str,
+    phase: str,
+    duration_seconds: float | None = None,
+    error_type: str | None = None,
+) -> None:
+    """Emit best-effort diagnostics without changing registry behavior."""
+    if callback is None:
+        return
+    try:
+        callback(stage, phase, duration_seconds, error_type)
+    except BaseException:
+        # Diagnostics must never turn a valid registry operation into failure.
+        pass
+
+
+def open_registry(
+    path: str | Path = DEFAULT_DATABASE,
+    *,
+    timing_callback: RegistryTimingCallback | None = None,
+) -> sqlite3.Connection:
     """Open an existing current-version registry without creating or migrating."""
-    connection = _connect_existing(path)
+    _report_registry_timing(timing_callback, "connection_opening", "started")
+    started = monotonic()
+    try:
+        connection = _connect_existing(path)
+    except BaseException as error:
+        _report_registry_timing(
+            timing_callback,
+            "connection_opening",
+            "failed",
+            monotonic() - started,
+            type(error).__name__,
+        )
+        raise
+    _report_registry_timing(
+        timing_callback,
+        "connection_opening",
+        "completed",
+        monotonic() - started,
+    )
+    _report_registry_timing(timing_callback, "schema_validation", "started")
+    started = monotonic()
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version != SCHEMA_VERSION:
@@ -311,9 +358,22 @@ def open_registry(path: str | Path = DEFAULT_DATABASE) -> sqlite3.Connection:
                 "registry migration command first."
             )
         _validate_schema(connection)
-    except BaseException:
+    except BaseException as error:
+        _report_registry_timing(
+            timing_callback,
+            "schema_validation",
+            "failed",
+            monotonic() - started,
+            type(error).__name__,
+        )
         connection.close()
         raise
+    _report_registry_timing(
+        timing_callback,
+        "schema_validation",
+        "completed",
+        monotonic() - started,
+    )
     return connection
 
 
