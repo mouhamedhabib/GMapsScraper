@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import getaddresses
 import json
 from pathlib import Path
+import re
 from typing import Iterable
 
 from company_registry.normalization import (
@@ -20,6 +22,43 @@ from company_registry.storage import open_registry
 
 RELEVANCE_VALUES = {"TARGET", "POSSIBLE", "NOISE", "UNKNOWN"}
 ELIGIBILITY_VALUES = {"ELIGIBLE", "REVIEW", "EXCLUDED"}
+EMAIL_DECISIONS = {"ACCEPT", "REVIEW", "REJECT"}
+EMAIL_SOURCE_FIELDS = ("email", "emails", "email_address", "site_email")
+MAX_EMAIL_FIELD_CHARACTERS = 4096
+MAX_EMAIL_CANDIDATES_PER_FIELD = 50
+MAX_EMAIL_ADDRESS_CHARACTERS = 320
+EMAIL_PATTERN = re.compile(
+    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,63}",
+    flags=re.IGNORECASE,
+)
+EMAIL_UNAVAILABLE_VALUES = {
+    "", "-", "n/a", "na", "none", "not available", "null", "unknown",
+}
+EMAIL_PLACEHOLDER_DOMAINS = {
+    "company.com", "domain.com", "email.com", "example.com", "example.net",
+    "example.org", "yourcompany.com",
+}
+EMAIL_PLACEHOLDER_LOCAL_PARTS = {
+    "email", "foulen", "lastname", "name", "test", "user", "yourname",
+}
+EMAIL_ASSET_EXTENSIONS = {
+    "css", "gif", "jpeg", "jpg", "js", "pdf", "png", "svg", "webp",
+}
+EMAIL_AUTOMATED_LOCAL_PARTS = {
+    "bounce", "do-not-reply", "donotreply", "mailer-daemon", "no-reply",
+    "noreply", "postmaster",
+}
+EMAIL_TELEMETRY_LOCAL_PARTS = {
+    "error", "errors", "monitoring", "sentry", "telemetry",
+}
+EMAIL_TELEMETRY_DOMAINS = {
+    "sentry.io", "sentry.wixpress.com", "sentry-next.wixpress.com",
+}
+EMAIL_BUSINESS_LOCAL_PARTS = {
+    "admin", "careers", "commercial", "contact", "hello", "hr", "info",
+    "jobs", "office", "recruiting", "recruitment", "sales", "support",
+}
 
 
 @dataclass(frozen=True)
@@ -34,15 +73,49 @@ class QualificationResult:
 
 
 @dataclass(frozen=True)
+class EmailValidation:
+    """Auditable deterministic classification of one supplied address."""
+
+    original: str
+    normalized: str
+    source_field: str
+    decision: str
+    reason_code: str
+
+
+@dataclass(frozen=True)
 class QualificationPolicy:
     """Versioned policy configuration; changing rules requires a new version."""
 
-    version: str = "maps-dual-purpose-v1"
+    version: str = "maps-dual-purpose-v3-business-relevance"
+    employment_target_categories: tuple[str, ...] = (
+        "computer consultant", "computer networking service",
+        "computer security service", "cybersecurity service", "it consultant",
+        "software company", "software development company", "web designer",
+        "web hosting company", "website designer",
+    )
+    mission_target_categories: tuple[str, ...] = (
+        "computer consultant", "computer networking service",
+        "computer security service", "cybersecurity service", "it consultant",
+        "software company", "software development company", "web designer",
+        "web hosting company", "website designer",
+    )
+    unrelated_organization_categories: tuple[str, ...] = (
+        "council", "government office", "government organization",
+        "software training institute", "training center", "university",
+    )
     employment_strong_terms: tuple[str, ...] = (
         "software company", "software development", "software developer",
-        "web development", "mobile app development", "it consulting",
-        "it consultant", "information technology company", "it services",
-        "technology company", "technology consultant",
+        "application development", "app development", "backend development",
+        "back-end development", "business software", "cloud computing",
+        "cloud infrastructure", "cloud services", "cyber security services",
+        "cybersecurity services", "devops services", "erp software",
+        "enterprise resource planning", "frontend development",
+        "front-end development", "information technology company",
+        "it consulting", "it consultant", "it services",
+        "managed it services", "mobile app development", "software engineering",
+        "system integration", "systems integration", "web development",
+        "website development",
     )
     employment_possible_terms: tuple[str, ...] = (
         "computer support", "computer service", "computer repair",
@@ -50,9 +123,16 @@ class QualificationPolicy:
         "digital agency", "web agency", "internet service provider",
     )
     mission_strong_terms: tuple[str, ...] = (
-        "software development", "web development", "mobile app development",
-        "it consulting", "it services", "digital agency", "web agency",
-        "automation", "systems integration", "api development",
+        "software development", "application development", "app development",
+        "api development", "backend development", "back-end development",
+        "business process automation", "business software", "cloud computing",
+        "cloud infrastructure", "cloud services", "custom automation",
+        "cyber security services", "cybersecurity services", "devops services",
+        "erp software", "enterprise resource planning", "frontend development",
+        "front-end development", "it consulting", "it services",
+        "managed it services", "mobile app development", "software engineering",
+        "system integration", "systems integration", "web development",
+        "website development",
     )
     mission_possible_terms: tuple[str, ...] = (
         "travel agency", "tour operator", "hotel", "resort", "e-commerce",
@@ -63,6 +143,15 @@ class QualificationPolicy:
     definite_noise_terms: tuple[str, ...] = (
         "government office", "police station", "place of worship", "cemetery",
         "public park", "bus stop",
+    )
+    employment_opportunity_terms: tuple[str, ...] = (
+        "job opening", "job vacancy", "join our team", "now hiring",
+        "we are hiring",
+    )
+    mission_opportunity_terms: tuple[str, ...] = (
+        "freelance opportunity", "looking for a developer",
+        "looking for technology partner", "request for proposal",
+        "seeking a developer", "seeking technology partner",
     )
 
     def assess(
@@ -84,7 +173,20 @@ DEFAULT_QUALIFICATION_POLICY = QualificationPolicy()
 
 
 def _contains(text: str, terms: Iterable[str]) -> bool:
-    return any(term in text for term in terms)
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+    padded = f" {normalized} "
+    return any(
+        f" {re.sub(r'[^a-z0-9]+', ' ', term.casefold()).strip()} " in padded
+        for term in terms
+    )
+
+
+def _category_in(category: str, categories: Iterable[str]) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", " ", category.casefold()).strip()
+    return normalized in {
+        re.sub(r"[^a-z0-9]+", " ", item.casefold()).strip()
+        for item in categories
+    }
 
 
 def _first(row: dict, *fields: str) -> str:
@@ -95,11 +197,137 @@ def _first(row: dict, *fields: str) -> str:
     return ""
 
 
+def validate_contact_email(candidate: object, source_field: str) -> EmailValidation:
+    """Classify one bounded candidate without claiming mailbox deliverability."""
+    original = clean_text(candidate)
+    normalized = original.casefold()
+    if normalized in EMAIL_UNAVAILABLE_VALUES:
+        return EmailValidation(
+            original, "", source_field, "REJECT", "empty_or_unavailable",
+        )
+    if len(original) > MAX_EMAIL_ADDRESS_CHARACTERS:
+        return EmailValidation(
+            original, "", source_field, "REJECT", "address_too_long",
+        )
+    if not EMAIL_PATTERN.fullmatch(original):
+        return EmailValidation(
+            original, "", source_field, "REJECT", "malformed_address",
+        )
+
+    local_part, domain = normalized.rsplit("@", 1)
+    if (
+        len(local_part) > 64
+        or len(domain) > 253
+        or ".." in normalized
+        or local_part.startswith(".")
+        or local_part.endswith(".")
+    ):
+        return EmailValidation(
+            original, "", source_field, "REJECT", "malformed_address",
+        )
+    if (
+        domain in EMAIL_PLACEHOLDER_DOMAINS
+        or local_part in EMAIL_PLACEHOLDER_LOCAL_PARTS
+    ):
+        return EmailValidation(
+            original, normalized, source_field, "REJECT", "placeholder_address",
+        )
+    if domain.rsplit(".", 1)[-1] in EMAIL_ASSET_EXTENSIONS:
+        return EmailValidation(
+            original, normalized, source_field, "REJECT", "asset_address",
+        )
+    compact_local = local_part.replace(".", "").replace("_", "").replace("-", "")
+    if local_part in EMAIL_AUTOMATED_LOCAL_PARTS or compact_local in {
+        "donotreply", "mailerdaemon", "noreply",
+    }:
+        return EmailValidation(
+            original, normalized, source_field, "REJECT", "automated_sender",
+        )
+    if (
+        local_part in EMAIL_TELEMETRY_LOCAL_PARTS
+        or compact_local in EMAIL_TELEMETRY_LOCAL_PARTS
+        or domain in EMAIL_TELEMETRY_DOMAINS
+        or domain.startswith("sentry.")
+        or ".sentry." in domain
+        or domain.endswith(".sentry.io")
+    ):
+        return EmailValidation(
+            original, normalized, source_field, "REJECT", "telemetry_address",
+        )
+    if local_part in EMAIL_BUSINESS_LOCAL_PARTS:
+        return EmailValidation(
+            original, normalized, source_field, "ACCEPT", "business_role_address",
+        )
+    return EmailValidation(
+        original, normalized, source_field, "REVIEW", "uncertain_local_part",
+    )
+
+
+def _email_values(value: object) -> list[str]:
+    """Return bounded candidates from a scalar or existing multi-value field."""
+    if isinstance(value, (list, tuple, set)):
+        raw_values = list(value)[:MAX_EMAIL_CANDIDATES_PER_FIELD]
+    else:
+        raw_values = [value]
+
+    candidates: list[str] = []
+    for raw_value in raw_values:
+        text = clean_text(raw_value)
+        if not text:
+            continue
+        text = text[:MAX_EMAIL_FIELD_CHARACTERS]
+        for segment in re.split(r"[;\r\n]+", text):
+            segment = clean_text(segment)
+            if not segment:
+                continue
+            parsed = getaddresses([segment])[:MAX_EMAIL_CANDIDATES_PER_FIELD]
+            addresses = [address for _, address in parsed if clean_text(address)]
+            candidates.extend(addresses or [segment])
+            if len(candidates) >= MAX_EMAIL_CANDIDATES_PER_FIELD:
+                break
+        if len(candidates) >= MAX_EMAIL_CANDIDATES_PER_FIELD:
+            break
+    return candidates[:MAX_EMAIL_CANDIDATES_PER_FIELD]
+
+
+def _email_evidence(row: dict) -> tuple[str, list[dict]]:
+    assessments: list[EmailValidation] = []
+    seen: set[tuple[str, str]] = set()
+    for source_field in EMAIL_SOURCE_FIELDS:
+        for candidate in _email_values(row.get(source_field)):
+            assessment = validate_contact_email(candidate, source_field)
+            key = (
+                assessment.normalized or assessment.original.casefold(),
+                source_field,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            assessments.append(assessment)
+    accepted = next(
+        (assessment.normalized for assessment in assessments
+         if assessment.decision == "ACCEPT"),
+        "",
+    )
+    audit = [
+        {
+            "original": assessment.original,
+            "normalized": assessment.normalized,
+            "source_field": assessment.source_field,
+            "decision": assessment.decision,
+            "reason_code": assessment.reason_code,
+        }
+        for assessment in assessments
+    ]
+    return accepted, audit
+
+
 def _evidence_snapshot(
     row: dict, *, identity_conflict: bool, location_conflict: bool,
 ) -> dict:
     website = _first(row, "webpage", "website", "website_url")
     domain = website if is_trustworthy_domain(website) else ""
+    email, email_candidates = _email_evidence(row)
     return {
         "name": _first(row, "title", "company_name", "name"),
         "category": _first(row, "category", "categories"),
@@ -109,7 +337,8 @@ def _evidence_snapshot(
         "website": website,
         "usable_website": bool(domain),
         "phone": _first(row, "phone_number", "phone"),
-        "email": _first(row, "email", "emails", "email_address"),
+        "email": email,
+        "email_candidates": email_candidates,
         "address": _first(row, "address", "location"),
         "country": _first(row, "country"),
         "city": _first(row, "city"),
@@ -143,20 +372,45 @@ def assess_maps_company(
     employment_reasons: list[str] = []
     # Category/description is business evidence. A keyword in the name or source
     # query alone can never produce TARGET.
-    if has_business_identity and _contains(descriptive, policy.employment_strong_terms):
+    strong_employment_category = _category_in(
+        category, policy.employment_target_categories,
+    )
+    technical_description = _contains(
+        description, policy.employment_strong_terms,
+    )
+    unrelated_organization = _category_in(
+        category, policy.unrelated_organization_categories,
+    )
+    if unrelated_organization:
+        employment_relevance = "NOISE"
+        employment_reasons.append("unrelated_organization_category")
+    elif has_business_identity and (
+        strong_employment_category or technical_description
+    ):
         employment_relevance = "TARGET"
-        employment_reasons.append("strong_software_or_it_business_evidence")
+        if strong_employment_category:
+            employment_reasons.append("target_technical_business_category")
+        else:
+            employment_reasons.append("explicit_technical_services_description")
     elif _contains(descriptive, policy.employment_possible_terms) or _contains(
         name, policy.employment_strong_terms + policy.employment_possible_terms,
     ):
         employment_relevance = "POSSIBLE"
         employment_reasons.append("adjacent_or_name_only_technical_evidence")
-    elif _contains(all_text, policy.definite_noise_terms) or (category and name):
+    elif (
+        _contains(all_text, policy.definite_noise_terms)
+        or (category and name)
+    ):
         employment_relevance = "NOISE"
         employment_reasons.append("no_software_or_it_business_evidence")
     else:
         employment_relevance = "UNKNOWN"
         employment_reasons.append("insufficient_business_evidence")
+
+    if _contains(description, policy.employment_opportunity_terms):
+        employment_reasons.append("explicit_hiring_opportunity_evidence")
+    else:
+        employment_reasons.append("current_hiring_not_established")
 
     if employment_relevance == "NOISE":
         employment_eligibility = "EXCLUDED"
@@ -176,20 +430,29 @@ def assess_maps_company(
         employment_reasons.append("strong_relevance_website_and_location")
 
     mission_reasons: list[str] = []
-    strong_mission = has_business_identity and _contains(
-        descriptive, policy.mission_strong_terms,
+    strong_mission_category = _category_in(
+        category, policy.mission_target_categories,
+    )
+    strong_mission_description = _contains(
+        description, policy.mission_strong_terms,
+    )
+    strong_mission = has_business_identity and (
+        strong_mission_category or strong_mission_description
     )
     possible_mission = has_business_identity and _contains(
         descriptive, policy.mission_possible_terms,
     )
-    # Development capability explicitly attached to a marketing category is a
-    # partnership/overflow fit, not a claim that the company currently needs help.
-    marketing_with_development = (
-        "marketing agency" in category or "advertising agency" in category
-    ) and _contains(description, policy.mission_strong_terms)
-    if strong_mission or marketing_with_development:
+    # Development capability is partnership/overflow fit, not a claim that the
+    # company currently needs help.
+    if unrelated_organization:
+        mission_relevance = "NOISE"
+        mission_reasons.append("unrelated_organization_category")
+    elif strong_mission:
         mission_relevance = "TARGET"
-        mission_reasons.append("explicit_software_service_or_partnership_fit")
+        if strong_mission_category:
+            mission_reasons.append("target_technical_service_category")
+        else:
+            mission_reasons.append("explicit_technical_services_description")
     elif possible_mission:
         mission_relevance = "POSSIBLE"
         mission_reasons.append("industry_may_have_service_fit_but_need_is_unproven")
@@ -202,6 +465,11 @@ def assess_maps_company(
     else:
         mission_relevance = "UNKNOWN"
         mission_reasons.append("insufficient_business_evidence")
+
+    if _contains(description, policy.mission_opportunity_terms):
+        mission_reasons.append("explicit_mission_opportunity_evidence")
+    else:
+        mission_reasons.append("active_mission_not_established")
 
     if mission_relevance == "NOISE":
         mission_eligibility = "EXCLUDED"

@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Callable
 
-from company_registry.normalization import canonical_json
+from company_registry.normalization import canonical_json, clean_text
 from company_registry.qualification import DEFAULT_QUALIFICATION_POLICY
 from company_registry.schema import SCHEMA_VERSION
 from company_registry.storage import open_registry
@@ -381,9 +381,9 @@ def verify_run_exports(
     run_id: str,
     output_directory: str | Path,
     *,
-    policy_version: str = DEFAULT_QUALIFICATION_POLICY.version,
+    policy_version: str | None = None,
 ) -> dict[str, dict]:
-    """Verify all required artifacts against fresh ordered SQLite projections."""
+    """Verify artifacts, defaulting to their recorded historical policy."""
     return {
         name: verify_run_export(
             database, run_id, output_directory, name,
@@ -399,13 +399,14 @@ def verify_run_export(
     output_directory: str | Path,
     name: str,
     *,
-    policy_version: str = DEFAULT_QUALIFICATION_POLICY.version,
+    policy_version: str | None = None,
 ) -> dict:
     """Verify one named artifact against its exact SQLite projection."""
     if name not in {"discovery", "employment", "mission"}:
         raise ValueError(f"Unknown required run export: {name}")
     database = Path(database)
     output_directory = Path(output_directory)
+    manifest_path = _manifest_paths(output_directory, run_id)[name]
     if name == "discovery":
         rows = _new_company_rows(database, run_id)[0]
         expected = {
@@ -413,12 +414,16 @@ def verify_run_export(
             "company_ids": [row["company_id"] for row in rows],
         }
     else:
+        if policy_version is None:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            policy_version = clean_text(manifest.get("policy_version"))
+            if not policy_version:
+                raise ValueError(f"{name} export manifest lacks a policy version")
         rows = _qualified_rows(database, run_id, name, policy_version)
         expected = {
             "assessment_ids": [row["qualification_assessment_id"] for row in rows],
             "company_ids": [row["company_id"] for row in rows],
         }
-    manifest_path = _manifest_paths(output_directory, run_id)[name]
     result = verify_export_manifest(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("run_id") != run_id:
@@ -455,7 +460,10 @@ def recover_run_exports(
 
     def valid(name: str) -> bool:
         try:
-            verify_run_export(database, run_id, output_directory, name)
+            verify_run_export(
+                database, run_id, output_directory, name,
+                policy_version=DEFAULT_QUALIFICATION_POLICY.version,
+            )
             return True
         except Exception:
             return False
@@ -478,5 +486,8 @@ def recover_run_exports(
                 failure_injector=inject(purpose),
             )
             rebuilt.append(purpose)
-    verified = verify_run_exports(database, run_id, output_directory)
+    verified = verify_run_exports(
+        database, run_id, output_directory,
+        policy_version=DEFAULT_QUALIFICATION_POLICY.version,
+    )
     return {"verified": verified, "rebuilt": rebuilt, "preserved": preserved}

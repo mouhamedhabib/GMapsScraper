@@ -6,12 +6,18 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from company_registry.discovery_adapter import AuthoritativeDiscoveryAdapter
-from company_registry.exports import export_qualified_leads, verify_export_manifest
+from company_registry.exports import (
+    export_new_companies,
+    export_qualified_leads,
+    verify_export_manifest,
+    verify_run_exports,
+)
 from company_registry.models import IdentityObservation
 from company_registry.qualification import (
     QualificationPolicy,
     assess_maps_company,
     assess_run,
+    validate_contact_email,
 )
 from company_registry.storage import initialize_registry, open_registry
 
@@ -107,6 +113,239 @@ class QualificationPolicyTests(TestCase):
         ))
         self.assertEqual(result.employment_eligibility, "EXCLUDED")
         self.assertEqual(result.mission_eligibility, "REVIEW")
+
+    def test_exact_technical_categories_are_relevant_for_both_purposes(self):
+        for category in (
+            "Software company", "Website designer", "Computer consultant",
+            "Computer security service", "Computer networking service",
+        ):
+            with self.subTest(category=category):
+                result = assess_maps_company(maps_row(
+                    category=category, about_desc="Not Available",
+                ))
+                self.assertEqual(result.employment_relevance, "TARGET")
+                self.assertEqual(result.mission_relevance, "TARGET")
+                self.assertIn(
+                    "current_hiring_not_established", result.employment_reasons,
+                )
+                self.assertIn(
+                    "active_mission_not_established", result.mission_reasons,
+                )
+
+    def test_technical_descriptions_cover_web_cloud_erp_and_application_work(self):
+        descriptions = (
+            "Backend development and API development",
+            "Frontend development and website development",
+            "Cloud infrastructure and managed IT services",
+            "ERP software and business software",
+            "Application development and systems integration",
+            "Cybersecurity services and IT consulting",
+        )
+        for description in descriptions:
+            with self.subTest(description=description):
+                self.assert_outcomes(
+                    maps_row(
+                        category="Business to business service",
+                        about_desc=description,
+                    ),
+                    ("TARGET", "ELIGIBLE"),
+                    ("TARGET", "ELIGIBLE"),
+                )
+
+    def test_web_and_digital_agencies_need_explicit_technical_services(self):
+        for category in ("Web agency", "Digital agency"):
+            with self.subTest(category=category):
+                technical = assess_maps_company(maps_row(
+                    category=category,
+                    about_desc="Website development and application development",
+                ))
+                self.assertEqual(
+                    (technical.employment_relevance, technical.mission_relevance),
+                    ("TARGET", "TARGET"),
+                )
+
+        marketing_only = assess_maps_company(maps_row(
+            category="Digital agency",
+            about_desc="Social media marketing, branding, and paid campaigns",
+        ))
+        self.assertEqual(
+            (marketing_only.employment_relevance, marketing_only.mission_relevance),
+            ("POSSIBLE", "POSSIBLE"),
+        )
+
+    def test_unrelated_training_and_government_categories_are_noise(self):
+        for category in (
+            "Training center", "Software training institute", "University",
+            "Government office", "Government organization", "Council",
+        ):
+            with self.subTest(category=category):
+                self.assert_outcomes(
+                    maps_row(
+                        category=category,
+                        about_desc="Courses and research in software development",
+                    ),
+                    ("NOISE", "EXCLUDED"),
+                    ("NOISE", "EXCLUDED"),
+                )
+
+    def test_ambiguous_category_without_technical_description_is_not_target(self):
+        result = assess_maps_company(maps_row(
+            category="Corporate office", about_desc="Business services",
+        ))
+        self.assertEqual(result.employment_relevance, "NOISE")
+        self.assertEqual(result.mission_relevance, "POSSIBLE")
+
+        missing = assess_maps_company(maps_row(category="", about_desc=""))
+        self.assertEqual(missing.employment_relevance, "UNKNOWN")
+        self.assertEqual(missing.mission_relevance, "UNKNOWN")
+
+    def test_contact_and_completeness_gate_eligibility_not_relevance(self):
+        missing_website = assess_maps_company(maps_row(
+            category="Website designer", about_desc="Not Available", webpage="",
+        ))
+        missing_contact = assess_maps_company(maps_row(
+            category="Website designer", about_desc="Not Available",
+            phone_number="", site_email="",
+        ))
+        self.assertEqual(
+            (missing_website.employment_relevance, missing_website.mission_relevance),
+            ("TARGET", "TARGET"),
+        )
+        self.assertEqual(
+            (missing_website.employment_eligibility,
+             missing_website.mission_eligibility),
+            ("REVIEW", "REVIEW"),
+        )
+        self.assertEqual(missing_contact.employment_eligibility, "ELIGIBLE")
+        self.assertEqual(missing_contact.mission_eligibility, "REVIEW")
+
+    def test_opportunity_evidence_is_recorded_without_changing_business_relevance(self):
+        result = assess_maps_company(maps_row(
+            category="Software company",
+            about_desc=(
+                "We are hiring. We are also seeking technology partner for a "
+                "request for proposal."
+            ),
+        ))
+        self.assertEqual(result.employment_relevance, "TARGET")
+        self.assertEqual(result.mission_relevance, "TARGET")
+        self.assertIn(
+            "explicit_hiring_opportunity_evidence", result.employment_reasons,
+        )
+        self.assertIn(
+            "explicit_mission_opportunity_evidence", result.mission_reasons,
+        )
+        self.assertNotIn(
+            "current_hiring_not_established", result.employment_reasons,
+        )
+        self.assertNotIn(
+            "active_mission_not_established", result.mission_reasons,
+        )
+
+    def test_site_email_general_and_recruitment_roles_are_accepted(self):
+        for email in (
+            "contact@company.test", "info@company.test",
+            "careers@company.test", "jobs@company.test",
+        ):
+            with self.subTest(email=email):
+                result = assess_maps_company(maps_row(
+                    phone_number="", site_email=email,
+                ))
+                self.assertEqual(result.evidence["email"], email)
+                self.assertEqual(
+                    result.evidence["email_candidates"][0]["decision"], "ACCEPT",
+                )
+                self.assertEqual(result.mission_eligibility, "ELIGIBLE")
+
+    def test_automated_telemetry_placeholder_and_malformed_emails_are_rejected(self):
+        cases = {
+            "noreply@company.test": "automated_sender",
+            "no-reply@company.test": "automated_sender",
+            "sentry@company.test": "telemetry_address",
+            "3764a8f1d8c03247@sentry.company.test": "telemetry_address",
+            "example@example.com": "placeholder_address",
+            "hello@": "malformed_address",
+        }
+        for email, reason in cases.items():
+            with self.subTest(email=email):
+                result = assess_maps_company(maps_row(
+                    phone_number="", site_email=email,
+                ))
+                candidate = result.evidence["email_candidates"][0]
+                self.assertEqual(result.evidence["email"], "")
+                self.assertEqual(
+                    (candidate["decision"], candidate["reason_code"]),
+                    ("REJECT", reason),
+                )
+                self.assertEqual(result.mission_eligibility, "REVIEW")
+
+    def test_personal_looking_email_requires_review_and_does_not_count(self):
+        result = assess_maps_company(maps_row(
+            phone_number="", site_email="firstname@company.test",
+        ))
+        candidate = result.evidence["email_candidates"][0]
+        self.assertEqual(result.evidence["email"], "")
+        self.assertEqual(
+            (candidate["decision"], candidate["reason_code"]),
+            ("REVIEW", "uncertain_local_part"),
+        )
+        self.assertEqual(result.mission_eligibility, "REVIEW")
+
+    def test_first_accepted_candidate_wins_without_invalid_masking(self):
+        result = assess_maps_company(maps_row(
+            phone_number="",
+            email="noreply@company.test",
+            site_email=["firstname@company.test", "INFO@Company.Test"],
+        ))
+        self.assertEqual(result.evidence["email"], "info@company.test")
+        self.assertEqual(
+            [item["decision"] for item in result.evidence["email_candidates"]],
+            ["REJECT", "REVIEW", "ACCEPT"],
+        )
+        self.assertEqual(
+            [item["source_field"] for item in result.evidence["email_candidates"]],
+            ["email", "site_email", "site_email"],
+        )
+        self.assertEqual(result.mission_eligibility, "ELIGIBLE")
+
+    def test_semicolon_delimited_existing_representation_is_supported(self):
+        result = assess_maps_company(maps_row(
+            phone_number="",
+            emails="noreply@company.test; jobs@company.test",
+        ))
+        self.assertEqual(result.evidence["email"], "jobs@company.test")
+        self.assertEqual(
+            [item["decision"] for item in result.evidence["email_candidates"]],
+            ["REJECT", "ACCEPT"],
+        )
+
+    def test_public_provider_role_address_is_not_rejected(self):
+        validation = validate_contact_email("info@gmail.com", "site_email")
+        self.assertEqual(validation.decision, "ACCEPT")
+        self.assertEqual(validation.reason_code, "business_role_address")
+
+    def test_existing_email_fields_keep_precedence_and_missing_email_is_compatible(self):
+        for field in ("email", "emails", "email_address"):
+            with self.subTest(field=field):
+                result = assess_maps_company(maps_row(
+                    phone_number="", **{field: "contact@company.test"},
+                ))
+                self.assertEqual(result.evidence["email"], "contact@company.test")
+                self.assertEqual(
+                    result.evidence["email_candidates"][0]["source_field"], field,
+                )
+
+        missing = assess_maps_company(maps_row(phone_number="", site_email=""))
+        self.assertEqual(missing.evidence["email"], "")
+        self.assertEqual(missing.evidence["email_candidates"], [])
+        self.assertEqual(missing.mission_eligibility, "REVIEW")
+
+    def test_email_validation_is_bounded_for_large_malformed_input(self):
+        validation = validate_contact_email("a" * 1_000_000, "site_email")
+        self.assertEqual(
+            (validation.decision, validation.reason_code),
+            ("REJECT", "address_too_long"),
+        )
 
 
 class QualificationPersistenceAndExportTests(TestCase):
@@ -225,3 +464,20 @@ class QualificationPersistenceAndExportTests(TestCase):
         self.assertEqual(first["sha256"], repeated["sha256"])
         self.assertEqual(first["rows"], 1)
         self.assertTrue(verify_export_manifest(first["manifest"])["valid"])
+
+    def test_historical_policy_exports_remain_read_only_verifiable(self):
+        historical = QualificationPolicy(version="maps-dual-purpose-v1")
+        self.adapter.commit("run-a", self._observation())
+        assess_run(self.database, "run-a", policy=historical, assessed_at=STAMP)
+        output = self.root / "historical-exports"
+        export_new_companies(
+            self.database, "run-a", output, verified_maps_publication=True,
+        )
+        for purpose in ("employment", "mission"):
+            export_qualified_leads(
+                self.database, "run-a", output, purpose=purpose,
+                policy_version=historical.version,
+            )
+
+        verified = verify_run_exports(self.database, "run-a", output)
+        self.assertTrue(all(result["valid"] for result in verified.values()))
