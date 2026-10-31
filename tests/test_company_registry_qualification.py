@@ -1,15 +1,19 @@
 """Offline Phase 3D.2 dual-purpose qualification coverage."""
 
 from csv import DictReader
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from company_registry.discovery_adapter import AuthoritativeDiscoveryAdapter
 from company_registry.exports import (
+    REVIEW_EXPORT_FIELDS,
     export_new_companies,
     export_qualified_leads,
+    export_review_queue,
     verify_export_manifest,
+    verify_review_export,
     verify_run_exports,
 )
 from company_registry.models import IdentityObservation
@@ -481,3 +485,170 @@ class QualificationPersistenceAndExportTests(TestCase):
 
         verified = verify_run_exports(self.database, "run-a", output)
         self.assertTrue(all(result["valid"] for result in verified.values()))
+
+    def test_review_queues_are_deterministic_auditable_and_purpose_specific(self):
+        decisions = {}
+        decisions["high"] = self.adapter.commit("run-a", self._observation(
+            "zulu-target",
+            title="Zulu Target",
+            category="Software company",
+            about_desc="Software development",
+            webpage="",
+            phone_number="",
+            site_email="INFO@Zulu.Test",
+            map_link="https://www.google.com/maps/place/zulu-target",
+        ))
+        decisions["medium"] = self.adapter.commit("run-a", self._observation(
+            "alpha-possible",
+            title="Alpha Possible",
+            category="Software retailer",
+            about_desc="Computer software store",
+            webpage="https://alpha.test",
+        ))
+        decisions["low"] = self.adapter.commit("run-a", self._observation(
+            "beta-unknown",
+            title="Beta Unknown",
+            category="",
+            about_desc="",
+            webpage="",
+            phone_number="",
+            address="",
+            country="",
+            city="",
+        ))
+        decisions["mission_only"] = self.adapter.commit(
+            "run-a", self._observation(
+                "contact-gap",
+                title="Contact Gap",
+                category="Software company",
+                about_desc="Software development",
+                webpage="https://contact-gap.test",
+                phone_number="",
+                site_email="firstname@contact-gap.test",
+            ),
+        )
+        self.adapter.commit("run-a", self._observation(
+            "eligible",
+            title="Eligible Company",
+            category="Software company",
+            webpage="https://eligible.test",
+        ))
+        self.adapter.commit("run-a", self._observation(
+            "excluded",
+            title="Excluded Training",
+            category="Training center",
+            webpage="https://training.test",
+        ))
+        assess_run(self.database, "run-a", assessed_at=STAMP)
+        output = self.root / "review-exports"
+
+        exports = {
+            purpose: export_review_queue(
+                self.database, "run-a", output, purpose=purpose,
+            )
+            for purpose in ("employment", "mission")
+        }
+        repeated = export_review_queue(
+            self.database, "run-a", output, purpose="mission",
+        )
+        self.assertEqual(repeated["sha256"], exports["mission"]["sha256"])
+
+        rows = {}
+        for purpose, result in exports.items():
+            with result["csv"].open(newline="", encoding="utf-8-sig") as handle:
+                reader = DictReader(handle)
+                self.assertEqual(tuple(reader.fieldnames), REVIEW_EXPORT_FIELDS)
+                rows[purpose] = list(reader)
+            self.assertEqual(
+                len(rows[purpose]),
+                len({row["company_id"] for row in rows[purpose]}),
+            )
+            self.assertTrue(all(
+                row["eligibility"] == "REVIEW"
+                and row["source_run_id"] == "run-a"
+                and row["source_system"] == "GOOGLE_MAPS"
+                for row in rows[purpose]
+            ))
+            self.assertTrue(verify_export_manifest(result["manifest"])["valid"])
+            self.assertTrue(verify_review_export(
+                self.database, "run-a", output, purpose,
+            )["valid"])
+
+        self.assertEqual(
+            [row["company_name"] for row in rows["employment"]],
+            ["Zulu Target", "Alpha Possible", "Beta Unknown"],
+        )
+        self.assertEqual(
+            [row["review_priority"] for row in rows["employment"]],
+            ["HIGH", "MEDIUM", "LOW"],
+        )
+        self.assertEqual(
+            [row["company_name"] for row in rows["mission"]],
+            ["Contact Gap", "Zulu Target", "Alpha Possible", "Beta Unknown"],
+        )
+        self.assertEqual(
+            exports["employment"]["priority_counts"],
+            {"HIGH": 1, "MEDIUM": 1, "LOW": 1},
+        )
+        self.assertEqual(
+            exports["mission"]["priority_counts"],
+            {"HIGH": 2, "MEDIUM": 1, "LOW": 1},
+        )
+
+        employment_ids = {row["company_id"] for row in rows["employment"]}
+        mission_ids = {row["company_id"] for row in rows["mission"]}
+        self.assertEqual(len(employment_ids & mission_ids), 3)
+        self.assertEqual(
+            mission_ids - employment_ids,
+            {decisions["mission_only"].resolution.company_id},
+        )
+        high = rows["employment"][0]
+        self.assertEqual(
+            high["company_id"], decisions["high"].resolution.company_id,
+        )
+        self.assertEqual(high["accepted_contact_email"], "info@zulu.test")
+        self.assertEqual(
+            high["google_maps_url"],
+            "https://www.google.com/maps/place/zulu-target",
+        )
+        self.assertEqual(
+            json.loads(high["missing_evidence"]),
+            ["usable_website_not_available"],
+        )
+        contact_gap = rows["mission"][0]
+        self.assertEqual(contact_gap["accepted_contact_email"], "")
+        self.assertIn(
+            "direct_contact_not_available",
+            json.loads(contact_gap["missing_evidence"]),
+        )
+        self.assertIn(
+            "active_mission_not_established",
+            json.loads(contact_gap["classification_reason_codes"]),
+        )
+        low = rows["employment"][-1]
+        self.assertEqual(low["country"], "")
+        self.assertEqual(low["address"], "")
+        self.assertEqual(low["website"], "")
+        self.assertIn(
+            "target_relevance_not_established",
+            json.loads(low["missing_evidence"]),
+        )
+
+        # Optional review files must not alter the existing three-artifact
+        # authoritative verification contract.
+        export_new_companies(
+            self.database, "run-a", output, verified_maps_publication=True,
+        )
+        for purpose in ("employment", "mission"):
+            export_qualified_leads(
+                self.database, "run-a", output, purpose=purpose,
+            )
+        verified = verify_run_exports(self.database, "run-a", output)
+        self.assertTrue(all(result["valid"] for result in verified.values()))
+
+    def test_review_queue_rejects_unknown_purpose(self):
+        with self.assertRaisesRegex(ValueError, "employment.*mission"):
+            export_review_queue(
+                self.database, "run-a", self.root / "invalid-review",
+                purpose="sales",
+            )

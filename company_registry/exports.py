@@ -31,6 +31,19 @@ QUALIFIED_EXPORT_FIELDS = (
     "reasons_json", "evidence_hash", "assessed_at", "name", "category",
     "description", "website", "phone", "email", "address", "country", "city",
 )
+REVIEW_EXPORT_FIELDS = (
+    "qualification_assessment_id", "qualification_policy_version", "purpose",
+    "company_id", "registry_decision_id", "source_run_id", "branch_id",
+    "source_system", "source_record_key", "review_priority", "relevance",
+    "eligibility", "classification_reason_codes", "missing_evidence",
+    "evidence_hash", "assessed_at", "company_name", "country", "address",
+    "website", "accepted_contact_email", "phone", "google_maps_url",
+    "business_category",
+)
+REVIEW_PRIORITIES = ("HIGH", "MEDIUM", "LOW")
+_UNAVAILABLE_EXPORT_VALUES = {
+    "", "-", "n/a", "na", "none", "not available", "null", "unknown",
+}
 
 
 def _safe_run_token(run_id: str) -> str:
@@ -257,6 +270,145 @@ def _qualified_rows(
     return rows
 
 
+def _available_text(value: object) -> str:
+    text = clean_text(value)
+    if text.casefold() in _UNAVAILABLE_EXPORT_VALUES:
+        return ""
+    return text
+
+
+def _review_priority(relevance: str) -> str:
+    """Map stored relevance to a deterministic human-review priority."""
+    if relevance == "TARGET":
+        return "HIGH"
+    if relevance == "POSSIBLE":
+        return "MEDIUM"
+    return "LOW"
+
+
+def _review_missing_evidence(
+    purpose: str, relevance: str, evidence: dict,
+) -> tuple[str, ...]:
+    """Describe evidence gaps without changing the qualification result."""
+    missing: list[str] = []
+    if relevance != "TARGET":
+        missing.append("target_relevance_not_established")
+    if not evidence.get("usable_website"):
+        missing.append("usable_website_not_available")
+    if purpose == "mission" and not (
+        _available_text(evidence.get("phone"))
+        or _available_text(evidence.get("email"))
+    ):
+        missing.append("direct_contact_not_available")
+    if not _available_text(evidence.get("address")):
+        missing.append("location_evidence_not_available")
+    if evidence.get("identity_conflict"):
+        missing.append("identity_conflict_requires_resolution")
+    if evidence.get("location_conflict"):
+        missing.append("location_conflict_requires_resolution")
+    return tuple(missing or ("additional_verification_required",))
+
+
+def _review_rows(
+    database: Path, run_id: str, purpose: str, policy_version: str,
+) -> list[dict]:
+    if purpose not in {"employment", "mission"}:
+        raise ValueError("Review export purpose must be 'employment' or 'mission'")
+    relevance_column = f"{purpose}_relevance"
+    eligibility_column = f"{purpose}_eligibility"
+    reasons_column = f"{purpose}_reasons_json"
+    connection = open_registry(database)
+    try:
+        if connection.execute(
+            "SELECT 1 FROM discovery_runs WHERE run_id=?", (run_id,),
+        ).fetchone() is None:
+            raise LookupError(f"Unknown discovery run: {run_id}")
+        records = connection.execute(
+            f"""SELECT assessment.*, decision.run_id, decision.branch_id,
+                       observation.source_system, observation.source_record_key,
+                       observation.raw_payload_json
+                  FROM qualification_assessments assessment
+                  JOIN discovery_run_decisions decision
+                    ON decision.decision_id=assessment.decision_id
+                  JOIN discovery_observations observation
+                    ON observation.observation_id=decision.observation_id
+                 WHERE decision.run_id=? AND assessment.policy_version=?
+                   AND decision.classification='NEW'
+                   AND decision.resolution_action='CREATE_COMPANY'
+                   AND decision.requires_review=0
+                   AND assessment.{eligibility_column}='REVIEW'""",
+            (run_id, policy_version),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    rows = []
+    for record in records:
+        evidence = json.loads(record["evidence_json"])
+        evidence = evidence if isinstance(evidence, dict) else {}
+        raw = json.loads(record["raw_payload_json"])
+        raw = raw if isinstance(raw, dict) else {}
+        reasons = json.loads(record[reasons_column])
+        reasons = reasons if isinstance(reasons, list) else []
+        relevance = record[relevance_column]
+        google_maps_url = next(
+            (
+                value for value in (
+                    _available_text(raw.get("map_link")),
+                    _available_text(raw.get("google_maps_url")),
+                    _available_text(raw.get("maps_url")),
+                ) if value
+            ),
+            "",
+        )
+        rows.append({
+            "qualification_assessment_id": record["assessment_id"],
+            "qualification_policy_version": record["policy_version"],
+            "purpose": purpose,
+            "company_id": record["company_id"],
+            "registry_decision_id": record["decision_id"],
+            "source_run_id": record["run_id"],
+            "branch_id": record["branch_id"] or "",
+            "source_system": record["source_system"],
+            "source_record_key": record["source_record_key"],
+            "review_priority": _review_priority(relevance),
+            "relevance": relevance,
+            "eligibility": record[eligibility_column],
+            "classification_reason_codes": canonical_json(reasons),
+            "missing_evidence": canonical_json(_review_missing_evidence(
+                purpose, relevance, evidence,
+            )),
+            "evidence_hash": record["evidence_hash"],
+            "assessed_at": record["assessed_at"],
+            "company_name": _available_text(evidence.get("name")),
+            "country": _available_text(evidence.get("country")),
+            "address": _available_text(evidence.get("address")),
+            "website": _available_text(evidence.get("website")),
+            "accepted_contact_email": _available_text(evidence.get("email")),
+            "phone": _available_text(evidence.get("phone")),
+            "google_maps_url": google_maps_url,
+            "business_category": _available_text(evidence.get("category")),
+        })
+
+    priority_order = {priority: index for index, priority in enumerate(
+        REVIEW_PRIORITIES
+    )}
+    rows.sort(key=lambda row: (
+        priority_order[row["review_priority"]],
+        row["company_name"].casefold(),
+        row["company_id"],
+        row["qualification_assessment_id"],
+    ))
+    unique_rows = []
+    seen_companies = set()
+    for row in rows:
+        if row["company_id"] in seen_companies:
+            continue
+        seen_companies.add(row["company_id"])
+        unique_rows.append(row)
+    return unique_rows
+
+
 def export_qualified_leads(
     database: str | Path,
     run_id: str,
@@ -321,6 +473,80 @@ def export_qualified_leads(
                 temporary.unlink(missing_ok=True)
 
 
+def export_review_queue(
+    database: str | Path,
+    run_id: str,
+    output_directory: str | Path,
+    *,
+    purpose: str,
+    policy_version: str = DEFAULT_QUALIFICATION_POLICY.version,
+    failure_injector: FailureInjector | None = None,
+) -> dict:
+    """Publish one deterministic, company-deduplicated REVIEW queue."""
+    database = Path(database)
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    rows = _review_rows(database, run_id, purpose, policy_version)
+    token = _safe_run_token(run_id)
+    csv_path = output_directory / f"review_{purpose}_queue_{token}.csv"
+    manifest_path = (
+        output_directory / f"review_{purpose}_queue_{token}.manifest.json"
+    )
+    priority_counts = {
+        priority: sum(row["review_priority"] == priority for row in rows)
+        for priority in REVIEW_PRIORITIES
+    }
+    staged_csv = staged_manifest = None
+    try:
+        staged_csv = _stage_csv(
+            output_directory, list(REVIEW_EXPORT_FIELDS), rows,
+            prefix=f".review-{purpose}.",
+        )
+        csv_hash = sha256(staged_csv.read_bytes()).hexdigest()
+        manifest = {
+            "format": "company-registry-review-queue-v1",
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run_id,
+            "purpose": purpose,
+            "policy_version": policy_version,
+            "csv_file": csv_path.name,
+            "csv_sha256": csv_hash,
+            "row_count": len(rows),
+            "assessment_ids": [
+                row["qualification_assessment_id"] for row in rows
+            ],
+            "company_ids": [row["company_id"] for row in rows],
+            "priority_counts": priority_counts,
+        }
+        staged_manifest = _stage_manifest(
+            output_directory, manifest,
+            prefix=f".review-{purpose}-manifest.",
+        )
+        if failure_injector:
+            failure_injector("before_csv_publish")
+        os.replace(staged_csv, csv_path)
+        staged_csv = None
+        _fsync_directory(output_directory)
+        if failure_injector:
+            failure_injector("before_manifest_publish")
+        os.replace(staged_manifest, manifest_path)
+        staged_manifest = None
+        _fsync_directory(output_directory)
+        return {
+            "csv": csv_path,
+            "manifest": manifest_path,
+            "rows": len(rows),
+            "sha256": csv_hash,
+            "assessment_ids": manifest["assessment_ids"],
+            "company_ids": manifest["company_ids"],
+            "priority_counts": priority_counts,
+        }
+    finally:
+        for temporary in (staged_csv, staged_manifest):
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+
 def verify_export_manifest(manifest_path: str | Path) -> dict:
     """Validate a published export's commit marker, hash, count, and decision list."""
     manifest_path = Path(manifest_path)
@@ -329,6 +555,7 @@ def verify_export_manifest(manifest_path: str | Path) -> dict:
     if export_format not in {
         "company-registry-new-companies-v1",
         "company-registry-qualified-leads-v1",
+        "company-registry-review-queue-v1",
     }:
         raise ValueError("Unsupported company-registry export manifest format")
     csv_path = manifest_path.parent / str(manifest.get("csv_file") or "")
@@ -340,8 +567,13 @@ def verify_export_manifest(manifest_path: str | Path) -> dict:
     with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
         exported_rows = list(DictReader(handle))
     qualified = export_format == "company-registry-qualified-leads-v1"
-    id_field = "qualification_assessment_id" if qualified else "registry_decision_id"
-    manifest_id_field = "assessment_ids" if qualified else "decision_ids"
+    review = export_format == "company-registry-review-queue-v1"
+    assessment_backed = qualified or review
+    id_field = (
+        "qualification_assessment_id"
+        if assessment_backed else "registry_decision_id"
+    )
+    manifest_id_field = "assessment_ids" if assessment_backed else "decision_ids"
     exported_ids = [row.get(id_field, "") for row in exported_rows]
     if len(exported_rows) != manifest.get("row_count"):
         raise ValueError("Company-registry export row count does not match its manifest")
@@ -349,13 +581,29 @@ def verify_export_manifest(manifest_path: str | Path) -> dict:
         raise ValueError("Company-registry export IDs do not match its manifest")
     company_ids = [row.get("company_id", "") for row in exported_rows]
     manifest_company_ids = manifest.get("company_ids")
-    if qualified or manifest_company_ids is not None:
+    if assessment_backed or manifest_company_ids is not None:
         if company_ids != manifest_company_ids:
             raise ValueError("Company-registry export company IDs do not match its manifest")
         if len(company_ids) != len(set(company_ids)):
             raise ValueError("Company-registry export contains duplicate companies")
     if qualified and any(row.get("eligibility") != "ELIGIBLE" for row in exported_rows):
         raise ValueError("Qualified export contains a non-eligible row")
+    if review and any(row.get("eligibility") != "REVIEW" for row in exported_rows):
+        raise ValueError("Review export contains a non-review row")
+    if review and any(
+        row.get("review_priority") not in REVIEW_PRIORITIES
+        for row in exported_rows
+    ):
+        raise ValueError("Review export contains an invalid priority")
+    if review:
+        priority_counts = {
+            priority: sum(
+                row.get("review_priority") == priority for row in exported_rows
+            )
+            for priority in REVIEW_PRIORITIES
+        }
+        if priority_counts != manifest.get("priority_counts"):
+            raise ValueError("Review export priority counts do not match its manifest")
     return {
         "valid": True,
         "csv": csv_path,
@@ -365,6 +613,52 @@ def verify_export_manifest(manifest_path: str | Path) -> dict:
         manifest_id_field: exported_ids,
         "company_ids": company_ids,
     }
+
+
+def verify_review_export(
+    database: str | Path,
+    run_id: str,
+    output_directory: str | Path,
+    purpose: str,
+    *,
+    policy_version: str | None = None,
+) -> dict:
+    """Verify one review queue against its exact SQLite projection."""
+    if purpose not in {"employment", "mission"}:
+        raise ValueError("Review export purpose must be 'employment' or 'mission'")
+    database = Path(database)
+    output_directory = Path(output_directory)
+    token = _safe_run_token(run_id)
+    manifest_path = (
+        output_directory / f"review_{purpose}_queue_{token}.manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("format") != "company-registry-review-queue-v1":
+        raise ValueError("Review export manifest has the wrong format")
+    if policy_version is None:
+        policy_version = clean_text(manifest.get("policy_version"))
+        if not policy_version:
+            raise ValueError("Review export manifest lacks a policy version")
+    rows = _review_rows(database, run_id, purpose, policy_version)
+    result = verify_export_manifest(manifest_path)
+    if (
+        manifest.get("run_id") != run_id
+        or manifest.get("purpose") != purpose
+        or manifest.get("policy_version") != policy_version
+    ):
+        raise ValueError("Review export provenance or policy metadata does not match")
+    expected = {
+        "assessment_ids": [
+            row["qualification_assessment_id"] for row in rows
+        ],
+        "company_ids": [row["company_id"] for row in rows],
+    }
+    for field, values in expected.items():
+        if result.get(field) != values:
+            raise ValueError(
+                f"Review export {field} do not match committed SQLite data"
+            )
+    return result
 
 
 def _manifest_paths(output_directory: Path, run_id: str) -> dict[str, Path]:
