@@ -33,6 +33,12 @@ from company_registry.exports import (
 from company_registry.models import Classification, IdentityObservation, ResolutionAction
 from company_registry.normalization import canonical_json, normalize_google_place_id
 from company_registry.qualification import DEFAULT_QUALIFICATION_POLICY, assess_run
+from company_registry.query_observability import (
+    finish_query_attempt,
+    record_discovered_results,
+    record_result_outcome,
+    start_query_attempt,
+)
 from company_registry.resolver import RESOLVER_VERSION
 from company_registry.run_lifecycle import transition_run
 from company_registry.run_lease import (
@@ -44,7 +50,10 @@ from company_registry.run_lease import (
 )
 from company_registry.service import (
     NewCompanyBudgetExhausted,
+    QueryNewCompanyBudgetExhausted,
+    QueryBudgetSnapshot,
     RunBudgetSnapshot,
+    get_query_budget_snapshot,
     get_run_budget_snapshot,
 )
 from company_registry.shadow import DEFAULT_SHADOW_DATABASE
@@ -145,6 +154,7 @@ def maps_run_configuration_hash(
     *,
     mode: DiscoveryMode,
     new_company_limit: int | None,
+    max_new_per_query: int | None = None,
     export_directory: Path,
 ) -> str:
     """Build the exact durable configuration identity used by Maps runs."""
@@ -156,6 +166,10 @@ def maps_run_configuration_hash(
         "qualification_policy_version": DEFAULT_QUALIFICATION_POLICY.version,
         "export_root": str(export_directory),
     }
+    # Preserve historical configuration hashes when the optional Phase 6D
+    # setting is omitted, so existing resumable runs remain compatible.
+    if max_new_per_query is not None:
+        configuration["max_new_per_query"] = max_new_per_query
     return sha256(canonical_json(configuration).encode("utf-8")).hexdigest()
 
 
@@ -208,7 +222,7 @@ def validate_authoritative_paths(
         except Exception as error:
             raise UnsafeAuthoritativePathError(
                 "Production registry activation requires an existing, complete, "
-                f"integrity-clean schema-v6 database: {type(error).__name__}: {error}"
+                f"integrity-clean schema-v8 database: {type(error).__name__}: {error}"
             ) from error
     elif allow_production_registry:
         raise UnsafeAuthoritativePathError(
@@ -285,6 +299,7 @@ class AuthoritativeMapsSession:
         run_id: str | None = None,
         resume_run_id: str | None = None,
         new_company_limit: int | None = None,
+        max_new_per_query: int | None = None,
         lease_seconds: int = 120,
         heartbeat_interval_seconds: float = 40.0,
         stack_snapshot_interval_seconds: float | None = None,
@@ -295,6 +310,8 @@ class AuthoritativeMapsSession:
             raise ValueError("run_id and resume_run_id are mutually exclusive")
         if new_company_limit is not None and new_company_limit < 1:
             raise ValueError("new_company_limit must be >= 1 when provided")
+        if max_new_per_query is not None and max_new_per_query < 1:
+            raise ValueError("max_new_per_query must be >= 1 when provided")
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be >= 1")
         if heartbeat_interval_seconds <= 0:
@@ -316,6 +333,7 @@ class AuthoritativeMapsSession:
         self.is_resume = resume_run_id is not None
         self.run_id = resume_run_id or run_id or f"maps-{uuid4()}"
         self.new_company_limit = new_company_limit
+        self.max_new_per_query = max_new_per_query
         self.lease_seconds = lease_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.lease_owner = lease_owner or f"maps-writer-{uuid4()}"
@@ -346,6 +364,7 @@ class AuthoritativeMapsSession:
             queries,
             mode=self.mode,
             new_company_limit=self.new_company_limit,
+            max_new_per_query=self.max_new_per_query,
             export_directory=self.export_directory,
         )
 
@@ -368,12 +387,12 @@ class AuthoritativeMapsSession:
                 connection.execute(
                     """INSERT INTO discovery_runs
                        (run_id, run_type, status, started_at, created_at,
-                        new_company_limit, run_config_hash, lease_owner,
+                        new_company_limit, max_new_per_query, run_config_hash, lease_owner,
                         lease_expires_at, heartbeat_at, updated_at)
-                       VALUES (?, 'SCRAPE', 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, 'SCRAPE', 'RUNNING', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         self.run_id, now, now, self.new_company_limit,
-                        self._configuration_hash([]), self.lease_owner,
+                        self.max_new_per_query, self._configuration_hash([]), self.lease_owner,
                         expires, now, now,
                     ),
                 )
@@ -395,6 +414,7 @@ class AuthoritativeMapsSession:
 
     def configure_queries(self, queries: list[str]) -> None:
         """Persist fresh configuration or validate/acquire an explicit resume."""
+        normalized_queries = [query.strip() for query in queries if query.strip()]
         config_hash = self._configuration_hash(queries)
         if self.is_resume:
             self.recovery_checkpoint = acquire_resume_lease(
@@ -408,6 +428,26 @@ class AuthoritativeMapsSession:
             self._remember_successful_renewal(
                 datetime.now(timezone.utc).isoformat()
             )
+            connection = open_registry(self.database)
+            try:
+                rows = connection.execute(
+                    """SELECT query_index, query_text
+                         FROM discovery_run_queries
+                        WHERE run_id=? ORDER BY query_index""",
+                    (self.run_id,),
+                ).fetchall()
+                expected = list(enumerate(normalized_queries))
+                actual = [(row["query_index"], row["query_text"]) for row in rows]
+                # Pre-6E uncapped runs legitimately have no query ledger.
+                historical_without_ledger = (
+                    not actual and self.max_new_per_query is None
+                )
+                if not historical_without_ledger and actual != expected:
+                    raise AuthoritativeResumeError(
+                        "Durable per-query ledger does not match the resumed query list"
+                    )
+            finally:
+                connection.close()
             return
         now = datetime.now(timezone.utc).isoformat()
         connection = open_registry(self.database)
@@ -428,6 +468,16 @@ class AuthoritativeMapsSession:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("Only a RUNNING run can be configured")
+            connection.executemany(
+                """INSERT INTO discovery_run_queries
+                   (run_id, query_index, query_text, committed_new_count,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, 0, ?, ?)""",
+                [
+                    (self.run_id, index, query, now, now)
+                    for index, query in enumerate(normalized_queries)
+                ],
+            )
             connection.commit()
         except BaseException:
             if connection.in_transaction:
@@ -710,7 +760,13 @@ class AuthoritativeMapsSession:
             log.close()
             self._diagnostic_log = None
 
-    def resolve(self, observation: IdentityObservation, budget) -> AuthoritativeOutcome:
+    def resolve(
+        self,
+        observation: IdentityObservation,
+        budget,
+        *,
+        query_index: int | None = None,
+    ) -> AuthoritativeOutcome:
         """Preview, reserve possible NEW, then transactionally re-resolve."""
         preview = self.adapter.preview(observation)
         possible_new = (
@@ -723,7 +779,12 @@ class AuthoritativeMapsSession:
         try:
             decision = self.adapter.commit(
                 self.run_id, observation, lease_owner=self.lease_owner,
+                query_index=query_index,
             )
+        except QueryNewCompanyBudgetExhausted:
+            if reservation is not None:
+                reservation.release()
+            return AuthoritativeOutcome("query_limit", preview)
         except NewCompanyBudgetExhausted:
             if reservation is not None:
                 reservation.release()
@@ -769,6 +830,63 @@ class AuthoritativeMapsSession:
     def budget_snapshot(self) -> RunBudgetSnapshot:
         """Read durable NEW-company capacity directly from SQLite."""
         return get_run_budget_snapshot(self.database, self.run_id)
+
+    def query_budget_snapshot(self, query_index: int) -> QueryBudgetSnapshot:
+        """Read durable NEW-company capacity for one configured query."""
+        return get_query_budget_snapshot(self.database, self.run_id, query_index)
+
+    def start_query(self, query_index: int) -> None:
+        try:
+            start_query_attempt(
+                self.database, self.run_id, query_index, self.lease_owner,
+            )
+        except Exception as error:
+            raise RegistryUnavailableError(
+                f"Durable query-start reporting failed: {type(error).__name__}: {error}"
+            ) from error
+
+    def finish_query(self, query_index: int, status: str) -> None:
+        try:
+            finish_query_attempt(
+                self.database, self.run_id, query_index, status, self.lease_owner,
+            )
+        except Exception as error:
+            raise RegistryUnavailableError(
+                f"Durable query-finish reporting failed: {type(error).__name__}: {error}"
+            ) from error
+
+    def record_discovered_results(
+        self, query_index: int, result_identities: list[str],
+    ) -> None:
+        try:
+            record_discovered_results(
+                self.database, self.run_id, query_index, result_identities,
+                self.lease_owner,
+            )
+        except Exception as error:
+            raise RegistryUnavailableError(
+                f"Durable result discovery reporting failed: {type(error).__name__}: {error}"
+            ) from error
+
+    def record_result_outcome(
+        self,
+        query_index: int,
+        result_identity: str,
+        *,
+        inspected: bool = False,
+        outcome: str | None = None,
+        rejection_reason: str | None = None,
+    ) -> None:
+        try:
+            record_result_outcome(
+                self.database, self.run_id, query_index, result_identity,
+                self.lease_owner, inspected=inspected, outcome=outcome,
+                rejection_reason=rejection_reason,
+            )
+        except Exception as error:
+            raise RegistryUnavailableError(
+                f"Durable result outcome reporting failed: {type(error).__name__}: {error}"
+            ) from error
 
     def complete(
         self,
@@ -847,6 +965,7 @@ def recover_finalizing_run(
     *,
     mode: str | DiscoveryMode = DiscoveryMode.AUTHORITATIVE_CANARY,
     new_company_limit: int | None = None,
+    max_new_per_query: int | None = None,
     lease_seconds: int = 120,
     lease_owner: str | None = None,
     failure_injector: FailureInjector | None = None,
@@ -867,6 +986,7 @@ def recover_finalizing_run(
         queries,
         mode=parsed_mode,
         new_company_limit=new_company_limit,
+        max_new_per_query=max_new_per_query,
         export_directory=export_path,
     )
     acquired = False

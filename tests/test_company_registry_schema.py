@@ -54,6 +54,8 @@ class CompanyRegistrySchemaTests(TestCase):
             "discovery_runs", "run_companies", "historical_source_records",
             "branch_identities", "discovery_observations", "resolution_reviews",
             "discovery_run_decisions", "qualification_assessments",
+            "discovery_run_queries",
+            "discovery_run_query_decisions", "discovery_run_query_results",
         })
         self.assertEqual(
             self.connection.execute("PRAGMA user_version").fetchone()[0],

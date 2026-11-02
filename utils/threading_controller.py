@@ -25,6 +25,7 @@ from signal import signal, SIGINT, SIGTERM
 from threading import Lock, Event
 from pathlib import Path
 from utils.known_companies import KnownCompanies
+from utils.geography import coerce_maps_query_spec, load_maps_query_specs
 from utils.run_acceptance_budget import RunAcceptanceBudget
 from company_registry.discovery_adapter import (
     DiscoveryMode, RegistryUnavailableError, parse_discovery_mode,
@@ -58,11 +59,14 @@ class FastSearchAlgo:
                  authoritative_export_directory=DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY,
                  allow_production_registry: bool = False,
                  diagnostic_stack_interval_seconds: float | None = None,
+                 max_new_per_query: int | None = None,
                  ) -> None:
         if workers < 1:
             raise ValueError("workers must be >= 1")
         if result_range is not None and result_range < 1:
             raise ValueError("result_range must be >= 1 when provided")
+        if max_new_per_query is not None and max_new_per_query < 1:
+            raise ValueError("max_new_per_query must be >= 1 when provided")
         if wait_time < 1:
             raise ValueError("wait_time must be >= 1")
         if scroll_minutes < 1:
@@ -88,6 +92,8 @@ class FastSearchAlgo:
         self._low_resource = low_resource
         self._shadow_observer = shadow_observer
         self._discovery_mode = parse_discovery_mode(discovery_mode)
+        if max_new_per_query is not None and not self._discovery_mode.is_authoritative:
+            raise ValueError("max_new_per_query requires an authoritative discovery mode")
         if registry_run_id is not None and resume_run_id is not None:
             raise ValueError("registry_run_id and resume_run_id are mutually exclusive")
         if resume_run_id is not None and not self._discovery_mode.is_authoritative:
@@ -103,6 +109,7 @@ class FastSearchAlgo:
                 run_id=registry_run_id,
                 resume_run_id=resume_run_id,
                 new_company_limit=result_range,
+                max_new_per_query=max_new_per_query,
                 allow_production_registry=allow_production_registry,
                 stack_snapshot_interval_seconds=(
                     diagnostic_stack_interval_seconds
@@ -119,6 +126,7 @@ class FastSearchAlgo:
             if incremental and not self._discovery_mode.is_authoritative else None
         )
         self._acceptance_budget = RunAcceptanceBudget(result_range)
+        self._max_new_per_query = max_new_per_query
         self._query_file_path = (
             str(Path(query_file_path).expanduser().resolve())
             if query_file_path is not None else None
@@ -172,16 +180,18 @@ class FastSearchAlgo:
         """Submit all queries to the worker pool and surface worker exceptions."""
         if not query_list:
             raise ValueError("query_list must contain at least one usable query")
-        query_list_range = len(query_list)
+        query_specs = [coerce_maps_query_spec(query) for query in query_list]
+        durable_queries = [query.canonical_text for query in query_specs]
+        query_list_range = len(query_specs)
         if self._authoritative_session is not None:
-            self._authoritative_session.configure_queries(query_list)
+            self._authoritative_session.configure_queries(durable_queries)
             durable_budget = self._authoritative_session.budget_snapshot()
             self._acceptance_budget = RunAcceptanceBudget(
                 durable_budget.configured_limit,
                 committed=durable_budget.committed_new,
             )
             self._authoritative_session.start_heartbeat()
-        self._query_list = query_list
+        self._query_list = query_specs
         self._queries_loaded = query_list_range
         previous_sigint = signal(SIGINT, self.signal_handler)
         previous_sigterm = signal(SIGTERM, self.signal_handler)
@@ -313,8 +323,25 @@ class FastSearchAlgo:
                     break
                 with self._summary_lock:
                     self._query_indexes_scheduled.append(thread_index)
+                query_attempt_started = False
                 try:
-                    state = maps_obj.start_scrapper(self._query_list[thread_index])
+                    maps_obj._current_query_index = thread_index
+                    if self._authoritative_session is not None:
+                        self._authoritative_session.start_query(thread_index)
+                        query_attempt_started = True
+                    state = maps_obj.start_scrapper(
+                        self._query_list[thread_index].search_text
+                    )
+                    durable_state = state
+                    if (
+                        self._thread_stop_event.is_set()
+                        and self._termination_reason == "INTERRUPTED"
+                    ):
+                        durable_state = "INTERRUPTED"
+                    if self._authoritative_session is not None:
+                        self._authoritative_session.finish_query(
+                            thread_index, durable_state,
+                        )
                     if state in {"COMPLETED", "NO_RESULTS"}:
                         with self._summary_lock:
                             self._query_indexes_completed.append(thread_index)
@@ -324,6 +351,13 @@ class FastSearchAlgo:
                     self._thread_stop_event.set()
                     raise
                 except Exception as e:
+                    if query_attempt_started and self._authoritative_session is not None:
+                        try:
+                            self._authoritative_session.finish_query(
+                                thread_index, "FAILED",
+                            )
+                        except BaseException:
+                            pass
                     self._note_termination("ERROR")
                     print(f"Exception in thread {thread_id}: {e}")
                     continue
@@ -426,9 +460,11 @@ class FastSearchAlgo:
 
     @staticmethod
     def load_query_file(file_name: str):
-        """Return non-empty, stripped query lines from a UTF-8 text file."""
-        with open(file_name, "r", encoding="utf-8") as query_file:
-            return [line.strip() for line in query_file if line.strip()]
+        """Return validated canonical query entries from a UTF-8 text file."""
+        return [
+            specification.canonical_text
+            for specification in load_maps_query_specs(file_name)
+        ]
 
     def _record_run_row(self, row: dict) -> None:
         with self._summary_lock:

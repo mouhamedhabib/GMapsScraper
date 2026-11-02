@@ -43,6 +43,7 @@ class LocalReleaseTests(TestCase):
             browser_home=str(root / "browser-home"),
             show_browser=False,
             diagnostic_stack_interval_seconds=None,
+            max_new_per_query=None,
         )
 
     def test_parser_uses_permanent_local_defaults(self):
@@ -55,6 +56,7 @@ class LocalReleaseTests(TestCase):
         self.assertEqual(Path(args.browser_home), DEFAULT_BROWSER_HOME)
         self.assertFalse(args.show_browser)
         self.assertIsNone(args.diagnostic_stack_interval_seconds)
+        self.assertIsNone(args.max_new_per_query)
 
     def test_fresh_command_is_fixed_to_authoritative_local_options(self):
         command = build_maps_command(
@@ -73,6 +75,17 @@ class LocalReleaseTests(TestCase):
         self.assertIn("--resume-run-id", command)
         self.assertNotIn("--registry-run-id", command)
         self.assertEqual(command[command.index("--resume-run-id") + 1], "daily-1")
+
+    def test_per_query_limit_is_optional_and_forwarded(self):
+        default = build_maps_command(
+            query_file="queries.txt", max_new=3, run_id="daily-1",
+        )
+        self.assertNotIn("--max-new-per-query", default)
+        capped = build_maps_command(
+            query_file="queries.txt", max_new=3, max_new_per_query=2,
+            run_id="daily-1",
+        )
+        self.assertEqual(capped[capped.index("--max-new-per-query") + 1], "2")
 
     def test_show_browser_is_forwarded_for_resume(self):
         command = build_maps_command(
@@ -109,7 +122,7 @@ class LocalReleaseTests(TestCase):
                 registry, root / "backups", label="pre-run",
                 now=datetime(2026, 10, 10, tzinfo=timezone.utc),
             )
-            self.assertEqual(result["schema_version"], 6)
+            self.assertEqual(result["schema_version"], 8)
             self.assertEqual(result["integrity_check"], "ok")
             self.assertEqual(result["foreign_key_violations"], 0)
             self.assertEqual(result["path"].stat().st_mode & 0o777, 0o600)
@@ -132,7 +145,7 @@ class LocalReleaseTests(TestCase):
             connection = sqlite3.connect(database)
             connection.execute("PRAGMA user_version=2")
             connection.close()
-            with self.assertRaisesRegex(LocalReleaseError, "requires schema 6"):
+            with self.assertRaisesRegex(LocalReleaseError, "requires schema 8"):
                 verify_sqlite_backup(database)
 
     def test_required_backup_failure_prevents_maps_launch(self):
@@ -159,6 +172,25 @@ class LocalReleaseTests(TestCase):
                 patch("local_release.create_verified_backup") as backup,
                 self.assertRaisesRegex(
                     LocalReleaseError, "faulthandler watchdog is unsafe"
+                ),
+            ):
+                execute_release(args, runner=runner)
+            backup.assert_not_called()
+            runner.assert_not_called()
+
+    def test_malformed_query_spec_fails_before_backup_or_launch(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = self.make_registry(root)
+            args = self.release_args(root, registry)
+            Path(args.query_file).write_text(
+                "software Tokyo\tTokyo\n", encoding="utf-8"
+            )
+            runner = Mock()
+            with (
+                patch("local_release.create_verified_backup") as backup,
+                self.assertRaisesRegex(
+                    LocalReleaseError, "exactly three tab-separated fields"
                 ),
             ):
                 execute_release(args, runner=runner)

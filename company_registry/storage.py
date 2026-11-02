@@ -29,6 +29,9 @@ EXPECTED_TABLES = {
     "resolution_reviews",
     "discovery_run_decisions",
     "qualification_assessments",
+    "discovery_run_queries",
+    "discovery_run_query_decisions",
+    "discovery_run_query_results",
 }
 
 EXPECTED_COLUMNS = {
@@ -49,7 +52,7 @@ EXPECTED_COLUMNS = {
     "discovery_runs": {
         "run_id", "run_type", "status", "started_at", "finished_at",
         "created_at", "new_company_limit", "run_config_hash", "lease_owner",
-        "lease_expires_at", "heartbeat_at", "updated_at",
+        "lease_expires_at", "heartbeat_at", "updated_at", "max_new_per_query",
     },
     "run_companies": {
         "run_id", "company_id", "discovery_status", "observed_at", "created_at",
@@ -92,7 +95,22 @@ EXPECTED_COLUMNS = {
         "employment_reasons_json", "mission_reasons_json", "assessed_at",
         "created_at",
     },
+    "discovery_run_queries": {
+        "run_id", "query_index", "query_text", "committed_new_count",
+        "created_at", "updated_at", "query_status", "attempt_count",
+        "last_started_at", "last_finished_at",
+    },
+    "discovery_run_query_decisions": {
+        "run_id", "query_index", "decision_id", "created_at",
+    },
+    "discovery_run_query_results": {
+        "run_id", "query_index", "result_key", "detail_inspected", "outcome",
+        "duplicate_observed", "rejected_observed", "rejection_reason",
+        "first_discovered_at", "last_observed_at",
+    },
 }
+
+READONLY_COMPATIBLE_SCHEMA_VERSIONS = {6, 7, SCHEMA_VERSION}
 
 
 IDENTITY_NAMESPACE = UUID("9d77a853-c493-52c7-9f61-b36d0a5ce2b0")
@@ -208,7 +226,26 @@ def _enable_foreign_keys(connection: sqlite3.Connection) -> None:
         raise RuntimeError("SQLite foreign-key enforcement could not be enabled")
 
 
-def _validate_schema(connection: sqlite3.Connection) -> None:
+def _validate_schema(
+    connection: sqlite3.Connection,
+    *,
+    schema_version: int = SCHEMA_VERSION,
+) -> None:
+    expected_tables = set(EXPECTED_TABLES)
+    expected_columns = {name: set(columns) for name, columns in EXPECTED_COLUMNS.items()}
+    if schema_version < 8:
+        expected_tables.remove("discovery_run_query_decisions")
+        expected_tables.remove("discovery_run_query_results")
+        expected_columns.pop("discovery_run_query_decisions")
+        expected_columns.pop("discovery_run_query_results")
+        for column in (
+            "query_status", "attempt_count", "last_started_at", "last_finished_at",
+        ):
+            expected_columns["discovery_run_queries"].remove(column)
+    if schema_version == 6:
+        expected_tables.remove("discovery_run_queries")
+        expected_columns.pop("discovery_run_queries")
+        expected_columns["discovery_runs"].remove("max_new_per_query")
     tables = {
         row[0]
         for row in connection.execute(
@@ -216,13 +253,13 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
             "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    missing = EXPECTED_TABLES - tables
+    missing = expected_tables - tables
     if missing:
         raise RuntimeError(
             "Company registry schema is incomplete; missing tables: "
             + ", ".join(sorted(missing))
         )
-    for table, expected in EXPECTED_COLUMNS.items():
+    for table, expected in expected_columns.items():
         actual = {
             row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')
         }
@@ -269,7 +306,7 @@ def migrate_schema(connection: sqlite3.Connection) -> None:
             if migration_version == 6:
                 # Validate the rebuilt parent table and every foreign-key edge
                 # before committing the schema/version change.
-                _validate_schema(connection)
+                _validate_schema(connection, schema_version=6)
             connection.execute(f"PRAGMA user_version = {migration_version}")
             connection.commit()
         except BaseException:
@@ -374,6 +411,35 @@ def open_registry(
         "completed",
         monotonic() - started,
     )
+    return connection
+
+
+def open_registry_readonly(
+    path: str | Path = DEFAULT_DATABASE,
+) -> sqlite3.Connection:
+    """Open and fully validate an existing registry without write access."""
+    database_path = Path(path)
+    if not database_path.is_file():
+        raise FileNotFoundError(f"Company registry does not exist: {database_path}")
+    connection = sqlite3.connect(
+        f"file:{database_path.resolve()}?mode=ro", uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        _enable_foreign_keys(connection)
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version not in READONLY_COMPATIBLE_SCHEMA_VERSIONS:
+            raise RuntimeError(
+                f"Unsupported company registry schema version {version}; "
+                "read-only access requires a compatible version in "
+                f"{sorted(READONLY_COMPATIBLE_SCHEMA_VERSIONS)}"
+            )
+        _validate_schema(connection, schema_version=version)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 

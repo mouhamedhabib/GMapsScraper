@@ -222,6 +222,7 @@ class GoogleMaps:
         self._incremental = incremental
         self._authoritative_session = authoritative_session
         self._authoritative = authoritative_session is not None
+        self._current_query_index = None
         self._known_companies = known_companies
         if incremental and not self._authoritative and self._known_companies is None:
             self._known_companies = KnownCompanies.from_directory(
@@ -1213,6 +1214,7 @@ class GoogleMaps:
                     temp_data, query=query, observed_at=temp_data["added_at"],
                 ),
                 self._acceptance_budget,
+                query_index=self._current_query_index,
             )
             if authoritative.outcome == "new":
                 self._collection_counters["companies_persisted"] += 1
@@ -1317,6 +1319,22 @@ class GoogleMaps:
 
             # load all the results
             results = self.scroll_to_the_end_event(driver)
+            if self._authoritative:
+                discovered_identities = []
+                for discovered in results:
+                    if discovered == "continue":
+                        continue
+                    try:
+                        identity = self._result_url(discovered)
+                    except Exception:
+                        # Preserve the existing per-result stale-element
+                        # handling; an anonymous item cannot be durably keyed.
+                        continue
+                    if identity:
+                        discovered_identities.append(identity)
+                self._authoritative_session.record_discovered_results(
+                    self._current_query_index, discovered_identities,
+                )
 
             result_indices = [len(results), 1]
             for result in results:
@@ -1325,9 +1343,18 @@ class GoogleMaps:
                 if self._acceptance_budget.committed_exhausted():
                     break
                 try:
+                    result_identity = ""
                     if result != "continue":
                         href = self._result_url(result)
+                        result_identity = href
                         if not self.is_individual_place_url(href):
+                            if self._authoritative and result_identity:
+                                self._authoritative_session.record_result_outcome(
+                                    self._current_query_index,
+                                    result_identity,
+                                    outcome="REJECTED",
+                                    rejection_reason="non_place_result_url",
+                                )
                             if self.is_search_page_url(href):
                                 self._collection_counters[
                                     "search_page_urls_rejected"
@@ -1343,6 +1370,12 @@ class GoogleMaps:
                             stats[duplicate_kind] += 1
                             continue
                     stats["inspected"] += 1
+                    if self._authoritative and result_identity:
+                        self._authoritative_session.record_result_outcome(
+                            self._current_query_index,
+                            result_identity,
+                            inspected=True,
+                        )
                     # Scrape and store data
                     outcome = self._scrape_result_and_store(
                         driver=driver, result=result, query=query,
@@ -1350,10 +1383,27 @@ class GoogleMaps:
                     )
                     if (self._incremental or self._authoritative) and outcome in stats:
                         stats[outcome] += 1
+                    if self._authoritative and result_identity:
+                        self._authoritative_session.record_result_outcome(
+                            self._current_query_index,
+                            result_identity,
+                            inspected=True,
+                            outcome=outcome,
+                        )
+                    if outcome == "query_limit":
+                        break
                 except RegistryUnavailableError:
                     self._stop_event.set()
                     raise
                 except Exception as e:
+                    if self._authoritative and result_identity:
+                        self._authoritative_session.record_result_outcome(
+                            self._current_query_index,
+                            result_identity,
+                            inspected=True,
+                            outcome="REJECTED",
+                            rejection_reason=f"inspection_error:{type(e).__name__}",
+                        )
                     # One bad result (stale element, timeout, IO error) must not abort
                     # the whole query — log it, recover the window state, and continue.
                     self.__pprint_override(query=query, status=f"Skipping result ({type(e).__name__})",

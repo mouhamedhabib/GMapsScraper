@@ -19,6 +19,7 @@ from company_registry.schema import SCHEMA_VERSION
 from company_registry.shadow import DEFAULT_SHADOW_DATABASE
 from company_registry.storage import DEFAULT_DATABASE
 from utils.display_environment import validate_wslg_display
+from utils.geography import QuerySpecificationError, load_maps_query_specs
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -152,10 +153,13 @@ def build_maps_command(
     resume: bool = False,
     show_browser: bool = False,
     diagnostic_stack_interval_seconds: float | None = None,
+    max_new_per_query: int | None = None,
 ) -> list[str]:
     """Construct the fixed authoritative Maps command for a fresh or resumed run."""
     if max_new < 1:
         raise LocalReleaseError("--max-new must be >= 1")
+    if max_new_per_query is not None and max_new_per_query < 1:
+        raise LocalReleaseError("--max-new-per-query must be >= 1")
     if not run_id.strip():
         raise LocalReleaseError("--run-id must not be empty")
     if diagnostic_stack_interval_seconds is not None:
@@ -177,6 +181,8 @@ def build_maps_command(
     ]
     if show_browser:
         command.append("--show-browser")
+    if max_new_per_query is not None:
+        command.extend(["--max-new-per-query", str(max_new_per_query)])
     return command
 
 
@@ -219,7 +225,11 @@ def execute_release(
     query_file = _resolved(args.query_file)
     if not query_file.is_file():
         raise LocalReleaseError(f"Query file does not exist: {query_file}")
-    if not any(line.strip() for line in query_file.read_text(encoding="utf-8").splitlines()):
+    try:
+        query_specs = load_maps_query_specs(query_file)
+    except (OSError, UnicodeError, QuerySpecificationError) as error:
+        raise LocalReleaseError(f"Invalid query file {query_file}: {error}") from error
+    if not query_specs:
         raise LocalReleaseError(f"Query file has no usable queries: {query_file}")
     stack_interval = getattr(args, "diagnostic_stack_interval_seconds", None)
     if stack_interval is not None:
@@ -252,6 +262,7 @@ def execute_release(
         resume=args.command == "resume",
         show_browser=show_browser,
         diagnostic_stack_interval_seconds=stack_interval,
+        max_new_per_query=getattr(args, "max_new_per_query", None),
     )
     completed = runner(command, cwd=PROJECT_ROOT, env=environment, check=False)
     if completed.returncode != 0:
@@ -283,7 +294,7 @@ def execute_release(
 def _add_registry_options(parser: ArgumentParser) -> None:
     parser.add_argument(
         "--registry-path", default=str(DEFAULT_LOCAL_REGISTRY),
-        help="Persistent schema-v6 local registry",
+        help="Persistent schema-v8 local registry",
     )
     parser.add_argument(
         "--backup-directory", default=None,
@@ -301,6 +312,7 @@ def build_parser() -> ArgumentParser:
         operation = subparsers.add_parser(name, help=f"{name.title()} a local Maps run")
         operation.add_argument("--query-file", required=True)
         operation.add_argument("--max-new", required=True, type=int)
+        operation.add_argument("--max-new-per-query", type=int)
         operation.add_argument("--run-id", required=True)
         _add_registry_options(operation)
         operation.add_argument(

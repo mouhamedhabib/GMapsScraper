@@ -9,7 +9,11 @@ from pathlib import Path
 from company_registry.models import IdentityObservation, Resolution
 from company_registry.repository import stable_id
 from company_registry.resolver import IdentityResolver, normalize_observation
-from company_registry.service import NewCompanyBudgetExhausted, RegistryService
+from company_registry.service import (
+    NewCompanyBudgetExhausted,
+    QueryNewCompanyBudgetExhausted,
+    RegistryService,
+)
 from company_registry.storage import DEFAULT_DATABASE
 
 
@@ -101,11 +105,13 @@ class AuthoritativeDiscoveryAdapter:
         observation: IdentityObservation,
         *,
         lease_owner: str | None = None,
+        query_index: int | None = None,
     ) -> DiscoveryDecision:
         """Perform final transactional resolution and return a committed decision."""
         try:
             commit = RegistryService(self.database).resolve_with_metadata(
                 run_id, observation, lease_owner=lease_owner,
+                query_index=query_index,
             )
             result = commit.resolution
             observation_id, decision_id = self._ids(run_id, observation)
@@ -114,7 +120,7 @@ class AuthoritativeDiscoveryAdapter:
                 observation_id=observation_id,
                 newly_committed=commit.decision_created,
             )
-        except NewCompanyBudgetExhausted:
+        except (NewCompanyBudgetExhausted, QueryNewCompanyBudgetExhausted):
             raise
         except Exception as error:
             raise RegistryUnavailableError(

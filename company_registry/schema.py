@@ -1,6 +1,6 @@
 """Versioned SQLite schema for persistent company discovery identity."""
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 MIGRATION_1 = """
 CREATE TABLE companies (
@@ -436,6 +436,87 @@ DROP TABLE discovery_runs;
 ALTER TABLE discovery_runs_v6 RENAME TO discovery_runs;
 """
 
+MIGRATION_7 = """
+ALTER TABLE discovery_runs ADD COLUMN max_new_per_query INTEGER
+    CHECK (max_new_per_query IS NULL OR max_new_per_query >= 1);
+
+CREATE TABLE discovery_run_queries (
+    run_id TEXT NOT NULL
+        REFERENCES discovery_runs(run_id) ON DELETE CASCADE,
+    query_index INTEGER NOT NULL CHECK (query_index >= 0),
+    query_text TEXT NOT NULL CHECK (length(trim(query_text)) > 0),
+    committed_new_count INTEGER NOT NULL DEFAULT 0
+        CHECK (committed_new_count >= 0),
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
+    PRIMARY KEY (run_id, query_index)
+);
+
+CREATE INDEX idx_discovery_run_queries_run_count
+    ON discovery_run_queries(run_id, committed_new_count);
+"""
+
+MIGRATION_8 = """
+ALTER TABLE discovery_run_queries ADD COLUMN query_status TEXT NOT NULL
+    DEFAULT 'PENDING' CHECK (query_status IN (
+        'PENDING', 'RUNNING', 'COMPLETED', 'NO_RESULTS',
+        'VERIFICATION_ABORTED', 'CONSENT_ABORTED', 'NETWORK_INTERRUPTED',
+        'SEARCH_TIMEOUT', 'FAILED', 'INTERRUPTED'
+    ));
+ALTER TABLE discovery_run_queries ADD COLUMN attempt_count INTEGER NOT NULL
+    DEFAULT 0 CHECK (attempt_count >= 0);
+ALTER TABLE discovery_run_queries ADD COLUMN last_started_at TEXT
+    CHECK (last_started_at IS NULL OR length(trim(last_started_at)) > 0);
+ALTER TABLE discovery_run_queries ADD COLUMN last_finished_at TEXT
+    CHECK (last_finished_at IS NULL OR length(trim(last_finished_at)) > 0);
+
+CREATE UNIQUE INDEX idx_discovery_run_decisions_run_decision
+    ON discovery_run_decisions(run_id, decision_id);
+
+CREATE TABLE discovery_run_query_decisions (
+    run_id TEXT NOT NULL,
+    query_index INTEGER NOT NULL,
+    decision_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+    PRIMARY KEY (run_id, query_index, decision_id),
+    FOREIGN KEY (run_id, query_index)
+        REFERENCES discovery_run_queries(run_id, query_index) ON DELETE CASCADE,
+    FOREIGN KEY (run_id, decision_id)
+        REFERENCES discovery_run_decisions(run_id, decision_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_discovery_run_query_decisions_query
+    ON discovery_run_query_decisions(run_id, query_index);
+
+CREATE TABLE discovery_run_query_results (
+    run_id TEXT NOT NULL,
+    query_index INTEGER NOT NULL,
+    result_key TEXT NOT NULL CHECK (length(result_key) = 64),
+    detail_inspected INTEGER NOT NULL DEFAULT 0
+        CHECK (detail_inspected IN (0, 1)),
+    duplicate_observed INTEGER NOT NULL DEFAULT 0
+        CHECK (duplicate_observed IN (0, 1)),
+    rejected_observed INTEGER NOT NULL DEFAULT 0
+        CHECK (rejected_observed IN (0, 1)),
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN (
+        'NEW', 'KNOWN', 'DUPLICATE', 'UPDATED', 'BRANCH', 'REVIEW',
+        'REJECTED', 'GLOBAL_LIMIT', 'QUERY_LIMIT'
+    )),
+    rejection_reason TEXT,
+    first_discovered_at TEXT NOT NULL
+        CHECK (length(trim(first_discovered_at)) > 0),
+    last_observed_at TEXT NOT NULL
+        CHECK (length(trim(last_observed_at)) > 0),
+    PRIMARY KEY (run_id, query_index, result_key),
+    FOREIGN KEY (run_id, query_index)
+        REFERENCES discovery_run_queries(run_id, query_index) ON DELETE CASCADE,
+    CHECK (rejection_reason IS NULL OR length(trim(rejection_reason)) > 0)
+);
+
+CREATE INDEX idx_discovery_run_query_results_query
+    ON discovery_run_query_results(run_id, query_index, detail_inspected, outcome);
+"""
+
 MIGRATIONS = (
     (1, MIGRATION_1),
     (2, MIGRATION_2),
@@ -443,4 +524,6 @@ MIGRATIONS = (
     (4, MIGRATION_4),
     (5, MIGRATION_5),
     (6, MIGRATION_6),
+    (7, MIGRATION_7),
+    (8, MIGRATION_8),
 )

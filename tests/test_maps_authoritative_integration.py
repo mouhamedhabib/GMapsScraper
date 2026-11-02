@@ -325,7 +325,7 @@ class AuthoritativeMapsIntegrationTests(TestCase):
         before = old.read_bytes()
         with patch("company_registry.maps_authoritative.DEFAULT_DATABASE", old):
             with self.assertRaisesRegex(
-                UnsafeAuthoritativePathError, "schema-v6",
+                UnsafeAuthoritativePathError, "schema-v8",
             ):
                 AuthoritativeMapsSession(
                     old, self.exports, mode="authoritative",

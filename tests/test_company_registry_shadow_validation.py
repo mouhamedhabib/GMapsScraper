@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 class ShadowValidationTests(TestCase):
     def test_validation_requires_the_runtime_schema_not_legacy_v4(self):
-        self.assertEqual(SCHEMA_VERSION, 6)
+        self.assertEqual(SCHEMA_VERSION, 8)
         self.assertTrue(_schema_version_is_current(SCHEMA_VERSION))
         self.assertFalse(_schema_version_is_current(4))
 

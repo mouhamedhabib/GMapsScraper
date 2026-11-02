@@ -34,6 +34,7 @@ from company_registry.shadow import (
 )
 from job_search.csv_exports import DEFAULT_EXPORT_DIRECTORY, export_maps_rows
 from utils.display_environment import validate_wslg_display
+from utils.geography import QuerySpecificationError
 from utils.threading_controller import FastSearchAlgo
 
 
@@ -75,6 +76,7 @@ def run_maps_discovery(
     authoritative_export_directory=DEFAULT_AUTHORITATIVE_EXPORT_DIRECTORY,
     allow_production_registry=False,
     diagnostic_stack_interval_seconds=None,
+    max_new_per_query=None,
 ):
     """Run the existing Maps pipeline incrementally and return its counters."""
     if windowed:
@@ -107,6 +109,7 @@ def run_maps_discovery(
             authoritative_export_directory=authoritative_export_directory,
             allow_production_registry=allow_production_registry,
             diagnostic_stack_interval_seconds=diagnostic_stack_interval_seconds,
+            max_new_per_query=max_new_per_query,
         )
         stats = algo.fast_search_algorithm(queries)
     finally:
@@ -150,9 +153,16 @@ class GMapsScraper:
                             default="./queries.txt")
         parser.add_argument('-w', '--threads',
                             help='Number of threads to use (default: 1)', type=int, default=1)
-        parser.add_argument('-l', '--limit',
+        parser.add_argument('-l', '--limit', '--max-new', dest='limit',
                             help='Maximum newly persisted companies across the entire run (default: 1)',
                             type=int, default=1)
+        parser.add_argument(
+            '--max-new-per-query', type=int,
+            help=(
+                'Optional durable NEW-company cap for each query; '
+                'authoritative modes only'
+            ),
+        )
         parser.add_argument(
             '--incremental', action='store_true',
             help='Make --limit count only new companies and skip known identities early',
@@ -220,7 +230,7 @@ class GMapsScraper:
         parser.add_argument(
             '--registry-database', type=str,
             help=(
-                'Explicit schema-v6 SQLite registry for authoritative modes; '
+                'Explicit schema-v8 SQLite registry for authoritative modes; '
                 'the canonical production path remains denied without its '
                 'separate opt-in'
             ),
@@ -231,7 +241,7 @@ class GMapsScraper:
         )
         parser.add_argument(
             '--resume-run-id', type=str,
-            help='Explicitly resume an eligible schema-v6 Maps run',
+            help='Explicitly resume an eligible schema-v8 Maps run',
         )
         parser.add_argument(
             '--authoritative-export-dir', type=str,
@@ -241,7 +251,7 @@ class GMapsScraper:
         parser.add_argument(
             '--allow-production-registry', action='store_true',
             help=(
-                'Explicitly permit a validated schema-v6 canonical production '
+                'Explicitly permit a validated schema-v8 canonical production '
                 'registry in authoritative mode; denied by default'
             ),
         )
@@ -277,6 +287,11 @@ class GMapsScraper:
                 parser.error(str(error))
         if self._args.limit < 1:
             parser.error("--limit must be >= 1")
+        if (
+            self._args.max_new_per_query is not None
+            and self._args.max_new_per_query < 1
+        ):
+            parser.error("--max-new-per-query must be >= 1")
         if self._args.threads < 1:
             parser.error("--threads must be >= 1")
         if self._args.browser_wait < 1:
@@ -296,6 +311,8 @@ class GMapsScraper:
         self._effective_mode = parse_discovery_mode(selected)
         if self._effective_mode.is_authoritative and not self._args.registry_database:
             parser.error("authoritative modes require --registry-database")
+        if self._args.max_new_per_query is not None and not self._effective_mode.is_authoritative:
+            parser.error("--max-new-per-query requires an authoritative discovery mode")
         if self._args.resume_run_id and self._args.registry_run_id:
             parser.error("--resume-run-id and --registry-run-id are mutually exclusive")
         if self._args.resume_run_id and not self._effective_mode.is_authoritative:
@@ -336,7 +353,7 @@ class GMapsScraper:
             self._parser.error(f"Query file is not readable: {q}")
         try:
             queries = FastSearchAlgo.load_query_file(file_name=q)
-        except (OSError, UnicodeError) as exc:
+        except (OSError, UnicodeError, QuerySpecificationError) as exc:
             self._parser.error(f"Could not read query file {q}: {exc}")
         if not queries:
             self._parser.error(f"No usable search queries found in {q}")
@@ -389,6 +406,7 @@ class GMapsScraper:
                 diagnostic_stack_interval_seconds=(
                     self._args.diagnostic_stack_interval_seconds
                 ),
+                max_new_per_query=self._args.max_new_per_query,
             )
             stats = algo_obj.fast_search_algorithm(queries_list)
         except (FileNotFoundError, ValueError) as exception:

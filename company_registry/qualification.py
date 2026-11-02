@@ -84,6 +84,16 @@ class EmailValidation:
 
 
 @dataclass(frozen=True)
+class EmailAvailability:
+    """Coverage-oriented classification without changing qualification policy."""
+
+    status: str
+    available: bool
+    decision: str | None
+    reason_code: str
+
+
+@dataclass(frozen=True)
 class QualificationPolicy:
     """Versioned policy configuration; changing rules requires a new version."""
 
@@ -288,6 +298,56 @@ def _email_values(value: object) -> list[str]:
         if len(candidates) >= MAX_EMAIL_CANDIDATES_PER_FIELD:
             break
     return candidates[:MAX_EMAIL_CANDIDATES_PER_FIELD]
+
+
+def classify_email_availability(
+    value: object, source_field: str = "site_email",
+) -> EmailAvailability:
+    """Classify source email coverage without equating non-empty with available.
+
+    ``AVAILABLE`` and ``REVIEW`` are syntactically plausible candidates. The
+    latter preserves the existing policy distinction for a plausible address
+    whose local part is not auto-approved. The coverage classification does not
+    synthesize a candidate decision for missing values or configured sentinels.
+    """
+    raw_values = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    supplied = [" ".join(str(item or "").split()).strip() for item in raw_values]
+    supplied = [item for item in supplied if item]
+    if not supplied:
+        return EmailAvailability("MISSING", False, None, "missing_or_empty")
+    if all(item.casefold() in EMAIL_UNAVAILABLE_VALUES for item in supplied):
+        return EmailAvailability("PLACEHOLDER", False, None, "known_placeholder")
+
+    assessments = [
+        validate_contact_email(candidate, source_field)
+        for candidate in _email_values(value)
+    ]
+    if any(item.decision == "ACCEPT" for item in assessments):
+        return EmailAvailability(
+            "AVAILABLE", True, "ACCEPT", "accepted_plausible_address",
+        )
+    if any(item.decision == "REVIEW" for item in assessments):
+        return EmailAvailability(
+            "REVIEW", True, "REVIEW", "plausible_address_requires_review",
+        )
+    reason = assessments[0].reason_code if assessments else "malformed_address"
+    return EmailAvailability("REJECTED", False, "REJECT", reason)
+
+
+def classify_email_fields(row: dict) -> EmailAvailability:
+    """Classify all supported source fields using qualification precedence."""
+    classifications = [
+        classify_email_availability(row.get(field), field)
+        for field in EMAIL_SOURCE_FIELDS
+    ]
+    priority = {
+        "AVAILABLE": 0,
+        "REVIEW": 1,
+        "REJECTED": 2,
+        "PLACEHOLDER": 3,
+        "MISSING": 4,
+    }
+    return min(classifications, key=lambda item: priority[item.status])
 
 
 def _email_evidence(row: dict) -> tuple[str, list[dict]]:

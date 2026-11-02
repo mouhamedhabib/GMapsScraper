@@ -39,8 +39,27 @@ class MapsCliValidationTests(TestCase):
         self.assertEqual(app._args.known_companies_dir, "./CSV_FILES")
         self.assertFalse(app._args.allow_empty_known_companies)
         self.assertIsNone(app._args.diagnostic_stack_interval_seconds)
+        self.assertIsNone(app._args.max_new_per_query)
         self.assertTrue(app._args.windowed_browser)
         self.assertEqual(app._effective_mode.value, "legacy")
+
+    def test_max_new_alias_and_optional_per_query_validation(self):
+        alias = self.parse("--max-new", "12")
+        self.assertEqual(alias._args.limit, 12)
+        self.assert_parse_error(
+            "--max-new-per-query must be >= 1",
+            "--max-new-per-query", "0",
+        )
+        self.assert_parse_error(
+            "requires an authoritative discovery mode",
+            "--max-new-per-query", "2",
+        )
+        authoritative = self.parse(
+            "--discovery-mode", "authoritative-canary",
+            "--registry-database", "/tmp/disposable.db",
+            "--max-new-per-query", "2",
+        )
+        self.assertEqual(authoritative._args.max_new_per_query, 2)
 
     def test_show_browser_alias_validates_wslg_and_disables_headless(self):
         for option in ("--show-browser", "--windowed-browser"):

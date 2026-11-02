@@ -1,14 +1,76 @@
-"""Small deterministic geography helpers for the current prospecting markets.
+"""Small deterministic geography helpers for Maps and prospecting pipelines.
 
 The pipeline deliberately uses address and query text already collected by the
 scrapers.  It does not geocode, call an external service, or infer geography
 from company website content.
 """
 
+from dataclasses import dataclass
+from pathlib import Path
 from re import IGNORECASE, compile, escape, sub
+from unicodedata import category as unicode_category
+from unicodedata import normalize as unicode_normalize
 
 
 UNAVAILABLE_VALUES = {"", "n/a", "none", "not available", "null", "unknown"}
+
+
+class QuerySpecificationError(ValueError):
+    """A Maps query-file entry is malformed or duplicates another entry."""
+
+
+def _normalized_query_component(value):
+    """Return a stable Unicode-aware comparison form without transliteration."""
+    return " ".join(unicode_normalize("NFKC", str(value or "")).split()).casefold()
+
+
+def _validate_query_text(value, *, field, line_number=None, allow_empty=False):
+    prefix = f"Line {line_number}: " if line_number is not None else ""
+    if not value and not allow_empty:
+        raise QuerySpecificationError(f"{prefix}{field} must not be empty")
+    if any(unicode_category(character) == "Cc" for character in value):
+        raise QuerySpecificationError(
+            f"{prefix}{field} contains a prohibited control character"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MapsQuerySpec:
+    """One exact Maps search plus optional operator-declared geography.
+
+    ``search_text`` is the only value sent to Google Maps.  Explicit target
+    values are metadata and deliberately accept arbitrary Unicode country and
+    city names; they are not checked against ``COUNTRY_ALIASES``.
+    """
+
+    search_text: str
+    target_city: str = ""
+    target_country: str = ""
+    geography_source: str = "UNDECLARED"
+
+    @property
+    def is_explicit(self):
+        return self.geography_source == "EXPLICIT"
+
+    @property
+    def target_location(self):
+        if self.target_city and self.target_country:
+            return f"{self.target_city}, {self.target_country}"
+        return self.target_country or self.target_city
+
+    @property
+    def canonical_text(self):
+        """Return the durable query representation used for hashing/resume."""
+        if self.is_explicit:
+            return "\t".join((self.search_text, self.target_city, self.target_country))
+        return self.search_text
+
+    @property
+    def canonical_key(self):
+        """Return the Unicode-safe identity used for duplicate detection."""
+        return tuple(_normalized_query_component(value) for value in (
+            self.search_text, self.target_city, self.target_country,
+        ))
 
 # Long aliases are checked first so ``United Kingdom`` is consumed as one
 # country rather than leaving a word behind that could be mistaken for a city.
@@ -118,6 +180,100 @@ def extract_query_geography(query):
         "city": city,
         "location": format_location(city, country),
     }
+
+
+def parse_maps_query_spec(line, *, line_number=None):
+    """Parse one legacy or explicit Maps query-file line.
+
+    Legacy lines contain only search text.  Explicit lines contain exactly
+    ``search text<TAB>target city<TAB>target country``.  Target names are
+    normalized for Unicode and whitespace but are never allowlist-validated.
+    """
+    raw = str(line).rstrip("\r\n")
+    if not raw.strip():
+        raise QuerySpecificationError(
+            f"Line {line_number}: query must not be empty"
+            if line_number is not None else "Query must not be empty"
+        )
+
+    if "\t" in raw:
+        fields = raw.split("\t")
+        prefix = f"Line {line_number}: " if line_number is not None else ""
+        if len(fields) != 3:
+            raise QuerySpecificationError(
+                f"{prefix}explicit query specifications require exactly three "
+                "tab-separated fields: search text, target city, target country"
+            )
+        search_text, target_city, target_country = fields
+        for field_name, value in (
+            ("search text", search_text),
+            ("target country", target_country),
+        ):
+            if value != value.strip():
+                raise QuerySpecificationError(
+                    f"{prefix}{field_name} must not have leading or trailing whitespace"
+                )
+            _validate_query_text(
+                value, field=field_name, line_number=line_number,
+            )
+        if target_city != target_city.strip():
+            raise QuerySpecificationError(
+                f"{prefix}target city must not have leading or trailing whitespace"
+            )
+        _validate_query_text(
+            target_city, field="target city", line_number=line_number,
+            allow_empty=True,
+        )
+        return MapsQuerySpec(
+            search_text=search_text,
+            target_city=" ".join(unicode_normalize("NFKC", target_city).split()),
+            target_country=" ".join(
+                unicode_normalize("NFKC", target_country).split()
+            ),
+            geography_source="EXPLICIT",
+        )
+
+    # Preserve historical behavior for one-column files by trimming only the
+    # outer whitespace. Internal spacing remains part of the exact search.
+    search_text = raw.strip()
+    _validate_query_text(
+        search_text, field="search text", line_number=line_number,
+    )
+    inferred = extract_query_geography(search_text)
+    return MapsQuerySpec(
+        search_text=search_text,
+        target_city=inferred["city"],
+        target_country=inferred["country"],
+        geography_source=("LEGACY_INFERRED" if inferred["country"] else "UNDECLARED"),
+    )
+
+
+def load_maps_query_specs(file_name):
+    """Load, validate, and de-duplicate a UTF-8 Maps query file."""
+    path = Path(file_name)
+    specs = []
+    first_lines = {}
+    with path.open("r", encoding="utf-8") as query_file:
+        for line_number, line in enumerate(query_file, start=1):
+            if not line.strip():
+                continue
+            spec = parse_maps_query_spec(line, line_number=line_number)
+            first_line = first_lines.get(spec.canonical_key)
+            if first_line is not None:
+                raise QuerySpecificationError(
+                    f"Line {line_number}: duplicate canonical query specification "
+                    f"(first declared on line {first_line})"
+                )
+            first_lines[spec.canonical_key] = line_number
+            specs.append(spec)
+    return specs
+
+
+def coerce_maps_query_spec(value):
+    """Return a query specification for an API caller's string or spec."""
+    if isinstance(value, MapsQuerySpec):
+        return value
+    return parse_maps_query_spec(value)
 
 
 def extract_queries_geography(source_queries):
